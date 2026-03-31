@@ -270,6 +270,11 @@ def _make_chunk(
 
 
 def _make_chunk_id(project_id: str, file_path: str, chunk_index: int) -> str:
-    """Generate deterministic chunk ID."""
+    """Generate deterministic chunk ID as a valid UUID string.
+
+    Qdrant requires string point IDs to be valid UUIDs.
+    We take the first 32 hex chars of the SHA256 hash and format as UUID.
+    """
     raw = f"{project_id}::{file_path}::{chunk_index}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    hex32 = hashlib.sha256(raw.encode()).hexdigest()[:32]
+    return f"{hex32[:8]}-{hex32[8:12]}-{hex32[12:16]}-{hex32[16:20]}-{hex32[20:32]}"

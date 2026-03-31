@@ -83,7 +83,7 @@ class TestGetRelativePath:
         root = str(FIXTURES)
         full = FIXTURES / "project_a" / "README.md"
         rel = get_relative_path(full, root)
-        assert rel == "project_a/README.md" or rel == "project_a\\README.md"
+        assert rel == "project_a/README.md"
 
 
 # --- Metadata Tests ---
@@ -162,13 +162,11 @@ class TestMakeChunkId:
         id2 = _make_chunk_id("proj", "file.md", 1)
         assert id1 != id2
 
-    def test_length(self):
+    def test_is_valid_uuid(self):
+        import uuid
         cid = _make_chunk_id("proj", "file.md", 0)
-        assert len(cid) == 16
-
-    def test_hex_characters(self):
-        cid = _make_chunk_id("proj", "file.md", 0)
-        assert all(c in "0123456789abcdef" for c in cid)
+        parsed = uuid.UUID(cid)  # Should not raise
+        assert str(parsed) == cid
 
 
 class TestChunkMarkdownFile:

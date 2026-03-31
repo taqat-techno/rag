@@ -52,4 +52,4 @@ def scan_project(content_root: str, project_id: str | None = None) -> list[tuple
 def get_relative_path(file_path: Path, content_root: str) -> str:
     """Get relative path from content root for storage."""
     root = Path(content_root).resolve()
-    return str(file_path.resolve().relative_to(root))
+    return file_path.resolve().relative_to(root).as_posix()
