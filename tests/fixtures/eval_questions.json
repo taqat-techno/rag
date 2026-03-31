@@ -1,0 +1,72 @@
+[
+  {
+    "query": "What is the backend built with?",
+    "project": "project_a",
+    "expected_file": "project_a/README.md",
+    "expected_section": "Backend",
+    "notes": "Should find Python and FastAPI mention"
+  },
+  {
+    "query": "How does authentication work?",
+    "project": "project_a",
+    "expected_file": "project_a/README.md",
+    "expected_section": "Authentication",
+    "notes": "JWT tokens with refresh rotation"
+  },
+  {
+    "query": "What database is used?",
+    "project": "project_a",
+    "expected_file": "project_a/README.md",
+    "expected_section": "Database",
+    "notes": "PostgreSQL with SQLAlchemy"
+  },
+  {
+    "query": "How is the frontend built?",
+    "project": "project_a",
+    "expected_file": "project_a/README.md",
+    "expected_section": "Frontend",
+    "notes": "Next.js with React, Zustand, TanStack Query"
+  },
+  {
+    "query": "How to run tests?",
+    "project": "project_a",
+    "expected_file": "project_a/guide.md",
+    "expected_section": "Testing",
+    "notes": "pytest -v command"
+  },
+  {
+    "query": "How to set up the development environment?",
+    "project": "project_a",
+    "expected_file": "project_a/guide.md",
+    "expected_section": "Getting Started",
+    "notes": "Clone, install, runserver"
+  },
+  {
+    "query": "What API endpoints exist for users?",
+    "project": "project_a",
+    "expected_file": "project_a/README.md",
+    "expected_section": "User Endpoints",
+    "notes": "GET/PUT /api/users"
+  },
+  {
+    "query": "How is the application deployed?",
+    "project": "project_a",
+    "expected_file": "project_a/README.md",
+    "expected_section": "Deployment",
+    "notes": "Docker Compose, AWS ECS"
+  },
+  {
+    "query": "Why was PostgreSQL chosen over MySQL?",
+    "project": "project_b",
+    "expected_file": "project_b/notes.md",
+    "expected_section": "Chose PostgreSQL",
+    "notes": "JSON support and concurrent writes"
+  },
+  {
+    "query": "What API style is used?",
+    "project": "project_b",
+    "expected_file": "project_b/notes.md",
+    "expected_section": "GraphQL",
+    "notes": "Switched from REST to GraphQL"
+  }
+]

@@ -120,6 +120,58 @@ rag serve
 python -m ragtools.integration.mcp_server
 ```
 
+## Retrieval Evaluation
+
+Measure retrieval quality against a set of benchmark questions:
+
+```bash
+# Run evaluation against test fixtures
+rag index tests/fixtures
+python scripts/eval_retrieval.py --questions tests/fixtures/eval_questions.json
+
+# Output as JSON for further analysis
+python scripts/eval_retrieval.py --questions tests/fixtures/eval_questions.json --json
+
+# Custom top-k
+python scripts/eval_retrieval.py --top-k 5
+```
+
+### Benchmark Format
+
+Create a JSON file with entries like:
+
+```json
+[
+  {
+    "query": "What database is used?",
+    "project": "project_a",
+    "expected_file": "project_a/README.md",
+    "expected_section": "Database",
+    "notes": "PostgreSQL with SQLAlchemy"
+  }
+]
+```
+
+### Key Metrics
+
+| Metric | Target | What It Means |
+|--------|--------|---------------|
+| File Recall@5 | >= 80% | Correct file in top 5 results |
+| File Recall@10 | >= 90% | Correct file in top 10 results |
+| Mean File MRR | >= 0.5 | Average reciprocal rank of correct file |
+| Section Recall@5 | >= 60% | Correct section heading in top 5 |
+
+### Tuning Parameters
+
+| Parameter | Default | When to Change |
+|-----------|---------|---------------|
+| `RAG_CHUNK_SIZE` | 400 | Chunks too short (increase) or too noisy (decrease) |
+| `RAG_CHUNK_OVERLAP` | 100 | Missing context at boundaries (increase) |
+| `RAG_TOP_K` | 10 | Too many irrelevant results (decrease) |
+| `RAG_SCORE_THRESHOLD` | 0.3 | Low-quality results appearing (increase) |
+
+After changing parameters, run `rag rebuild` then re-evaluate.
+
 ## Data
 
 All persistent state lives in `data/`. Delete it to start fresh.
