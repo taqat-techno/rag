@@ -57,6 +57,43 @@ scripts/              # Utility scripts
 data/                 # Local state (gitignored)
 ```
 
+## CLI Commands
+
+```bash
+# Index Markdown files (incremental — skips unchanged files)
+rag index /path/to/docs
+
+# Force full re-index
+rag index /path/to/docs --full
+
+# Index only one project
+rag index /path/to/docs --project my_project
+
+# Search the knowledge base
+rag search "How does authentication work?"
+
+# Search within a specific project
+rag search "database schema" --project my_project --top-k 5
+
+# Show indexing status
+rag status
+
+# List indexed projects with file/chunk counts
+rag projects
+
+# Check system health
+rag doctor
+
+# Drop everything and rebuild from scratch
+rag rebuild /path/to/docs
+
+# Start MCP server for Claude CLI
+rag serve
+
+# Show version
+rag version
+```
+
 ## Claude CLI Integration (MCP)
 
 The system exposes a local MCP server that Claude CLI can use to search your knowledge base.
