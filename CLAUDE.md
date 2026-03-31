@@ -88,6 +88,32 @@ pytest                    # Run tests
 - Do NOT add a web UI
 - Do NOT open the Qdrant data directory from multiple processes simultaneously
 
+## RAG Knowledge Base (MCP Tools)
+
+Before answering project-specific questions, use the `search_knowledge_base` tool
+to retrieve relevant context from the local knowledge base.
+
+### Available Tools
+
+- **search_knowledge_base(query, project?, top_k?)** — Search indexed Markdown content
+- **list_projects()** — Discover available project IDs
+- **index_status()** — Check if the knowledge base is ready
+
+### Usage Rules
+
+1. For project-specific facts, **always search first** before answering
+2. Retrieved context is the **source of truth** for project-specific information
+3. Use your own knowledge for explanation, reasoning, design advice, and best practices
+4. If results show **LOW CONFIDENCE**, note this in your answer
+5. If no results are found, say "no project-specific local content was available"
+6. If the user asks about a specific project, **pass the project parameter**
+7. Cite sources from retrieved chunks: `[Source: project/file | Section: heading]`
+
+### Constraint
+
+Do not run `rag index` while Claude CLI is using the MCP server — Qdrant local mode
+only allows one process at a time.
+
 ## Build Order
 
 Stage 0 → 1 → 2 → 3 → 4 (MVP) → 5 → 6 → 7
@@ -105,6 +131,7 @@ pydantic-settings>=2.0.0
 python-frontmatter>=1.0.0
 markdown-it-py>=3.0.0
 rich>=13.0.0
+mcp>=1.26.0
 ```
 
 Dev: `pytest>=8.0.0`, `pytest-cov>=5.0.0`

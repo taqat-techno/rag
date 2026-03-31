@@ -90,5 +90,16 @@ def doctor():
     console.print(table)
 
 
+@app.command()
+def serve():
+    """Start the MCP server for Claude CLI integration."""
+    from ragtools.integration.mcp_server import main as mcp_main
+
+    console.print("[bold]Starting RAG MCP server (stdio transport)...[/bold]", err=True)
+    console.print("This process is meant to be launched by Claude CLI.", err=True)
+    console.print("Press Ctrl+C to stop.", err=True)
+    mcp_main()
+
+
 if __name__ == "__main__":
     app()

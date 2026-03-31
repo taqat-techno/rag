@@ -57,6 +57,32 @@ scripts/              # Utility scripts
 data/                 # Local state (gitignored)
 ```
 
+## Claude CLI Integration (MCP)
+
+The system exposes a local MCP server that Claude CLI can use to search your knowledge base.
+
+### Setup
+
+1. Index your Markdown files:
+   ```bash
+   rag index /path/to/your/docs
+   ```
+
+2. The MCP server is configured in `.claude/settings.json`.
+   Claude CLI starts it automatically when needed.
+
+3. Ask Claude project-specific questions — it will use `search_knowledge_base` automatically.
+
+### Manual Testing
+
+```bash
+# Start MCP server manually (for debugging)
+rag serve
+
+# Or directly:
+python -m ragtools.integration.mcp_server
+```
+
 ## Data
 
 All persistent state lives in `data/`. Delete it to start fresh.
