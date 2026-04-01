@@ -10,10 +10,15 @@ def extract_frontmatter(file_path: Path) -> tuple[dict[str, Any], str]:
     """Extract YAML frontmatter and body content from a Markdown file.
 
     Returns: (metadata_dict, body_content_string)
-    If no frontmatter exists, returns ({}, full_content).
+    If no frontmatter exists or parsing fails, returns ({}, full_content).
     """
-    post = frontmatter.load(str(file_path))
-    return dict(post.metadata), post.content
+    try:
+        post = frontmatter.load(str(file_path))
+        return dict(post.metadata), post.content
+    except Exception:
+        # Frontmatter parsing failed (malformed YAML) — treat as no frontmatter
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        return {}, content
 
 
 def estimate_tokens(text: str) -> int:

@@ -19,12 +19,24 @@ def discover_projects(content_root: str) -> dict[str, Path]:
     return projects
 
 
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", ".venv", "venv", "__pycache__", "node_modules",
+    "site-packages", ".tox", ".mypy_cache", ".pytest_cache", ".hypothesis",
+    "dist", "build", ".egg-info", ".stversions",
+}
+
+
 def discover_markdown_files(directory: Path) -> list[Path]:
-    """Find all .md files in a directory recursively.
+    """Find all .md files in a directory recursively, skipping common noise dirs.
 
     Returns: sorted list of absolute Paths to .md files
     """
-    return sorted(directory.rglob("*.md"))
+    results = []
+    for md in directory.rglob("*.md"):
+        # Skip files inside noise directories
+        if not any(part in SKIP_DIRS for part in md.parts):
+            results.append(md)
+    return sorted(results)
 
 
 def scan_project(content_root: str, project_id: str | None = None) -> list[tuple[str, Path]]:

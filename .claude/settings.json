@@ -48,5 +48,12 @@
     ],
     "deny": [],
     "defaultMode": "allowEdits"
+  },
+  "mcpServers": {
+    "ragtools": {
+      "command": "c:/MY-WorkSpace/rag/.venv/Scripts/python.exe",
+      "args": ["-m", "ragtools.integration.mcp_server"],
+      "cwd": "c:/MY-WorkSpace/rag"
+    }
   }
 }
