@@ -1,0 +1,177 @@
+[
+  {
+    "query": "What is the backend tech stack for Royal Preps?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Tech Stack",
+    "notes": "Django 5.1, DRF, PostgreSQL, Redis, Celery"
+  },
+  {
+    "query": "What frontend framework does Royal Preps use?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Tech Stack",
+    "notes": "Next.js 16, React 19, Tailwind CSS 4"
+  },
+  {
+    "query": "How does authentication work in Royal Preps?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Authentication",
+    "notes": "JWT with OTP verification, token rotation"
+  },
+  {
+    "query": "What are the Django backend apps?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Backend Apps",
+    "notes": "users, authentication, content, exams, subscriptions, marketing, common"
+  },
+  {
+    "query": "What is the content hierarchy in Royal Preps?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Content Hierarchy",
+    "notes": "Material > QuestionBank > Branch > Question > QuestionOption"
+  },
+  {
+    "query": "How does the permission system work?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Permission",
+    "notes": "Module-based RBAC: admin, sales, research, marketing x 3 levels"
+  },
+  {
+    "query": "What is the API base URL?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "API Structure",
+    "notes": "/api/v1/"
+  },
+  {
+    "query": "How are question options handled?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Question Correctness",
+    "notes": "First option (order=0) is always correct, shuffled during exam"
+  },
+  {
+    "query": "What is the Contact model used for?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Contact",
+    "notes": "Unified CRM entity: subscriber, partner, prospect roles"
+  },
+  {
+    "query": "What Celery queues exist?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Celery",
+    "notes": "default, notifications, subscriptions, auth, exams, analytics, marketing"
+  },
+  {
+    "query": "How do I run the Django tests?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Testing",
+    "notes": "python manage.py test"
+  },
+  {
+    "query": "What field naming convention is used for ForeignKey fields?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Field Naming",
+    "notes": "Odoo-style: _id suffix for FK, _ids for M2M"
+  },
+  {
+    "query": "What is the error response format?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Error Response",
+    "notes": "success: false, error: {code, message, details}"
+  },
+  {
+    "query": "How does the mobile app work?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Mobile",
+    "notes": "Flutter 3.29+ with Riverpod, Drift, FSRS"
+  },
+  {
+    "query": "What is the branch strategy for Royal Preps?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Branch",
+    "notes": "main > staging > develop > sprint > feature/fix"
+  },
+  {
+    "query": "How to run the Next.js frontend?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Frontend",
+    "notes": "npm run dev on localhost:3000"
+  },
+  {
+    "query": "What UUID pattern is used for primary keys?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "UUID",
+    "notes": "UUIDField with uuid4 default on all models"
+  },
+  {
+    "query": "Where is the production deployment?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Production",
+    "notes": "Railway at royalpreps-production.up.railway.app"
+  },
+  {
+    "query": "What state management does the frontend use?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Frontend Stack",
+    "notes": "Zustand for global, TanStack React Query for server state"
+  },
+  {
+    "query": "How does the upload portal work?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Upload Portal",
+    "notes": "Cloudflare Workers, npm run deploy"
+  },
+  {
+    "query": "What is the GDPR data export endpoint?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "GDPR",
+    "notes": "GET /api/v1/auth/me/data-export/"
+  },
+  {
+    "query": "How does module access work?",
+    "project": "django",
+    "expected_file": "django/royal_preps/CLAUDE.md",
+    "expected_section": "Module Access",
+    "notes": "UserModuleAccess join table, 4 modules x 3 levels, admin implicit"
+  },
+  {
+    "query": "What is the RAG system architecture?",
+    "project": "rag",
+    "expected_file": "rag/CLAUDE.md",
+    "expected_section": "Architecture",
+    "notes": "Qdrant local mode + Sentence Transformers + MCP"
+  },
+  {
+    "query": "How does incremental indexing work?",
+    "project": "rag",
+    "expected_file": "rag/implementation_plan_local.md",
+    "expected_section": "Incremental",
+    "notes": "SQLite state tracking, SHA256 file hashes"
+  },
+  {
+    "query": "What embedding model is used?",
+    "project": "rag",
+    "expected_file": "rag/CLAUDE.md",
+    "expected_section": "Embedding",
+    "notes": "all-MiniLM-L6-v2, 384 dims, cosine"
+  }
+]

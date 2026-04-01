@@ -222,7 +222,8 @@ def main() -> int:
 
     # Load questions
     questions = load_questions(args.questions)
-    print(f"Loaded {len(questions)} benchmark questions from {args.questions}\n")
+    if not args.json:
+        print(f"Loaded {len(questions)} benchmark questions from {args.questions}\n")
 
     # Initialize retrieval pipeline
     settings = Settings()
