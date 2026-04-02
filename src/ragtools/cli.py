@@ -329,6 +329,24 @@ def projects():
 
 
 @app.command()
+def watch(
+    path: str = typer.Argument(".", help="Root directory to watch for changes"),
+    debounce: int = typer.Option(3000, "--debounce", "-d", help="Debounce delay in milliseconds"),
+):
+    """Watch Markdown files and auto-index on changes.
+
+    Monitors the directory for .md file changes and triggers incremental
+    re-indexing after a quiet period. Stop with Ctrl+C.
+
+    NOTE: Do not run simultaneously with Claude CLI (MCP server).
+    Stop the watcher before starting Claude.
+    """
+    from ragtools.watcher.observer import run_watch
+
+    run_watch(content_root=path, debounce_ms=debounce)
+
+
+@app.command()
 def version():
     """Show the RAG Tools version."""
     from ragtools import __version__

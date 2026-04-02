@@ -87,12 +87,22 @@ rag doctor
 # Drop everything and rebuild from scratch
 rag rebuild /path/to/docs
 
+# Watch for changes and auto-index (foreground, Ctrl+C to stop)
+rag watch /path/to/docs
+
+# Custom debounce (default 3000ms)
+rag watch /path/to/docs --debounce 5000
+
 # Start MCP server for Claude CLI
 rag serve
 
 # Show version
 rag version
 ```
+
+> **Note:** Do not run `rag watch` and Claude CLI at the same time.
+> The watcher and MCP server both need Qdrant access.
+> Stop the watcher (Ctrl+C) before starting Claude.
 
 ## Claude CLI Integration (MCP)
 
