@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}RAG Tools{% endblock %}</title>
+    <link rel="icon" href="/static/logo.png" type="image/png">
     <link rel="stylesheet" href="/static/pico.min.css">
     <link rel="stylesheet" href="/static/design.css">
     <script src="/static/htmx.min.js"></script>
@@ -11,6 +12,7 @@
 <body>
     <aside class="sidebar">
         <div class="sidebar-brand">
+            <img src="/static/logo.png" alt="" onerror="this.style.display='none'">
             <span>RAG Tools</span>
         </div>
         <nav class="sidebar-nav">
@@ -54,6 +56,16 @@
         <footer class="main-footer">
             RAG Tools &mdash; Local AI Knowledge Base Manager
         </footer>
+
+        <div id="activity-drawer" class="activity-drawer">
+            <div class="activity-bar" onclick="document.getElementById('activity-drawer').classList.toggle('open')">
+                <span>Activity</span>
+                <span class="activity-chevron">&#9650;</span>
+            </div>
+            <div class="activity-panel" id="activity-panel"
+                 hx-get="/ui/activity" hx-trigger="every 5s" hx-swap="innerHTML">
+            </div>
+        </div>
     </div>
 </body>
 </html>

@@ -347,12 +347,27 @@ def startup_uninstall():
     raise HTTPException(status_code=500, detail="Failed to remove task")
 
 
+# --- Activity Log ---
+
+@router.get("/api/activity")
+def get_activity(
+    limit: int = Query(50, description="Max events"),
+    after: int = Query(0, description="Return events after this ID"),
+):
+    """Get recent activity events for the UI log."""
+    from ragtools.service.activity import activity_log
+    events = activity_log.get_recent(limit=limit, after_id=after)
+    return {"events": [e.to_dict() for e in events], "count": len(events)}
+
+
 # --- Shutdown ---
 
 @router.post("/api/shutdown")
 def shutdown():
     """Graceful shutdown. Stops watcher, then signals uvicorn to exit."""
     logger.info("Shutdown requested via API")
+    from ragtools.service.activity import log_activity
+    log_activity("warning", "service", "Shutdown requested")
 
     # Stop watcher if running
     watcher_stop()

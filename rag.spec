@@ -17,6 +17,7 @@ Output:
 import os
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 
@@ -36,50 +37,59 @@ MODEL_CACHE = os.path.join(PROJECT_ROOT, "build", "model_cache")
 if os.path.exists(MODEL_CACHE):
     datas.append((MODEL_CACHE, "model_cache"))
 
+binaries = []
+
+# Collect all for heavy packages with dynamic imports
+for pkg in ['sentence_transformers', 'transformers', 'torch']:
+    pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(pkg)
+    datas += pkg_datas
+    binaries += pkg_binaries
+
 # Hidden imports that PyInstaller misses
-hiddenimports = [
-    # Sentence Transformers + PyTorch
-    "sentence_transformers",
-    "sentence_transformers.models",
-    "torch",
-    "torch.nn",
-    "torch.nn.functional",
-    "transformers",
-    "tokenizers",
-    "huggingface_hub",
-    # Qdrant
-    "qdrant_client",
-    "qdrant_client.local",
-    "portalocker",
-    # FastAPI + Uvicorn
-    "fastapi",
-    "uvicorn",
-    "uvicorn.protocols.http",
-    "uvicorn.protocols.http.auto",
-    "uvicorn.lifespan",
-    "uvicorn.lifespan.on",
-    "starlette",
-    "httptools",
-    "websockets",
-    # Other
-    "pydantic",
-    "pydantic_settings",
-    "pathspec",
-    "frontmatter",
-    "yaml",
-    "rich",
-    "typer",
-    "httpx",
-    "jinja2",
-    "mcp",
-    "watchfiles",
-    "tomli_w",
-]
+hiddenimports = (
+    collect_submodules('sentence_transformers')
+    + collect_submodules('transformers')
+    + collect_submodules('uvicorn')
+    + collect_submodules('starlette')
+    + collect_submodules('fastapi')
+    + [
+        # Qdrant
+        "qdrant_client",
+        "qdrant_client.local",
+        "qdrant_client.local.qdrant_local",
+        "portalocker",
+        # FastAPI + server extras
+        "httptools",
+        "websockets",
+        "email.mime.multipart",
+        "email.mime.text",
+        "multiprocessing",
+        # Other
+        "pydantic",
+        "pydantic_settings",
+        "pydantic.deprecated",
+        "pydantic.deprecated.decorator",
+        "pathspec",
+        "frontmatter",
+        "yaml",
+        "rich",
+        "typer",
+        "httpx",
+        "jinja2",
+        "mcp",
+        "watchfiles",
+        "watchfiles._rust_notify",
+        "tomli_w",
+        "sklearn",
+        "sklearn.decomposition",
+        "sklearn.decomposition._pca",
+    ]
+)
 
 a = Analysis(
     [os.path.join(SRC_DIR, "ragtools", "cli.py")],
     pathex=[SRC_DIR],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

@@ -54,11 +54,14 @@ async def lifespan(app: FastAPI):
     logger.info("Loading encoder model: %s", _settings.embedding_model)
     _owner = QdrantOwner(_settings)
     logger.info("Service ready")
+    from ragtools.service.activity import log_activity
+    log_activity("success", "service", f"Service ready on {_settings.service_host}:{_settings.service_port}")
 
     yield
 
     # Shutdown
     logger.info("Shutting down service")
+    log_activity("info", "service", "Service shutting down")
     if _owner:
         _owner.close()
     _owner = None

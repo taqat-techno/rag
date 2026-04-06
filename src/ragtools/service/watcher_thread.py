@@ -55,6 +55,8 @@ class WatcherThread(threading.Thread):
             return not ignore_rules.is_ignored(Path(path), root_path)
 
         logger.info("Watcher started: %s (debounce=%dms)", content_root, self._debounce_ms)
+        from ragtools.service.activity import log_activity
+        log_activity("info", "watcher", f"Watcher started: {content_root}")
 
         try:
             for changes in watch(
@@ -88,6 +90,7 @@ class WatcherThread(threading.Thread):
                 modified = sum(1 for c, _ in md_changes if c == Change.modified)
                 deleted = sum(1 for c, _ in md_changes if c == Change.deleted)
                 logger.info("Changes detected: +%d ~%d -%d", added, modified, deleted)
+                log_activity("info", "watcher", f"Changes: +{added} ~{modified} -{deleted}")
 
                 # Trigger incremental index through the owner (uses shared client)
                 try:
@@ -97,12 +100,15 @@ class WatcherThread(threading.Thread):
                                     stats["indexed"], stats["skipped"], stats["deleted"])
                 except Exception as e:
                     logger.error("Indexing error: %s", e)
+                    log_activity("error", "watcher", f"Indexing error: {e}")
 
         except Exception as e:
             if not self._stop_event.is_set():
                 logger.error("Watcher error: %s", e)
+                log_activity("error", "watcher", f"Watcher error: {e}")
 
         logger.info("Watcher stopped")
+        log_activity("info", "watcher", "Watcher stopped")
 
     def stop(self):
         """Signal the watcher to stop."""

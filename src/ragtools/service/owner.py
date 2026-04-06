@@ -49,6 +49,8 @@ class QdrantOwner:
         ensure_collection(self._client, settings.collection_name, self._encoder.dimension)
         logger.info("QdrantOwner initialized (model=%s, collection=%s)",
                      settings.embedding_model, settings.collection_name)
+        from ragtools.service.activity import log_activity
+        log_activity("info", "service", f"Engine initialized (model={settings.embedding_model})")
 
     @property
     def client(self) -> QdrantClient:
@@ -131,10 +133,14 @@ class QdrantOwner:
 
     def run_full_index(self, project_id: str | None = None) -> dict:
         """Full index — re-index everything. Thread-safe."""
+        from ragtools.service.activity import log_activity
+        log_activity("info", "indexer", "Full index started")
         with self._lock:
             result = self._run_full_index_inner(project_id)
             self._invalidate_map_cache()
-            return result
+        log_activity("success", "indexer",
+                     f"Full index: {result['files_indexed']} files, {result['chunks_indexed']} chunks")
+        return result
 
     def run_incremental_index(self, project_id: str | None = None) -> dict:
         """Incremental index — only new/changed/deleted. Thread-safe."""
@@ -192,6 +198,9 @@ class QdrantOwner:
             self._invalidate_map_cache()
             logger.info("Incremental index: %d indexed, %d skipped, %d deleted",
                         stats["indexed"], stats["skipped"], stats["deleted"])
+            from ragtools.service.activity import log_activity
+            log_activity("success", "indexer",
+                         f"Incremental: {stats['indexed']} indexed, {stats['skipped']} skipped, {stats['deleted']} deleted")
             return stats
 
     def rebuild(self) -> dict:
@@ -214,6 +223,8 @@ class QdrantOwner:
                 state_path.unlink()
 
             # Full index
+            from ragtools.service.activity import log_activity
+            log_activity("info", "indexer", "Rebuild started — all data dropped")
             stats = self._run_full_index_inner()
             self._invalidate_map_cache()
             logger.info("Rebuild complete: %s", stats)
@@ -303,6 +314,8 @@ class QdrantOwner:
                 if hasattr(self._settings, key):
                     object.__setattr__(self._settings, key, value)
             logger.info("Settings updated: %s", list(kwargs.keys()))
+            from ragtools.service.activity import log_activity
+            log_activity("info", "config", f"Settings updated: {', '.join(kwargs.keys())}")
 
     def _invalidate_map_cache(self) -> None:
         """Invalidate the Semantic Map cache. Called after index changes."""

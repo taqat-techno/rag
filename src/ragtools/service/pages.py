@@ -398,6 +398,44 @@ def ui_startup_save(
         return f'<div class="flash flash-error">Save failed: {escape(str(e))}</div>'
 
 
+# --- Activity log fragment ---
+
+
+@page_router.get("/ui/activity", response_class=HTMLResponse)
+def ui_activity(after: int = Query(0)):
+    """Activity log HTML fragment for the bottom drawer."""
+    from ragtools.service.activity import activity_log
+    events = activity_log.get_recent(limit=50, after_id=after)
+
+    if not events:
+        return '<div class="activity-empty">No recent activity</div>'
+
+    rows = []
+    latest_id = events[-1].id if events else 0
+    for e in reversed(events):  # newest first
+        level_class = {
+            "info": "badge-accent", "success": "badge-success",
+            "warning": "badge-warning", "error": "badge-danger",
+        }.get(e.level, "badge-accent")
+
+        detail_html = ""
+        if e.details:
+            detail_html = f'<div class="activity-details">{escape(e.details)}</div>'
+
+        rows.append(f"""
+        <div class="activity-event">
+            <span class="activity-time">{escape(e.timestamp[11:19])}</span>
+            <span class="badge {level_class}" style="font-size:10px;">{escape(e.level)}</span>
+            <span class="activity-source">{escape(e.source)}</span>
+            <span class="activity-msg">{escape(e.message)}</span>
+            {detail_html}
+        </div>
+        """)
+
+    # Store latest ID for next poll
+    return f'<div data-latest-id="{latest_id}">' + "".join(rows) + "</div>"
+
+
 # --- Config save fragment ---
 
 
@@ -490,6 +528,8 @@ def _update_toml_config(section: str | None, data: dict) -> None:
         tomli_w.dump(existing, f)
 
     logger.info("Config updated: section=%s, keys=%s", section or "root", list(data.keys()))
+    from ragtools.service.activity import log_activity
+    log_activity("info", "config", f"Config saved: {section or 'general'} ({', '.join(data.keys())})")
 
 
 def _save_startup_config(settings, watcher: bool, open_browser: bool, delay: int) -> None:

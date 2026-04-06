@@ -8,22 +8,22 @@
    - `pyproject.toml` → `version = "X.Y.Z"`
    - `src/ragtools/__init__.py` → `__version__ = "X.Y.Z"`
    - `installer.iss` → `#define MyAppVersion "X.Y.Z"`
-3. Update `winget/` manifests with new version and placeholder SHA256
-4. Commit: `git commit -m "Release vX.Y.Z"`
+4. Update `winget/` manifests with new version and placeholder SHA256
+5. Commit: `git commit -m "Release vX.Y.Z"`
 
 ## Release
 
-5. Tag: `git tag vX.Y.Z`
-6. Push: `git push origin main --tags`
-7. GitHub Actions builds and creates the release automatically
-8. Verify the release on GitHub: installer `.exe` and portable `.zip` attached
+6. Tag: `git tag vX.Y.Z`
+7. Push: `git push origin main --tags`
+8. GitHub Actions builds and creates the release automatically
+9. Verify the release on GitHub: installer `.exe` and portable `.zip` attached
 
 ## Post-Release
 
-9. Download the installer from the release
-10. Compute SHA256: `certutil -hashfile RAGTools-Setup-X.Y.Z.exe SHA256`
-11. Update `winget/RAGTools.RAGTools.installer.yaml` with the real SHA256
-12. Submit PR to `microsoft/winget-pkgs` (or use `wingetcreate update`)
+10. Download the installer from the release
+11. Compute SHA256: `certutil -hashfile RAGTools-Setup-X.Y.Z.exe SHA256`
+12. Update `winget/RAGTools.RAGTools.installer.yaml` with the real SHA256
+13. Submit PR to `microsoft/winget-pkgs` (or use `wingetcreate update`)
 
 ## Version Numbering
 

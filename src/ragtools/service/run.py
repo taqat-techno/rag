@@ -7,6 +7,7 @@ Usage:
 
 import argparse
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -79,6 +80,14 @@ def main():
                         help="Indicates launch from Task Scheduler (enables browser-open if configured)")
     args = parser.parse_args()
 
+    # Set model cache path for frozen (PyInstaller) executables
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        bundle_dir = os.path.dirname(_sys.executable)
+        model_cache = os.path.join(bundle_dir, "model_cache")
+        if os.path.exists(model_cache):
+            os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", model_cache)
+
     settings = Settings()
     host = args.host or settings.service_host
     port = args.port or settings.service_port
@@ -88,7 +97,6 @@ def main():
     # Write PID file
     pid_path = Path(settings.qdrant_path).parent / "service.pid"
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    import os
     pid_path.write_text(str(os.getpid()))
 
     logger = logging.getLogger("ragtools.service")
