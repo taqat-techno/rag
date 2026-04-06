@@ -1,11 +1,14 @@
-# CLAUDE.md — Local Markdown RAG System
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Identity
 
 Local-first, Markdown-only RAG system. Claude CLI searches a local Qdrant knowledge base first, then completes answers using its own reasoning.
 
 **Stack:** Python 3.12 / Qdrant local mode / Sentence Transformers / Claude CLI (MCP)
-**No Docker. No cloud. No server processes. No containers.**
+**No Docker. No cloud. No containers.**
+**Evolving into:** long-running local service + web admin panel + Windows startup integration
 
 ## Architecture Decisions (Non-Negotiable)
 
@@ -23,11 +26,11 @@ Local-first, Markdown-only RAG system. Claude CLI searches a local Qdrant knowle
 
 ### Chunking
 - **Heading-based chunking** — split at `##`, `###`, `####` boundaries
-- **Fallback to paragraph splitting** if a section exceeds chunk_size
+- **Fallback to paragraph splitting** if a section exceeds chunk_size, then sentence splitting as last resort
 - **chunk_size=400 tokens, chunk_overlap=100 tokens**
 - **Prepend heading hierarchy** to chunk text before embedding (e.g., "Architecture > Backend\n\n...")
 - **Store raw text** (without headings) in payload for display
-- **Deterministic chunk IDs** — `sha256(project_id + file_path + chunk_index)[:16]`
+- **Deterministic chunk IDs** — `sha256(project_id::file_path::chunk_index)` formatted as UUID (Qdrant requires valid UUID strings)
 
 ### Retrieval
 - **Score threshold: 0.3** — below this, results are excluded
@@ -36,57 +39,84 @@ Local-first, Markdown-only RAG system. Claude CLI searches a local Qdrant knowle
 - **top_k=10** default
 
 ### Integration
-- **MCP server** for Claude CLI — exposes `search_knowledge_base` tool
-- **Single-process constraint** — do not run indexer and MCP server simultaneously on the same data directory
+- **MCP server** for Claude CLI — exposes `search_knowledge_base`, `list_projects`, `index_status` tools
+- **Single-process constraint** — do not run indexer/watcher and MCP server simultaneously on the same Qdrant data directory
 
-## Package Structure
+### Ignore Rules (Phase 1+)
+- **`.ragignore` files** — gitignore syntax, per-directory scope
+- **Three layers:** built-in defaults > global config `[ignore].patterns` > `.ragignore` files
+- **Matching:** `pathspec` library (gitignore spec, `!` negation supported)
+- **Enforcement:** scanner and watcher, NOT indexer (scanner already filtered)
+
+## Service Architecture (Phase 2+)
+
+Full decisions in `docs/decisions.md`. Key constraints:
+
+- **Single-process model** — the service process is the sole Qdrant owner. Watcher runs as a daemon thread. Encoder shared with `threading.RLock`.
+- **CLI dual-mode** — commands probe `localhost:21420/health` (1s timeout). If service responds, forward via HTTP. If not, fall back to direct Qdrant access (current behavior).
+- **MCP proxy mode** — MCP server probes service at startup. If available, becomes a thin HTTP proxy (instant startup). Otherwise falls back to direct mode (current 5-10s startup).
+- **Config resolution** — `RAG_CONFIG_PATH` env > `%LOCALAPPDATA%\RAGTools\config.toml` > `./ragtools.toml`. Env vars always override config file. TOML format.
+- **Data directory** — dev: `./data/` (current). Installed: `%LOCALAPPDATA%\RAGTools\`. Detected automatically.
+- **Service port** — `127.0.0.1:21420`, localhost-only, no auth.
+- **Logging** — service mode: `RotatingFileHandler` at `{data_dir}/logs/service.log`, 10MB, 3 backups.
+- **Startup** — Task Scheduler (Phase 5), not Startup Folder or Windows Service.
+
+## Data Pipeline
 
 ```
-src/ragtools/
-  cli.py              — Typer CLI
-  config.py           — Pydantic Settings from .env
-  models.py           — Chunk, FileRecord, SearchResult
-  chunking/           — Markdown parsing and splitting
-  embedding/          — SentenceTransformer wrapper
-  indexing/            — Scanner, indexer, state tracking
-  retrieval/           — Searcher, formatter
-  integration/         — MCP server
+Scanner (scanner.py)           — discovers projects (each subdir of content_root = project_id)
+  → discover_markdown_files    — rglob("*.md"), skips SKIP_DIRS (.git, node_modules, .venv, etc.)
+Chunker (chunking/markdown.py) — splits by heading boundaries → paragraph → sentence fallback
+Encoder (embedding/encoder.py) — SentenceTransformer, encodes chunk.text (heading-enriched)
+Indexer (indexing/indexer.py)   — upserts PointStruct to Qdrant, tracks state in SQLite
+Searcher (retrieval/searcher.py) — query_points with optional project_id filter
+Formatter (retrieval/formatter.py) — formats results with confidence labels and source attribution
 ```
+
+**Project discovery convention:** each immediate subdirectory of `content_root` becomes a `project_id`. Directories starting with `.` or `_` are skipped.
 
 ## Key Commands
 
 ```bash
-pip install -e .          # Install in dev mode
-pip install -e ".[dev]"   # With test dependencies
-rag index .               # Index all Markdown files
-rag index --full .        # Force full re-index
-rag search "query"        # Search the knowledge base
-rag status                # Show collection stats
-rag doctor                # Health check
-rag rebuild               # Drop everything, re-index from scratch
-rag projects              # List indexed projects
-pytest                    # Run tests
+pip install -e ".[dev]"           # Install with test dependencies
+rag index .                       # Incremental index (skips unchanged)
+rag index --full .                # Force full re-index
+rag index --project my_proj .     # Index single project
+rag search "query"                # Search knowledge base
+rag search "query" -p my_proj -k 5  # Filter by project, limit results
+rag status                        # Show collection stats
+rag doctor                        # Health check
+rag rebuild                       # Drop everything, re-index from scratch
+rag projects                      # List indexed projects with counts
+rag watch .                       # Auto-index on .md changes (Ctrl+C to stop)
+rag serve                         # Start MCP server (stdio transport)
+rag version                       # Show version
 ```
 
 ## Testing
 
-- **Always use `QdrantClient(":memory:")` for tests** — never touch real data
-- **Fixture files in `tests/fixtures/`** — sample .md files for each test scenario
-- **Test chunking independently** from indexing
-- **Test retrieval independently** from formatting
+```bash
+pytest                            # Run all tests
+pytest tests/test_chunking.py     # Single test file
+pytest -k "test_search"           # Filter by name
+pytest --cov=ragtools             # With coverage
+python scripts/eval_retrieval.py --questions tests/fixtures/eval_questions.json  # Eval harness
+```
+
+- **Always use `QdrantClient(":memory:")` for tests** — `Settings.get_memory_client()` helper exists
+- **Fixture files in `tests/fixtures/`** — sample .md files with two projects (`project_a`, `project_b`)
+- **Test modules mirror source**: `test_chunking`, `test_indexing`, `test_retrieval`, `test_integration`, `test_incremental`, `test_eval`
 
 ## What NOT to Do
 
-- Do NOT suggest Docker, containers, or server-mode Qdrant for MVP
-- Do NOT add LangChain or LlamaIndex as dependencies — we use libraries directly
+- Do NOT add LangChain or LlamaIndex — we use libraries directly
 - Do NOT use JSON files for state — use SQLite
 - Do NOT create multiple Qdrant collections — one collection, payload filtering
 - Do NOT change the embedding model without planning a full rebuild
-- Do NOT suggest cloud services, APIs, or hosted solutions
-- Do NOT add cross-encoder reranking, hybrid search, or SPLADE for MVP — these are post-MVP
-- Do NOT add watchfiles/auto-indexing for MVP
-- Do NOT add a web UI
-- Do NOT open the Qdrant data directory from multiple processes simultaneously
+- Do NOT suggest Docker, containers, server-mode Qdrant, cloud services, or hosted solutions
+- Do NOT add cross-encoder reranking, hybrid search, or SPLADE — these are post-MVP
+- Do NOT open the Qdrant data directory from multiple processes — the service is the sole owner (see `docs/decisions.md` Decision 1)
+- Do NOT use React, npm, or any JS build step for the admin panel — htmx + Jinja2 only (see `docs/decisions.md` Decision 6)
 
 ## RAG Knowledge Base (MCP Tools)
 
@@ -114,32 +144,24 @@ to retrieve relevant context from the local knowledge base.
 Do not run `rag index` while Claude CLI is using the MCP server — Qdrant local mode
 only allows one process at a time.
 
-## Build Order
+## Configuration
 
-Stage 0 → 1 → 2 → 3 → 4 (MVP) → 5 → 6 → 7
+All settings in `config.py` via Pydantic Settings. Override with env vars prefixed `RAG_` or `.env` file:
 
-Each stage must be tested before moving to the next. See `implementation_plan_local.md` for full details.
+| Env Var | Default | Notes |
+|---------|---------|-------|
+| `RAG_QDRANT_PATH` | `data/qdrant` | Local Qdrant storage |
+| `RAG_COLLECTION_NAME` | `markdown_kb` | Single collection name |
+| `RAG_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Do not change without rebuild |
+| `RAG_CHUNK_SIZE` | `400` | Target tokens per chunk |
+| `RAG_CHUNK_OVERLAP` | `100` | Overlap tokens |
+| `RAG_TOP_K` | `10` | Default search results |
+| `RAG_SCORE_THRESHOLD` | `0.3` | Minimum similarity score |
+| `RAG_CONTENT_ROOT` | `.` | Root for project discovery |
+| `RAG_STATE_DB` | `data/index_state.db` | SQLite state path |
 
-## Dependencies
+## Entry Points
 
-```
-qdrant-client>=1.12.0
-sentence-transformers>=5.0.0
-typer[all]>=0.12.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-python-frontmatter>=1.0.0
-markdown-it-py>=3.0.0
-rich>=13.0.0
-mcp>=1.26.0
-```
-
-Dev: `pytest>=8.0.0`, `pytest-cov>=5.0.0`
-
-## File Conventions
-
-- Source in `src/ragtools/`
-- Tests in `tests/`
-- Scripts in `scripts/`
-- All local data in `data/` (gitignored)
-- Config in `.env` with `RAG_` prefix
+Defined in `pyproject.toml`:
+- `rag` → `ragtools.cli:app` (Typer CLI)
+- `rag-mcp` → `ragtools.integration.mcp_server:main` (MCP server direct)

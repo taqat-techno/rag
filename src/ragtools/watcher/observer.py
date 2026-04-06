@@ -19,17 +19,25 @@ from rich.console import Console
 from watchfiles import watch, Change
 
 from ragtools.config import Settings
-from ragtools.indexing.scanner import SKIP_DIRS
+from ragtools.ignore import IgnoreRules, RAGIGNORE_FILENAME
 
 console = Console()
 
 
-def _md_filter(change: Change, path: str) -> bool:
-    """Only watch .md file changes, skip noise directories."""
-    if not path.endswith(".md"):
-        return False
-    parts = Path(path).parts
-    return not any(part in SKIP_DIRS for part in parts)
+def _make_md_filter(ignore_rules: IgnoreRules, content_root: Path):
+    """Create a watchfiles filter using ignore rules.
+
+    Returns a closure that watchfiles can use as watch_filter.
+    """
+    def md_filter(change: Change, path: str) -> bool:
+        # Accept .ragignore file changes (to trigger rule reload)
+        if Path(path).name == RAGIGNORE_FILENAME:
+            return True
+        if not path.endswith(".md"):
+            return False
+        return not ignore_rules.is_ignored(Path(path), content_root)
+
+    return md_filter
 
 
 def run_watch(
@@ -52,6 +60,13 @@ def run_watch(
             if k != "content_root"
         })
 
+    root_path = Path(content_root).resolve()
+    ignore_rules = IgnoreRules(
+        content_root=root_path,
+        global_patterns=settings.ignore_patterns,
+        use_ragignore=settings.use_ragignore_files,
+    )
+
     console.print(f"[bold]Watching[/bold] {content_root} for Markdown changes...")
     console.print(f"  Debounce: {debounce_ms}ms")
     console.print(f"  Press Ctrl+C to stop.\n")
@@ -59,7 +74,7 @@ def run_watch(
     try:
         for changes in watch(
             content_root,
-            watch_filter=_md_filter,
+            watch_filter=_make_md_filter(ignore_rules, root_path),
             debounce=debounce_ms,
             recursive=True,
             raise_interrupt=False,
@@ -67,10 +82,23 @@ def run_watch(
             if not changes:
                 continue
 
+            # Check if any .ragignore files changed — reload rules
+            ragignore_changed = any(
+                Path(p).name == RAGIGNORE_FILENAME for _, p in changes
+            )
+            if ragignore_changed:
+                ignore_rules.clear_cache()
+                console.print("  [dim].ragignore changed — ignore rules reloaded[/dim]")
+
+            # Filter to only actual .md changes (not .ragignore changes)
+            md_changes = [(c, p) for c, p in changes if p.endswith(".md")]
+            if not md_changes:
+                continue
+
             # Summarize what changed
-            added = [(p) for c, p in changes if c == Change.added]
-            modified = [(p) for c, p in changes if c == Change.modified]
-            deleted = [(p) for c, p in changes if c == Change.deleted]
+            added = [p for c, p in md_changes if c == Change.added]
+            modified = [p for c, p in md_changes if c == Change.modified]
+            deleted = [p for c, p in md_changes if c == Change.deleted]
 
             console.print(f"\n[yellow]Changes detected[/yellow] at {time.strftime('%H:%M:%S')}:")
             for p in added:
@@ -81,13 +109,13 @@ def run_watch(
                 console.print(f"  [red]- {_short_path(p, content_root)}[/red]")
 
             # Run incremental indexing
-            _run_incremental(settings)
+            _run_incremental(settings, ignore_rules)
 
     except KeyboardInterrupt:
         console.print("\n[bold]Watcher stopped.[/bold]")
 
 
-def _run_incremental(settings: Settings) -> None:
+def _run_incremental(settings: Settings, ignore_rules: IgnoreRules) -> None:
     """Run incremental indexing, opening and closing Qdrant within this call."""
     try:
         from ragtools.embedding.encoder import Encoder
@@ -105,7 +133,7 @@ def _run_incremental(settings: Settings) -> None:
 
         ensure_collection(client, settings.collection_name, encoder.dimension)
 
-        files = scan_project(settings.content_root)
+        files = scan_project(settings.content_root, ignore_rules=ignore_rules)
         current_paths = {get_relative_path(fp, settings.content_root) for _, fp in files}
         tracked_paths = state.get_all_paths()
         deleted_paths = tracked_paths - current_paths

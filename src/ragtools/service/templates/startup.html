@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Startup — RAG Tools{% endblock %}
+{% block header %}
+<h1 class="page-title">Startup</h1>
+<p class="page-subtitle">Windows auto-start configuration</p>
+{% endblock %}
+{% block content %}
+
+<div class="card">
+    <div class="card-header">Windows Login Startup</div>
+    <div id="startup-status" hx-get="/ui/startup/status" hx-trigger="load" hx-swap="innerHTML">
+        <span class="loading-placeholder">Loading status...</span>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">Startup Behavior</div>
+    <p style="font-size: 13px; color: var(--color-text-secondary); margin: 0 0 14px;">Configure what happens when the service starts automatically.</p>
+    <form hx-put="/ui/startup/save" hx-target="#save-result" hx-swap="innerHTML">
+        <label class="form-check">
+            <input type="checkbox" name="startup_watcher" id="startup-watcher">
+            Auto-start file watcher
+        </label>
+        <label class="form-check">
+            <input type="checkbox" name="startup_open_browser" id="startup-browser">
+            Open admin panel in browser on startup
+        </label>
+        <div class="form-group">
+            <label class="form-label">Startup delay (seconds)</label>
+            <input type="number" name="startup_delay" id="startup-delay" class="form-input" value="30" min="0" max="300" style="width: 120px;">
+        </div>
+        <button type="submit" class="btn btn-primary">Save Settings</button>
+    </form>
+    <div id="save-result" style="margin-top: 12px;"></div>
+</div>
+
+<div class="card">
+    <div class="card-header">CLI Commands</div>
+    <pre class="code-block">rag service install            # Register startup task
+rag service install --delay 60  # Custom delay
+rag service uninstall          # Remove startup task
+rag service start              # Start now
+rag service stop               # Stop now</pre>
+</div>
+
+<script>
+    fetch('/api/config').then(r => r.json()).then(data => {
+        document.getElementById('startup-watcher').checked = data.startup_watcher || false;
+        document.getElementById('startup-browser').checked = data.startup_open_browser || false;
+        document.getElementById('startup-delay').value = data.startup_delay || 30;
+    });
+</script>
+
+{% endblock %}

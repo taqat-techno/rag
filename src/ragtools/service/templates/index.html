@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Index — RAG Tools{% endblock %}
+{% block header %}
+<h1 class="page-title">Indexing</h1>
+<p class="page-subtitle">Manage the knowledge base index</p>
+{% endblock %}
+{% block content %}
+
+<div class="card card-compact">
+    <div class="card-header">Current Status</div>
+    <div id="index-status" hx-get="/ui/status" hx-trigger="load" hx-swap="innerHTML">
+        <span class="loading-placeholder">Loading status...</span>
+    </div>
+</div>
+
+<div class="grid-3">
+    <div class="card">
+        <div class="card-header">Incremental</div>
+        <p style="font-size: 13px; color: var(--color-text-secondary); margin: 0 0 14px;">Index new and changed files only. Skips unchanged.</p>
+        <button class="btn btn-primary" hx-post="/ui/index" hx-target="#index-result" hx-swap="innerHTML"
+                hx-indicator="#index-spinner">
+            Run Incremental
+        </button>
+    </div>
+    <div class="card">
+        <div class="card-header">Full Re-index</div>
+        <p style="font-size: 13px; color: var(--color-text-secondary); margin: 0 0 14px;">Re-index all files, ignoring previous state.</p>
+        <button class="btn btn-secondary" hx-post="/ui/index?full=true" hx-target="#index-result" hx-swap="innerHTML"
+                hx-confirm="Re-index all files?" hx-indicator="#index-spinner">
+            Run Full Index
+        </button>
+    </div>
+    <div class="card">
+        <div class="card-header">Rebuild</div>
+        <p style="font-size: 13px; color: var(--color-text-secondary); margin: 0 0 14px;">Drop all data and rebuild from scratch.</p>
+        <button class="btn btn-danger" hx-post="/ui/rebuild" hx-target="#index-result" hx-swap="innerHTML"
+                hx-confirm="This will delete ALL indexed data and rebuild. Continue?"
+                hx-indicator="#index-spinner">
+            Rebuild
+        </button>
+    </div>
+</div>
+
+<span id="index-spinner" class="htmx-indicator">Indexing in progress...</span>
+<div id="index-result" style="margin-top: 8px;"></div>
+
+{% endblock %}

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Search — RAG Tools{% endblock %}
+{% block header %}
+<h1 class="page-title">Search</h1>
+<p class="page-subtitle">Test semantic search against the knowledge base</p>
+{% endblock %}
+{% block content %}
+
+<div class="card">
+    <form hx-get="/ui/search" hx-target="#results" hx-swap="innerHTML" hx-indicator="#search-spinner">
+        <div class="form-row">
+            <div style="flex: 1;">
+                <input type="text" name="query" class="form-input" placeholder="Enter your search query..." required autofocus>
+            </div>
+            <div style="width: 160px;">
+                <select name="project" class="form-select">
+                    <option value="">All projects</option>
+                </select>
+            </div>
+            <div style="width: 80px;">
+                <input type="number" name="top_k" class="form-input" value="10" min="1" max="50">
+            </div>
+            <button type="submit" class="btn btn-primary">Search</button>
+        </div>
+        <span id="search-spinner" class="htmx-indicator" style="margin-top: 10px;">Searching...</span>
+    </form>
+</div>
+
+<script>
+    fetch('/api/projects').then(r => r.json()).then(data => {
+        const sel = document.querySelector('select[name=project]');
+        (data.projects || []).forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p.project_id;
+            opt.textContent = p.project_id;
+            sel.appendChild(opt);
+        });
+    });
+</script>
+
+<div id="results"></div>
+
+{% endblock %}

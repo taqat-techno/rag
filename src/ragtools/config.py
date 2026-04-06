@@ -1,15 +1,149 @@
-"""Configuration for RAG Tools."""
+"""Configuration for RAG Tools.
 
+Priority chain (highest to lowest):
+  1. Environment variables (RAG_* prefix)
+  2. TOML config file (if found)
+  3. Code defaults
+
+TOML config resolution (first match wins):
+  1. RAG_CONFIG_PATH env var
+  2. %LOCALAPPDATA%/RAGTools/config.toml  (Windows installed/packaged mode)
+  3. ./ragtools.toml  (dev mode)
+
+Packaged mode detection:
+  If sys.frozen is True (PyInstaller bundle), paths resolve to
+  %LOCALAPPDATA%/RAGTools/ instead of relative CWD paths.
+"""
+
+import os
+import sys
 from pathlib import Path
+from typing import Any, Tuple, Type
 
-from pydantic_settings import BaseSettings
+from pydantic import Field
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
+
+
+def is_packaged() -> bool:
+    """Check if running from a PyInstaller bundle."""
+    return getattr(sys, "frozen", False)
+
+
+def get_data_dir() -> Path:
+    """Resolve the data directory based on mode.
+
+    Packaged/installed mode: %LOCALAPPDATA%/RAGTools
+    Dev mode: ./data (relative to CWD)
+    """
+    # 1. Explicit override
+    explicit = os.environ.get("RAG_DATA_DIR")
+    if explicit:
+        return Path(explicit)
+
+    # 2. Packaged mode or installed mode (Windows)
+    if is_packaged() or (sys.platform == "win32" and os.environ.get("LOCALAPPDATA")):
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            installed_dir = Path(local_app_data) / "RAGTools"
+            # Use installed dir if it exists OR if we're packaged
+            if is_packaged() or installed_dir.exists():
+                installed_dir.mkdir(parents=True, exist_ok=True)
+                return installed_dir
+
+    # 3. Dev mode
+    return Path("data").resolve()
+
+
+def _find_config_path() -> Path | None:
+    """Resolve TOML config file location. Returns None if no config file exists."""
+    # 1. Explicit override
+    explicit = os.environ.get("RAG_CONFIG_PATH")
+    if explicit:
+        p = Path(explicit)
+        if p.is_file():
+            return p
+        return None
+
+    # 2. Installed mode (Windows)
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            installed = Path(local_app_data) / "RAGTools" / "config.toml"
+            if installed.is_file():
+                return installed
+
+    # 3. Dev mode (CWD)
+    dev = Path("ragtools.toml")
+    if dev.is_file():
+        return dev
+
+    return None
+
+
+def _load_toml(path: Path) -> dict[str, Any]:
+    """Read a TOML config file and return a flat dict suitable for Settings."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    # Flatten nested sections into Settings field names.
+    flat: dict[str, Any] = {}
+    for key, value in data.items():
+        if key == "ignore" and isinstance(value, dict):
+            if "patterns" in value:
+                flat["ignore_patterns"] = value["patterns"]
+            if "use_ragignore_files" in value:
+                flat["use_ragignore_files"] = value["use_ragignore_files"]
+        elif key == "version":
+            pass
+        elif isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                flat[f"{key}_{sub_key}"] = sub_value
+        else:
+            flat[key] = value
+
+    return flat
+
+
+class TomlConfigSource(PydanticBaseSettingsSource):
+    """Pydantic settings source that reads from a TOML config file."""
+
+    def __init__(self, settings_cls: Type[BaseSettings]):
+        super().__init__(settings_cls)
+        config_path = _find_config_path()
+        self._data: dict[str, Any] = _load_toml(config_path) if config_path else {}
+
+    def get_field_value(self, field: Any, field_name: str) -> Tuple[Any, str, bool]:
+        val = self._data.get(field_name)
+        return val, field_name, val is not None
+
+    def __call__(self) -> dict[str, Any]:
+        return self._data
+
+
+def _default_qdrant_path() -> str:
+    """Default Qdrant path — absolute for packaged, relative for dev."""
+    if is_packaged():
+        return str(get_data_dir() / "data" / "qdrant")
+    return "data/qdrant"
+
+
+def _default_state_db() -> str:
+    """Default state DB path — absolute for packaged, relative for dev."""
+    if is_packaged():
+        return str(get_data_dir() / "data" / "index_state.db")
+    return "data/index_state.db"
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables with RAG_ prefix."""
 
     # Qdrant local mode
-    qdrant_path: str = "data/qdrant"
+    qdrant_path: str = Field(default_factory=_default_qdrant_path)
     collection_name: str = "markdown_kb"
 
     # Embedding
@@ -28,9 +162,42 @@ class Settings(BaseSettings):
     score_threshold: float = 0.3
 
     # State
-    state_db: str = "data/index_state.db"
+    state_db: str = Field(default_factory=_default_state_db)
+
+    # Ignore rules
+    ignore_patterns: list[str] = Field(default_factory=list)
+    use_ragignore_files: bool = True
+
+    # Service
+    service_host: str = "127.0.0.1"
+    service_port: int = 21420
+    log_level: str = "INFO"
+
+    # Startup
+    startup_enabled: bool = False
+    startup_delay: int = 30
+    startup_watcher: bool = True
+    startup_open_browser: bool = False
 
     model_config = {"env_prefix": "RAG_", "env_file": ".env", "env_file_encoding": "utf-8"}
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ):
+        """Priority: init kwargs > env vars > TOML config > .env > defaults."""
+        return (
+            init_settings,
+            env_settings,
+            TomlConfigSource(settings_cls),
+            dotenv_settings,
+            file_secret_settings,
+        )
 
     def get_qdrant_client(self):
         """Create a Qdrant client in local persistent mode."""

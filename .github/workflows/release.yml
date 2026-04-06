@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Cache SentenceTransformer model
+        uses: actions/cache@v4
+        with:
+          path: build\model_cache
+          key: model-build-cache-all-MiniLM-L6-v2-v1
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,build]"
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download model
+        run: python scripts/build.py --no-model
+        # First run without model to verify PyInstaller works
+        # Then download model separately for caching
+        continue-on-error: true
+
+      - name: Build with model
+        run: python scripts/build.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        run: |
+          $env:PATH += ";C:\Program Files (x86)\Inno Setup 6"
+          iscc installer.iss
+
+      - name: Create zip of portable bundle
+        shell: bash
+        run: |
+          cd dist
+          7z a -tzip "RAGTools-${{ steps.version.outputs.version }}-portable.zip" rag/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RAG Tools v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/RAGTools-Setup-${{ steps.version.outputs.version }}.exe
+            dist/RAGTools-${{ steps.version.outputs.version }}-portable.zip

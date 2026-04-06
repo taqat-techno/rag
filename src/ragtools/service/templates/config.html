@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}Settings — RAG Tools{% endblock %}
+{% block header %}
+<h1 class="page-title">Settings</h1>
+<p class="page-subtitle">Configure indexing, retrieval, and service behavior</p>
+{% endblock %}
+{% block content %}
+
+<form hx-put="/ui/config/save" hx-target="#save-result" hx-swap="innerHTML">
+
+<div class="grid-2">
+    <div class="card">
+        <div class="card-header">Indexing</div>
+        <div class="form-group">
+            <label class="form-label">Chunk size (tokens)</label>
+            <input type="number" name="chunk_size" id="cfg-chunk-size" class="form-input" min="100" max="2000">
+        </div>
+        <div class="form-group">
+            <label class="form-label">Chunk overlap (tokens)</label>
+            <input type="number" name="chunk_overlap" id="cfg-chunk-overlap" class="form-input" min="0" max="500">
+        </div>
+        <div class="form-group">
+            <label class="form-label">Content root</label>
+            <input type="text" name="content_root" id="cfg-content-root" class="form-input">
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">Retrieval</div>
+        <div class="form-group">
+            <label class="form-label">Top K (max results)</label>
+            <input type="number" name="top_k" id="cfg-top-k" class="form-input" min="1" max="100">
+        </div>
+        <div class="form-group">
+            <label class="form-label">Score threshold (0.0 – 1.0)</label>
+            <input type="number" name="score_threshold" id="cfg-score-threshold" class="form-input" min="0" max="1" step="0.05">
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">Service <span class="badge badge-warning" style="margin-left:8px; font-size:10px;">Restart required</span></div>
+    <div class="grid-2">
+        <div class="form-group">
+            <label class="form-label">Port</label>
+            <input type="number" name="service_port" id="cfg-port" class="form-input" min="1024" max="65535">
+        </div>
+        <div class="form-group">
+            <label class="form-label">Log level</label>
+            <select name="log_level" id="cfg-log-level" class="form-select">
+                <option value="DEBUG">DEBUG</option>
+                <option value="INFO">INFO</option>
+                <option value="WARNING">WARNING</option>
+                <option value="ERROR">ERROR</option>
+            </select>
+        </div>
+    </div>
+</div>
+
+<div style="display:flex; gap:12px; align-items:center; margin-bottom:16px;">
+    <button type="submit" class="btn btn-primary">Save Settings</button>
+    <span id="save-result"></span>
+</div>
+
+</form>
+
+<div class="card">
+    <div class="card-header">Storage (read-only)</div>
+    <div class="callout" style="margin-bottom:12px;">These values are set at startup and cannot be changed from the UI.</div>
+    <table class="table-clean">
+        <tr><td>Qdrant path</td><td id="cfg-qdrant-path"><code>—</code></td></tr>
+        <tr><td>State DB</td><td id="cfg-state-db"><code>—</code></td></tr>
+        <tr><td>Collection</td><td id="cfg-collection"><code>—</code></td></tr>
+        <tr><td>Embedding model</td><td id="cfg-model"><code>—</code></td></tr>
+    </table>
+</div>
+
+<script>
+fetch('/api/config').then(r => r.json()).then(d => {
+    document.getElementById('cfg-chunk-size').value = d.chunk_size;
+    document.getElementById('cfg-chunk-overlap').value = d.chunk_overlap;
+    document.getElementById('cfg-content-root').value = d.content_root;
+    document.getElementById('cfg-top-k').value = d.top_k;
+    document.getElementById('cfg-score-threshold').value = d.score_threshold;
+    document.getElementById('cfg-port').value = d.service_port;
+    document.getElementById('cfg-log-level').value = d.log_level;
+    document.getElementById('cfg-qdrant-path').innerHTML = '<code>' + d.qdrant_path + '</code>';
+    document.getElementById('cfg-state-db').innerHTML = '<code>' + d.state_db + '</code>';
+    document.getElementById('cfg-collection').innerHTML = '<code>' + d.collection_name + '</code>';
+    document.getElementById('cfg-model').innerHTML = '<code>' + d.embedding_model + '</code>';
+});
+</script>
+
+{% endblock %}

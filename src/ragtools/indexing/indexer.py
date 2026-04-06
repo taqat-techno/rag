@@ -1,10 +1,14 @@
 """Full indexing pipeline: scan -> chunk -> embed -> upsert to Qdrant.
 
 Supports both full and incremental indexing modes.
+Ignore rules are applied by the scanner — the indexer does NOT re-check.
 """
+
+from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -25,6 +29,9 @@ from ragtools.indexing.scanner import (
 )
 from ragtools.indexing.state import IndexState
 from ragtools.models import Chunk
+
+if TYPE_CHECKING:
+    from ragtools.ignore import IgnoreRules
 
 
 def ensure_collection(client: QdrantClient, name: str, dim: int) -> None:
@@ -150,6 +157,7 @@ def index_file(
 def run_full_index(
     settings: Settings | None = None,
     project_id: str | None = None,
+    ignore_rules: IgnoreRules | None = None,
 ) -> dict:
     """Run a full indexing pipeline (no state tracking, re-indexes everything).
 
@@ -168,7 +176,7 @@ def run_full_index(
 
     ensure_collection(client, settings.collection_name, encoder.dimension)
 
-    files = scan_project(settings.content_root, project_id=project_id)
+    files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules)
 
     stats = {
         "files_indexed": 0,
@@ -199,6 +207,7 @@ def run_full_index(
 def run_incremental_index(
     settings: Settings | None = None,
     project_id: str | None = None,
+    ignore_rules: IgnoreRules | None = None,
 ) -> dict:
     """Run incremental indexing: only process new, changed, or deleted files.
 
@@ -226,7 +235,7 @@ def run_incremental_index(
     ensure_collection(client, settings.collection_name, encoder.dimension)
 
     # Discover current files on disk
-    files = scan_project(settings.content_root, project_id=project_id)
+    files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules)
     current_paths = {get_relative_path(fp, settings.content_root) for _, fp in files}
 
     # Detect deleted files (in state but not on disk)
