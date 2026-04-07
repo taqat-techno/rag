@@ -9,32 +9,47 @@
 <div class="card">
     <form hx-get="/ui/search" hx-target="#results" hx-swap="innerHTML" hx-indicator="#search-spinner">
         <div class="form-row">
-            <div style="flex: 1;">
+            <div style="flex: 1 1 200px; min-width: 200px;">
                 <input type="text" name="query" class="form-input" placeholder="Enter your search query..." required autofocus>
             </div>
-            <div style="width: 160px;">
+            <div style="width: 160px; flex-shrink: 0;">
                 <select name="project" class="form-select">
                     <option value="">All projects</option>
                 </select>
             </div>
-            <div style="width: 80px;">
+            <div style="width: 80px; flex-shrink: 0;">
                 <input type="number" name="top_k" class="form-input" value="10" min="1" max="50">
             </div>
-            <button type="submit" class="btn btn-primary">Search</button>
+            <button type="submit" class="btn btn-primary" style="flex-shrink: 0;">Search</button>
         </div>
         <span id="search-spinner" class="htmx-indicator" style="margin-top: 10px;">Searching...</span>
     </form>
 </div>
 
 <script>
-    fetch('/api/projects').then(r => r.json()).then(data => {
+    // Populate project dropdown from configured projects (v2) with v1 fallback
+    fetch('/api/projects/configured').then(r => {
+        if (!r.ok) throw new Error('Not available');
+        return r.json();
+    }).then(data => {
         const sel = document.querySelector('select[name=project]');
-        (data.projects || []).forEach(p => {
+        (data.projects || []).filter(p => p.enabled).forEach(p => {
             const opt = document.createElement('option');
-            opt.value = p.project_id;
-            opt.textContent = p.project_id;
+            opt.value = p.id;
+            opt.textContent = p.name || p.id;
             sel.appendChild(opt);
         });
+    }).catch(() => {
+        // Fallback for v1 or service not running
+        fetch('/api/projects').then(r => r.json()).then(data => {
+            const sel = document.querySelector('select[name=project]');
+            (data.projects || []).forEach(p => {
+                const opt = document.createElement('option');
+                opt.value = p.project_id;
+                opt.textContent = p.project_id;
+                sel.appendChild(opt);
+            });
+        }).catch(() => {});
     });
 </script>
 

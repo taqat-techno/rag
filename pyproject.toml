@@ -38,5 +38,14 @@ rag-mcp = "ragtools.integration.mcp_server:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+ragtools = [
+    "service/templates/*.html",
+    "service/static/*.css",
+    "service/static/*.js",
+    "service/static/*.png",
+    "service/static/*.ico",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

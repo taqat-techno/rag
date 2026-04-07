@@ -93,6 +93,163 @@ def projects():
     return {"projects": owner.get_projects()}
 
 
+# --- Project Management ---
+
+class ProjectCreateRequest(BaseModel):
+    id: str
+    name: str = ""
+    path: str
+    enabled: bool = True
+    ignore_patterns: list[str] = []
+
+
+class ProjectUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    path: Optional[str] = None
+    enabled: Optional[bool] = None
+    ignore_patterns: Optional[list[str]] = None
+
+
+import re
+def _validate_project_id(pid: str) -> str | None:
+    if not pid or not pid.strip():
+        return "Project ID is required"
+    if not re.match(r'^[a-z0-9][a-z0-9_-]*$', pid):
+        return "ID must be lowercase alphanumeric with hyphens/underscores"
+    if len(pid) > 64:
+        return "ID must be 64 characters or fewer"
+    return None
+
+
+@router.get("/api/projects/configured")
+def projects_configured():
+    """List configured projects with index stats."""
+    from pathlib import Path as P
+    settings = get_settings()
+    state_path = P(settings.state_db)
+    index_data = {}
+    if state_path.exists():
+        from ragtools.indexing.state import IndexState
+        state = IndexState(settings.state_db)
+        for project in settings.projects:
+            records = state.get_all_for_project(project.id)
+            index_data[project.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
+        state.close()
+
+    return {"projects": [
+        {
+            "id": p.id, "name": p.name, "path": p.path,
+            "enabled": p.enabled, "ignore_patterns": p.ignore_patterns,
+            "files": index_data.get(p.id, {}).get("files", 0),
+            "chunks": index_data.get(p.id, {}).get("chunks", 0),
+        }
+        for p in settings.projects
+    ]}
+
+
+@router.post("/api/projects")
+def project_create(req: ProjectCreateRequest):
+    """Add a new project."""
+    from pathlib import Path as P
+    from ragtools.config import ProjectConfig
+
+    err = _validate_project_id(req.id)
+    if err:
+        raise HTTPException(status_code=422, detail=err)
+
+    settings = get_settings()
+    if any(p.id == req.id for p in settings.projects):
+        raise HTTPException(status_code=422, detail=f"Project ID '{req.id}' already exists")
+
+    path = str(P(req.path).resolve())
+    if not P(path).is_dir():
+        raise HTTPException(status_code=422, detail=f"Path does not exist or is not a directory: {req.path}")
+
+    new_project = ProjectConfig(
+        id=req.id, name=req.name or req.id, path=path,
+        enabled=req.enabled, ignore_patterns=req.ignore_patterns,
+    )
+    updated = list(settings.projects) + [new_project]
+
+    from ragtools.service.pages import _save_projects_to_toml
+    _save_projects_to_toml(updated)
+    get_owner().update_projects(updated)
+
+    from ragtools.service.activity import log_activity
+    log_activity("info", "config", f"Project added: {req.id}")
+    _restart_watcher_if_running()
+    return {"status": "created", "project": {"id": new_project.id, "name": new_project.name, "path": new_project.path}}
+
+
+@router.put("/api/projects/{project_id}")
+def project_update(project_id: str, req: ProjectUpdateRequest):
+    """Update a project."""
+    from pathlib import Path as P
+    settings = get_settings()
+    project = next((p for p in settings.projects if p.id == project_id), None)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    if req.name is not None:
+        project.name = req.name
+    if req.path is not None:
+        resolved = str(P(req.path).resolve())
+        if not P(resolved).is_dir():
+            raise HTTPException(status_code=422, detail=f"Path does not exist: {req.path}")
+        project.path = resolved
+    if req.enabled is not None:
+        project.enabled = req.enabled
+    if req.ignore_patterns is not None:
+        project.ignore_patterns = req.ignore_patterns
+
+    from ragtools.service.pages import _save_projects_to_toml
+    _save_projects_to_toml(list(settings.projects))
+    get_owner().update_projects(list(settings.projects))
+
+    from ragtools.service.activity import log_activity
+    log_activity("info", "config", f"Project updated: {project_id}")
+    _restart_watcher_if_running()
+    return {"status": "updated", "project": {"id": project.id, "name": project.name, "path": project.path}}
+
+
+@router.delete("/api/projects/{project_id}")
+def project_delete(project_id: str):
+    """Remove a project."""
+    settings = get_settings()
+    updated = [p for p in settings.projects if p.id != project_id]
+    if len(updated) == len(settings.projects):
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    from ragtools.service.pages import _save_projects_to_toml
+    _save_projects_to_toml(updated)
+    get_owner().update_projects(updated)
+
+    from ragtools.service.activity import log_activity
+    log_activity("warning", "config", f"Project removed: {project_id}")
+    _restart_watcher_if_running()
+    return {"status": "removed", "project_id": project_id}
+
+
+@router.post("/api/projects/{project_id}/toggle")
+def project_toggle(project_id: str):
+    """Toggle project enabled/disabled."""
+    settings = get_settings()
+    project = next((p for p in settings.projects if p.id == project_id), None)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    project.enabled = not project.enabled
+
+    from ragtools.service.pages import _save_projects_to_toml
+    _save_projects_to_toml(list(settings.projects))
+    get_owner().update_projects(list(settings.projects))
+
+    from ragtools.service.activity import log_activity
+    log_activity("info", "config", f"Project {project_id} {'enabled' if project.enabled else 'disabled'}")
+    _restart_watcher_if_running()
+    return {"status": "toggled", "project_id": project_id, "enabled": project.enabled}
+
+
 # --- Config ---
 
 @router.get("/api/config")
@@ -257,13 +414,24 @@ def watcher_stop():
 @router.get("/api/watcher/status")
 def watcher_status():
     """Check watcher state."""
+    settings = get_settings()
     with _watcher_lock:
         if _watcher_thread is not None and _watcher_thread.is_alive():
-            return {
-                "running": True,
-                "content_root": get_settings().content_root,
-            }
+            if settings.has_explicit_projects:
+                paths = [p.path for p in settings.enabled_projects]
+                return {"running": True, "paths": paths, "project_count": len(paths)}
+            else:
+                return {"running": True, "content_root": settings.content_root}
         return {"running": False}
+
+
+def _restart_watcher_if_running():
+    """Restart the watcher if it's currently running. Called after project config changes."""
+    with _watcher_lock:
+        if _watcher_thread is not None and _watcher_thread.is_alive():
+            watcher_stop()
+            watcher_start()
+            logger.info("Watcher restarted after project config change")
 
 
 # --- Ignore Rules ---

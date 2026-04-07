@@ -157,6 +157,21 @@ def test_ui_config_fragment(client):
     assert "Retrieval" in r.text
 
 
+# --- Projects page ---
+
+
+def test_projects_page_renders(client):
+    r = client.get("/projects")
+    assert r.status_code == 200
+    assert "Projects" in r.text
+    assert "Add Project" in r.text
+
+
+def test_ui_projects_list_fragment(client):
+    r = client.get("/ui/projects/list")
+    assert r.status_code == 200
+
+
 # --- Static files ---
 
 

@@ -32,6 +32,11 @@
     <div id="save-result" style="margin-top: 12px;"></div>
 </div>
 
+<div class="callout" style="margin-bottom:16px;">
+    Per-project ignore patterns can be configured on the <a href="/projects">Projects page</a>.
+    Each project can have its own patterns in addition to the global rules above.
+</div>
+
 <div class="card">
     <div class="card-header">.ragignore Files Found</div>
     <div id="ragignore-files" hx-get="/ui/ignore/ragignore" hx-trigger="load" hx-swap="innerHTML">

@@ -19,7 +19,12 @@ from ragtools.indexing.indexer import (
     delete_file_points,
     index_file,
 )
-from ragtools.indexing.scanner import get_relative_path, scan_project
+from ragtools.indexing.scanner import (
+    get_relative_path,
+    get_project_relative_path,
+    scan_project,
+    scan_configured_projects,
+)
 from ragtools.indexing.state import IndexState
 from ragtools.models import SearchResult
 from ragtools.retrieval.formatter import format_context
@@ -41,11 +46,22 @@ class QdrantOwner:
         self._settings = settings
         self._client = client or settings.get_qdrant_client()
         self._encoder = Encoder(settings.embedding_model)
-        self._ignore_rules = IgnoreRules(
-            content_root=settings.content_root,
-            global_patterns=settings.ignore_patterns,
-            use_ragignore=settings.use_ragignore_files,
-        )
+
+        # Ignore rules: global instance for v1, or global-only for v2 (per-project merging at scan time)
+        if settings.has_explicit_projects:
+            # v2: ignore rules are constructed per-project during scanning
+            self._ignore_rules = IgnoreRules(
+                content_root=".",
+                global_patterns=settings.ignore_patterns,
+                use_ragignore=settings.use_ragignore_files,
+            )
+        else:
+            self._ignore_rules = IgnoreRules(
+                content_root=settings.content_root,
+                global_patterns=settings.ignore_patterns,
+                use_ragignore=settings.use_ragignore_files,
+            )
+
         ensure_collection(self._client, settings.collection_name, self._encoder.dimension)
         logger.info("QdrantOwner initialized (model=%s, collection=%s)",
                      settings.embedding_model, settings.collection_name)
@@ -147,13 +163,9 @@ class QdrantOwner:
         with self._lock:
             state = IndexState(self._settings.state_db)
 
-            files = scan_project(
-                self._settings.content_root,
-                project_id=project_id,
-                ignore_rules=self._ignore_rules,
-            )
+            files = self._scan_files(project_id)
             current_paths = {
-                get_relative_path(fp, self._settings.content_root) for _, fp in files
+                self._resolve_relative_path(pid, fp) for pid, fp in files
             }
 
             tracked_paths = state.get_all_paths()
@@ -170,7 +182,7 @@ class QdrantOwner:
                 stats["deleted"] += 1
 
             for pid, file_path in files:
-                relative_path = get_relative_path(file_path, self._settings.content_root)
+                relative_path = self._resolve_relative_path(pid, file_path)
                 current_hash = IndexState.hash_file(file_path)
 
                 if not state.file_changed(relative_path, current_hash):
@@ -234,15 +246,11 @@ class QdrantOwner:
         """Full index without acquiring lock (called from within locked context)."""
         state = IndexState(self._settings.state_db)
 
-        files = scan_project(
-            self._settings.content_root,
-            project_id=project_id,
-            ignore_rules=self._ignore_rules,
-        )
+        files = self._scan_files(project_id)
         stats = {"files_indexed": 0, "chunks_indexed": 0, "projects": set()}
 
         for pid, file_path in files:
-            relative_path = get_relative_path(file_path, self._settings.content_root)
+            relative_path = self._resolve_relative_path(pid, file_path)
             file_hash = IndexState.hash_file(file_path)
             count = index_file(
                 client=self._client,
@@ -316,6 +324,45 @@ class QdrantOwner:
             logger.info("Settings updated: %s", list(kwargs.keys()))
             from ragtools.service.activity import log_activity
             log_activity("info", "config", f"Settings updated: {', '.join(kwargs.keys())}")
+
+    def update_projects(self, projects: list) -> None:
+        """Hot-reload project configuration. Thread-safe."""
+        with self._lock:
+            object.__setattr__(self._settings, "projects", projects)
+            object.__setattr__(self._settings, "config_version", 2)
+            logger.info("Projects updated: %d configured", len(projects))
+            from ragtools.service.activity import log_activity
+            log_activity("info", "config", f"Projects reloaded: {len(projects)} configured")
+
+    def _scan_files(self, project_id: str | None = None) -> list[tuple[str, Path]]:
+        """Scan files using either v2 explicit projects or v1 legacy discovery."""
+        if self._settings.has_explicit_projects:
+            projects = self._settings.enabled_projects
+            if project_id:
+                projects = [p for p in projects if p.id == project_id]
+                if not projects:
+                    raise ValueError(f"Project '{project_id}' not found in configuration")
+            return scan_configured_projects(
+                projects,
+                global_ignore_patterns=self._settings.ignore_patterns,
+                use_ragignore=self._settings.use_ragignore_files,
+            )
+        else:
+            return scan_project(
+                self._settings.content_root,
+                project_id=project_id,
+                ignore_rules=self._ignore_rules,
+            )
+
+    def _resolve_relative_path(self, project_id: str, file_path: Path) -> str:
+        """Compute the storage-relative path for a file."""
+        if self._settings.has_explicit_projects:
+            project = next(
+                (p for p in self._settings.projects if p.id == project_id), None
+            )
+            if project:
+                return get_project_relative_path(file_path, project.path, project.id)
+        return get_relative_path(file_path, self._settings.content_root)
 
     def _invalidate_map_cache(self) -> None:
         """Invalidate the Semantic Map cache. Called after index changes."""

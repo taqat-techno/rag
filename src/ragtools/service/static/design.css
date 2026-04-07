@@ -452,6 +452,14 @@ a:hover {
   display: flex;
   gap: 12px;
   align-items: flex-end;
+  flex-wrap: wrap;
+}
+.form-row > * {
+  flex-shrink: 0;
+}
+.form-row > *:first-child {
+  flex: 1 1 200px;
+  min-width: 120px;
 }
 
 .form-check {

@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Projects — RAG Tools{% endblock %}
+{% block header %}
+<h1 class="page-title">Projects</h1>
+<p class="page-subtitle">Manage content source folders</p>
+{% endblock %}
+{% block content %}
+
+<div class="card">
+    <div class="card-header">Add Project</div>
+    <details id="add-project-form">
+        <summary style="font-size:13.5px; cursor:pointer; color:var(--color-accent); font-weight:500;">
+            + New Project
+        </summary>
+        <form hx-post="/ui/projects/add" hx-target="#projects-list" hx-swap="innerHTML"
+              style="margin-top: 14px;">
+            <div class="grid-2">
+                <div class="form-group">
+                    <label class="form-label">Project ID</label>
+                    <input type="text" name="id" class="form-input"
+                           placeholder="e.g., company-wiki" required
+                           pattern="[a-z0-9][a-z0-9_-]*">
+                    <small style="color: var(--color-text-muted);">Lowercase, hyphens/underscores OK. Used as internal identifier.</small>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Display Name</label>
+                    <input type="text" name="name" class="form-input" placeholder="e.g., Company Wiki">
+                    <small style="color: var(--color-text-muted);">Optional. Defaults to ID.</small>
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Folder Path</label>
+                <input type="text" name="path" class="form-input"
+                       placeholder="C:\path\to\project\folder" required>
+            </div>
+            <details style="margin-top: 4px;">
+                <summary style="font-size:13px; color:var(--color-text-secondary); cursor:pointer;">
+                    Advanced: Ignore Patterns
+                </summary>
+                <div class="form-group" style="margin-top:8px;">
+                    <textarea name="ignore_patterns" rows="3" class="form-textarea"
+                              placeholder="One pattern per line (gitignore syntax)"></textarea>
+                </div>
+            </details>
+            <div style="margin-top: 12px;">
+                <button type="submit" class="btn btn-primary">Add Project</button>
+            </div>
+        </form>
+    </details>
+</div>
+
+<div class="card">
+    <div class="card-header">Configured Projects</div>
+    <div id="projects-list" hx-get="/ui/projects/list" hx-trigger="load" hx-swap="innerHTML">
+        <span class="loading-placeholder">Loading projects...</span>
+    </div>
+</div>
+
+{% endblock %}

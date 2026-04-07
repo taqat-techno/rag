@@ -18,6 +18,8 @@ ignore_app = typer.Typer(help="Manage ignore rules.")
 app.add_typer(ignore_app, name="ignore")
 service_app = typer.Typer(help="Manage the RAG service.")
 app.add_typer(service_app, name="service")
+project_app = typer.Typer(help="Manage configured projects.")
+app.add_typer(project_app, name="project")
 console = Console()
 
 
@@ -79,7 +81,15 @@ def index(
     show_ignored: bool = typer.Option(False, "--show-ignored", help="Print ignored files"),
 ):
     """Index Markdown files. Incremental by default, skips unchanged files."""
-    settings = _get_settings(path)
+    settings = _get_settings()
+
+    # v2: warn if path argument is used with explicit projects
+    if settings.has_explicit_projects and path != ".":
+        console.print("[yellow]Note:[/yellow] Explicit projects are configured. The path argument is ignored.")
+        console.print("Use [bold]rag project add[/bold] to manage project folders, or [bold]-p <project_id>[/bold] to index a specific project.")
+    elif not settings.has_explicit_projects:
+        settings = _get_settings(path)
+
     start = time.time()
 
     if show_ignored:
@@ -586,6 +596,183 @@ def ignore_test(
         console.print(f"[red]IGNORED[/red] — {reason}")
     else:
         console.print(f"[green]NOT IGNORED[/green] — this file would be indexed")
+
+
+# --- Project Subcommands ---
+
+
+@project_app.command("list")
+def project_list():
+    """List all configured projects with status."""
+    settings = _get_settings()
+
+    if _probe_service(settings):
+        import httpx
+        try:
+            r = httpx.get(f"{_service_url(settings)}/api/projects/configured", timeout=5.0)
+            r.raise_for_status()
+            data = r.json()["projects"]
+        except Exception as e:
+            console.print(f"[red]Failed to get projects from service:[/red] {e}")
+            raise typer.Exit(1)
+    else:
+        # Direct mode: read from settings
+        from ragtools.indexing.state import IndexState
+        data = []
+        state_path = Path(settings.state_db)
+        for p in settings.projects:
+            files = chunks = 0
+            if state_path.exists():
+                state = IndexState(settings.state_db)
+                records = state.get_all_for_project(p.id)
+                files = len(records)
+                chunks = sum(r["chunk_count"] for r in records)
+                state.close()
+            data.append({"id": p.id, "name": p.name, "path": p.path, "enabled": p.enabled, "files": files, "chunks": chunks})
+
+    if not data:
+        console.print("[yellow]No projects configured.[/yellow]")
+        console.print("Add one with: rag project add --name \"My Docs\" --path /path/to/folder")
+        return
+
+    table = Table(title="Configured Projects")
+    table.add_column("ID", style="bold")
+    table.add_column("Name")
+    table.add_column("Path")
+    table.add_column("Status")
+    table.add_column("Files", justify="right")
+    table.add_column("Chunks", justify="right")
+    for p in data:
+        status = "[green]Enabled[/green]" if p["enabled"] else "[dim]Disabled[/dim]"
+        files = str(p["files"]) if p["files"] > 0 else "[dim]--[/dim]"
+        chunks = str(p["chunks"]) if p["chunks"] > 0 else "[dim]--[/dim]"
+        console.print() if False else None  # placeholder
+        table.add_row(p["id"], p["name"], p["path"], status, files, chunks)
+    console.print(table)
+
+
+@project_app.command("add")
+def project_add(
+    name: str = typer.Option(..., "--name", "-n", help="Display name for the project"),
+    path: str = typer.Option(..., "--path", "-p", help="Path to project folder"),
+    project_id: str = typer.Option("", "--id", help="Project ID (auto-generated from name if not provided)"),
+):
+    """Add a new project folder to the configuration."""
+    import re
+
+    # Auto-generate ID from name if not provided
+    if not project_id:
+        project_id = re.sub(r'[^a-z0-9-]', '-', name.lower()).strip('-')
+        project_id = re.sub(r'-+', '-', project_id)  # collapse multiple hyphens
+    if not project_id:
+        console.print("[red]Could not generate a valid ID from the name.[/red]")
+        raise typer.Exit(1)
+
+    resolved_path = str(Path(path).resolve())
+    if not Path(resolved_path).is_dir():
+        console.print(f"[red]Path does not exist or is not a directory:[/red] {path}")
+        raise typer.Exit(1)
+
+    settings = _get_settings()
+    if _probe_service(settings):
+        import httpx
+        try:
+            r = httpx.post(f"{_service_url(settings)}/api/projects",
+                          json={"id": project_id, "name": name, "path": resolved_path},
+                          timeout=10.0)
+            r.raise_for_status()
+            console.print(f"[green]Project added:[/green] {project_id} ({name}) → {resolved_path}")
+        except httpx.HTTPStatusError as e:
+            detail = e.response.json().get("detail", str(e))
+            console.print(f"[red]Failed:[/red] {detail}")
+            raise typer.Exit(1)
+    else:
+        # Direct mode: write to TOML
+        from ragtools.config import ProjectConfig
+        if any(p.id == project_id for p in settings.projects):
+            console.print(f"[red]Project ID '{project_id}' already exists.[/red]")
+            raise typer.Exit(1)
+        new_project = ProjectConfig(id=project_id, name=name, path=resolved_path)
+        updated = list(settings.projects) + [new_project]
+        from ragtools.service.pages import _save_projects_to_toml
+        _save_projects_to_toml(updated)
+        console.print(f"[green]Project added:[/green] {project_id} ({name}) → {resolved_path}")
+
+
+@project_app.command("remove")
+def project_remove(
+    project_id: str = typer.Argument(..., help="ID of the project to remove"),
+):
+    """Remove a configured project."""
+    settings = _get_settings()
+
+    # Check it exists
+    if not any(p.id == project_id for p in settings.projects):
+        console.print(f"[yellow]Project '{project_id}' not found.[/yellow]")
+        raise typer.Exit(1)
+
+    typer.confirm(f"Remove project '{project_id}'? Indexed data will be kept.", abort=True)
+
+    if _probe_service(settings):
+        import httpx
+        try:
+            r = httpx.delete(f"{_service_url(settings)}/api/projects/{project_id}", timeout=10.0)
+            r.raise_for_status()
+            console.print(f"[green]Project removed:[/green] {project_id}")
+        except Exception as e:
+            console.print(f"[red]Failed:[/red] {e}")
+            raise typer.Exit(1)
+    else:
+        updated = [p for p in settings.projects if p.id != project_id]
+        from ragtools.service.pages import _save_projects_to_toml
+        _save_projects_to_toml(updated)
+        console.print(f"[green]Project removed:[/green] {project_id}")
+
+
+@project_app.command("enable")
+def project_enable(
+    project_id: str = typer.Argument(..., help="ID of the project to enable"),
+):
+    """Enable a disabled project."""
+    _toggle_project(project_id, enable=True)
+
+
+@project_app.command("disable")
+def project_disable(
+    project_id: str = typer.Argument(..., help="ID of the project to disable"),
+):
+    """Disable a project (stops indexing and watching, keeps data)."""
+    _toggle_project(project_id, enable=False)
+
+
+def _toggle_project(project_id: str, enable: bool):
+    """Shared logic for enable/disable."""
+    settings = _get_settings()
+    project = next((p for p in settings.projects if p.id == project_id), None)
+    if not project:
+        console.print(f"[yellow]Project '{project_id}' not found.[/yellow]")
+        raise typer.Exit(1)
+
+    if project.enabled == enable:
+        state = "enabled" if enable else "disabled"
+        console.print(f"[dim]Project '{project_id}' is already {state}.[/dim]")
+        return
+
+    if _probe_service(settings):
+        import httpx
+        try:
+            r = httpx.post(f"{_service_url(settings)}/api/projects/{project_id}/toggle", timeout=10.0)
+            r.raise_for_status()
+        except Exception as e:
+            console.print(f"[red]Failed:[/red] {e}")
+            raise typer.Exit(1)
+    else:
+        project.enabled = enable
+        from ragtools.service.pages import _save_projects_to_toml
+        _save_projects_to_toml(list(settings.projects))
+
+    state = "enabled" if enable else "disabled"
+    console.print(f"[green]Project {state}:[/green] {project_id}")
 
 
 # --- Helpers ---

@@ -56,6 +56,11 @@ def startup_page(request: Request):
     return templates.TemplateResponse(request, "startup.html", {"page": "startup"})
 
 
+@page_router.get("/projects", response_class=HTMLResponse)
+def projects_page(request: Request):
+    return templates.TemplateResponse(request, "projects.html", {"page": "projects"})
+
+
 # --- htmx fragment routes (return HTML snippets, not full pages) ---
 
 
@@ -78,21 +83,52 @@ def ui_status():
 
 @page_router.get("/ui/projects", response_class=HTMLResponse)
 def ui_projects():
-    """Projects table fragment."""
+    """Projects table fragment for dashboard — merges config + index data."""
     owner = get_owner()
-    projects = owner.get_projects()
-    if not projects:
-        return '<p style="color: var(--color-text-muted);">No projects indexed yet.</p>'
-    rows = "".join(
-        f"<tr><td><strong>{escape(p['project_id'])}</strong></td><td>{p['files']}</td><td>{p['chunks']}</td></tr>"
-        for p in projects
-    )
-    return f"""
-    <table class="table-clean">
-        <thead><tr><th>Project</th><th>Files</th><th>Chunks</th></tr></thead>
-        <tbody>{rows}</tbody>
-    </table>
-    """
+    settings = get_settings()
+
+    if settings.has_explicit_projects:
+        from ragtools.indexing.state import IndexState
+        state_path = Path(settings.state_db)
+        index_data = {}
+        if state_path.exists():
+            state = IndexState(settings.state_db)
+            for p in settings.projects:
+                records = state.get_all_for_project(p.id)
+                index_data[p.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
+            state.close()
+
+        if not settings.projects:
+            return '<p style="color: var(--color-text-muted);">No projects configured. <a href="/projects">Add a project</a></p>'
+
+        rows = ""
+        for p in settings.projects:
+            idx = index_data.get(p.id, {"files": 0, "chunks": 0})
+            badge = '<span class="badge badge-success">Enabled</span>' if p.enabled else '<span class="badge badge-muted">Disabled</span>'
+            info = f"{idx['files']} files, {idx['chunks']} chunks" if idx["files"] > 0 else '<span style="color:var(--color-text-muted)">Not indexed</span>'
+            rows += f'<tr><td><strong>{escape(p.name)}</strong></td><td>{badge}</td><td>{info}</td></tr>'
+
+        return f"""
+        <table class="table-clean">
+            <thead><tr><th>Project</th><th>Status</th><th>Indexed</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+        <div style="margin-top:10px;"><a href="/projects" class="btn btn-secondary btn-sm">Manage Projects</a></div>
+        """
+    else:
+        projects = owner.get_projects()
+        if not projects:
+            return '<p style="color: var(--color-text-muted);">No projects indexed yet.</p>'
+        rows = "".join(
+            f"<tr><td><strong>{escape(p['project_id'])}</strong></td><td>{p['files']}</td><td>{p['chunks']}</td></tr>"
+            for p in projects
+        )
+        return f"""
+        <table class="table-clean">
+            <thead><tr><th>Project</th><th>Files</th><th>Chunks</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+        """
 
 
 @page_router.get("/ui/watcher", response_class=HTMLResponse)
@@ -398,6 +434,170 @@ def ui_startup_save(
         return f'<div class="flash flash-error">Save failed: {escape(str(e))}</div>'
 
 
+# --- Project management fragments ---
+
+
+def _render_projects_list() -> str:
+    """Render the projects table HTML. Shared by all mutating project fragments."""
+    settings = get_settings()
+    if not settings.projects:
+        return '''<div style="text-align:center; padding:24px; color:var(--color-text-muted);">
+            <p>No projects configured yet.</p>
+            <p style="font-size:13px;">Use the form above to add your first content folder.</p>
+        </div>'''
+
+    from ragtools.indexing.state import IndexState
+    state_path = Path(settings.state_db)
+    index_data = {}
+    if state_path.exists():
+        state = IndexState(settings.state_db)
+        for p in settings.projects:
+            records = state.get_all_for_project(p.id)
+            index_data[p.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
+        state.close()
+
+    rows = ""
+    for p in settings.projects:
+        idx = index_data.get(p.id, {"files": 0, "chunks": 0})
+        badge = '<span class="badge badge-success">Enabled</span>' if p.enabled else '<span class="badge badge-muted">Disabled</span>'
+        files = str(idx["files"]) if idx["files"] > 0 else "--"
+        chunks = str(idx["chunks"]) if idx["chunks"] > 0 else "--"
+        toggle_label = "Disable" if p.enabled else "Enable"
+        path_display = escape(p.path)
+        if len(p.path) > 40:
+            path_display = escape("..." + p.path[-37:])
+
+        rows += f"""<tr id="project-row-{escape(p.id)}">
+            <td><strong>{escape(p.name)}</strong><br><code style="font-size:11px;color:var(--color-text-muted)">{escape(p.id)}</code></td>
+            <td title="{escape(p.path)}"><code style="font-size:12px">{path_display}</code></td>
+            <td>{badge}</td>
+            <td>{files}</td>
+            <td>{chunks}</td>
+            <td style="white-space:nowrap">
+                <button class="btn btn-secondary btn-sm"
+                    hx-get="/ui/projects/{escape(p.id)}/edit" hx-target="#project-row-{escape(p.id)}" hx-swap="outerHTML">Edit</button>
+                <button class="btn btn-secondary btn-sm"
+                    hx-post="/ui/projects/{escape(p.id)}/toggle" hx-target="#projects-list" hx-swap="innerHTML">{toggle_label}</button>
+                <button class="btn btn-danger btn-sm"
+                    hx-delete="/ui/projects/{escape(p.id)}/remove" hx-target="#projects-list" hx-swap="innerHTML"
+                    hx-confirm="Remove project '{escape(p.name)}'? Indexed data will be kept.">Remove</button>
+            </td>
+        </tr>"""
+
+    return f"""
+    <table class="table-clean">
+        <thead><tr><th>Name</th><th>Path</th><th>Status</th><th>Files</th><th>Chunks</th><th>Actions</th></tr></thead>
+        <tbody>{rows}</tbody>
+    </table>
+    """
+
+
+@page_router.get("/ui/projects/list", response_class=HTMLResponse)
+def ui_projects_list():
+    """Full project list table fragment."""
+    return _render_projects_list()
+
+
+@page_router.post("/ui/projects/add", response_class=HTMLResponse)
+def ui_projects_add(
+    id: str = Form(""),
+    name: str = Form(""),
+    path: str = Form(""),
+    ignore_patterns: str = Form(""),
+):
+    """Add a new project via UI form."""
+    try:
+        from ragtools.service.routes import project_create, ProjectCreateRequest
+        patterns = [line.strip() for line in ignore_patterns.splitlines() if line.strip()]
+        req = ProjectCreateRequest(id=id.strip().lower(), name=name.strip(), path=path.strip(), ignore_patterns=patterns)
+        project_create(req)
+        return _render_projects_list()
+    except Exception as e:
+        detail = getattr(e, "detail", str(e))
+        return f'<div class="flash flash-error">Failed to add project: {escape(str(detail))}</div>' + _render_projects_list()
+
+
+@page_router.get("/ui/projects/{project_id}/edit", response_class=HTMLResponse)
+def ui_projects_edit(project_id: str):
+    """Inline edit form for a project row."""
+    settings = get_settings()
+    project = next((p for p in settings.projects if p.id == project_id), None)
+    if not project:
+        return f'<tr><td colspan="6"><div class="flash flash-error">Project not found</div></td></tr>'
+
+    patterns_text = "\n".join(project.ignore_patterns)
+    return f"""<tr id="project-row-{escape(project_id)}">
+        <td colspan="6">
+            <form hx-put="/ui/projects/{escape(project_id)}/save" hx-target="#projects-list" hx-swap="innerHTML">
+                <div class="grid-2">
+                    <div class="form-group">
+                        <label class="form-label">Display Name</label>
+                        <input type="text" name="name" class="form-input" value="{escape(project.name)}">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Folder Path</label>
+                        <input type="text" name="path" class="form-input" value="{escape(project.path)}">
+                    </div>
+                </div>
+                <details style="margin-top:8px;">
+                    <summary style="font-size:13px;color:var(--color-text-secondary);cursor:pointer;">Ignore Patterns</summary>
+                    <div class="form-group" style="margin-top:8px;">
+                        <textarea name="ignore_patterns" rows="3" class="form-textarea" placeholder="One pattern per line">{escape(patterns_text)}</textarea>
+                    </div>
+                </details>
+                <div style="display:flex;gap:8px;margin-top:10px;">
+                    <button type="submit" class="btn btn-primary btn-sm">Save</button>
+                    <button type="button" class="btn btn-secondary btn-sm"
+                        hx-get="/ui/projects/list" hx-target="#projects-list" hx-swap="innerHTML">Cancel</button>
+                </div>
+            </form>
+        </td>
+    </tr>"""
+
+
+@page_router.put("/ui/projects/{project_id}/save", response_class=HTMLResponse)
+def ui_projects_save(
+    project_id: str,
+    name: str = Form(""),
+    path: str = Form(""),
+    ignore_patterns: str = Form(""),
+):
+    """Save edited project via UI form."""
+    try:
+        from ragtools.service.routes import project_update, ProjectUpdateRequest
+        patterns = [line.strip() for line in ignore_patterns.splitlines() if line.strip()]
+        req = ProjectUpdateRequest(name=name.strip() or None, path=path.strip() or None, ignore_patterns=patterns)
+        project_update(project_id, req)
+        return _render_projects_list()
+    except Exception as e:
+        detail = getattr(e, "detail", str(e))
+        return f'<div class="flash flash-error">Save failed: {escape(str(detail))}</div>' + _render_projects_list()
+
+
+@page_router.post("/ui/projects/{project_id}/toggle", response_class=HTMLResponse)
+def ui_projects_toggle(project_id: str):
+    """Toggle project enabled/disabled via UI."""
+    try:
+        from ragtools.service.routes import project_toggle
+        project_toggle(project_id)
+        return _render_projects_list()
+    except Exception as e:
+        detail = getattr(e, "detail", str(e))
+        return f'<div class="flash flash-error">{escape(str(detail))}</div>' + _render_projects_list()
+
+
+@page_router.delete("/ui/projects/{project_id}/remove", response_class=HTMLResponse)
+def ui_projects_remove(project_id: str):
+    """Remove a project via UI."""
+    try:
+        from ragtools.service.routes import project_delete
+        project_delete(project_id)
+        return _render_projects_list()
+    except Exception as e:
+        detail = getattr(e, "detail", str(e))
+        return f'<div class="flash flash-error">{escape(str(detail))}</div>' + _render_projects_list()
+
+
 # --- Activity log fragment ---
 
 
@@ -547,3 +747,46 @@ def _save_ignore_config(settings, patterns: list[str], use_ragignore: bool) -> N
         "patterns": patterns,
         "use_ragignore_files": use_ragignore,
     })
+
+
+def _save_projects_to_toml(projects: list) -> None:
+    """Write the full projects list to TOML config, setting version=2.
+
+    Writes the entire [[projects]] array atomically (not merged key-by-key).
+    """
+    import os as _os
+    import tomli_w
+    from ragtools.config import _find_config_path
+
+    explicit = _os.environ.get("RAG_CONFIG_PATH")
+    config_path = Path(explicit) if explicit else (_find_config_path() or Path("ragtools.toml"))
+
+    existing = {}
+    if config_path.exists():
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            import tomli as tomllib
+        with open(config_path, "rb") as f:
+            existing = tomllib.load(f)
+
+    existing["version"] = 2
+    existing["projects"] = [
+        {
+            "id": p.id,
+            "name": p.name,
+            "path": p.path,
+            "enabled": p.enabled,
+            "ignore_patterns": p.ignore_patterns,
+        }
+        for p in projects
+    ]
+    # Remove legacy content_root if upgrading
+    existing.pop("content_root", None)
+
+    with open(config_path, "wb") as f:
+        tomli_w.dump(existing, f)
+
+    logger.info("Projects saved: %d projects to TOML", len(projects))
+    from ragtools.service.activity import log_activity
+    log_activity("info", "config", f"Projects saved: {len(projects)} projects")
