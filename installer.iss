@@ -9,7 +9,7 @@
 ;   iscc installer.iss
 
 #define MyAppName "RAG Tools"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "RAG Tools"
 #define MyAppURL "https://github.com/taqat-techno/rag"
 #define MyAppExeName "rag.exe"

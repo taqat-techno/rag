@@ -1,3 +1,3 @@
 """RAG Tools — Local Markdown RAG system for Claude CLI."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
