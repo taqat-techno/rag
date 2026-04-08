@@ -20,7 +20,15 @@ def client():
     """Create a test client with in-memory Qdrant and indexed fixtures."""
     with tempfile.TemporaryDirectory() as tmpdir:
         state_db = str(Path(tmpdir) / "test_state.db")
-        settings = Settings(content_root=str(FIXTURES), state_db=state_db)
+        from ragtools.config import ProjectConfig
+        settings = Settings(
+            content_root=str(FIXTURES),
+            state_db=state_db,
+            projects=[
+                ProjectConfig(id="project_a", path=str(FIXTURES / "project_a")),
+                ProjectConfig(id="project_b", path=str(FIXTURES / "project_b")),
+            ],
+        )
         qdrant_client = Settings.get_memory_client()
         owner = QdrantOwner(settings=settings, client=qdrant_client)
         owner.run_full_index()
@@ -52,28 +60,10 @@ def test_search_page_renders(client):
     assert "Search" in r.text
 
 
-def test_index_page_renders(client):
-    r = client.get("/index")
-    assert r.status_code == 200
-    assert "Indexing" in r.text
-
-
-def test_ignore_page_renders(client):
-    r = client.get("/ignore")
-    assert r.status_code == 200
-    assert "Ignore Rules" in r.text
-
-
 def test_config_page_renders(client):
     r = client.get("/config")
     assert r.status_code == 200
     assert "Settings" in r.text
-
-
-def test_startup_page_renders(client):
-    r = client.get("/startup")
-    assert r.status_code == 200
-    assert "Startup" in r.text
 
 
 # --- htmx fragment routes ---
@@ -94,7 +84,7 @@ def test_ui_projects_fragment(client):
 def test_ui_watcher_fragment(client):
     r = client.get("/ui/watcher")
     assert r.status_code == 200
-    assert "Stopped" in r.text or "Running" in r.text
+    assert "Starting" in r.text or "Running" in r.text
 
 
 def test_ui_search_empty(client):
@@ -119,35 +109,6 @@ def test_ui_index_full(client):
     r = client.post("/ui/index?full=true")
     assert r.status_code == 200
     assert "complete" in r.text.lower()
-
-
-def test_ui_ignore_builtin(client):
-    r = client.get("/ui/ignore/builtin")
-    assert r.status_code == 200
-    assert ".git/" in r.text
-
-
-def test_ui_ignore_config(client):
-    r = client.get("/ui/ignore/config")
-    assert r.status_code == 200
-    # May be empty if no config patterns set
-
-
-def test_ui_ignore_ragignore(client):
-    r = client.get("/ui/ignore/ragignore")
-    assert r.status_code == 200
-
-
-def test_ui_ignore_test_ignored(client):
-    r = client.post("/ui/ignore/test", data={"path": ".git/config"})
-    assert r.status_code == 200
-    assert "IGNORED" in r.text
-
-
-def test_ui_ignore_test_not_ignored(client):
-    r = client.post("/ui/ignore/test", data={"path": "project_a/README.md"})
-    assert r.status_code == 200
-    assert "NOT IGNORED" in r.text
 
 
 def test_ui_config_fragment(client):

@@ -36,29 +36,112 @@ def search_page(request: Request):
     return templates.TemplateResponse(request, "search.html", {"page": "search"})
 
 
-@page_router.get("/index", response_class=HTMLResponse)
-def index_page(request: Request):
-    return templates.TemplateResponse(request, "index.html", {"page": "index"})
-
-
-@page_router.get("/ignore", response_class=HTMLResponse)
-def ignore_page(request: Request):
-    return templates.TemplateResponse(request, "ignore.html", {"page": "ignore"})
-
-
 @page_router.get("/config", response_class=HTMLResponse)
 def config_page(request: Request):
     return templates.TemplateResponse(request, "config.html", {"page": "config"})
 
 
-@page_router.get("/startup", response_class=HTMLResponse)
-def startup_page(request: Request):
-    return templates.TemplateResponse(request, "startup.html", {"page": "startup"})
-
-
 @page_router.get("/projects", response_class=HTMLResponse)
 def projects_page(request: Request):
     return templates.TemplateResponse(request, "projects.html", {"page": "projects"})
+
+
+# --- Dashboard fragments ---
+
+
+@page_router.get("/ui/dash/status", response_class=HTMLResponse)
+def ui_dash_status():
+    """Compact status row for the dashboard."""
+    owner = get_owner()
+    s = owner.get_status()
+    from ragtools.service.routes import _watcher_thread, _watcher_lock
+    with _watcher_lock:
+        watcher_running = _watcher_thread is not None and _watcher_thread.is_alive()
+
+    watcher_badge = '<span class="badge badge-success">Watcher running</span>' if watcher_running else '<span class="badge badge-muted">Watcher starting</span>'
+    files = s["total_files"]
+    chunks = s["total_chunks"]
+    projects_count = len(s["projects"])
+
+    return f"""
+    <div class="dash-status-row">
+        <div class="dash-stat"><strong>{files}</strong> <span>files</span></div>
+        <div class="dash-stat"><strong>{chunks}</strong> <span>chunks</span></div>
+        <div class="dash-stat"><strong>{projects_count}</strong> <span>projects</span></div>
+        <div class="dash-stat">{watcher_badge}</div>
+    </div>
+    """
+
+
+@page_router.get("/ui/dash/projects", response_class=HTMLResponse)
+def ui_dash_projects():
+    """Projects card for dashboard — shows empty state if no projects."""
+    settings = get_settings()
+
+    if not settings.projects:
+        return """
+        <div class="card" style="text-align:center; padding:32px 20px;">
+            <p style="font-size:15px; color:var(--color-text); margin-bottom:6px; font-weight:500;">No projects configured</p>
+            <p style="font-size:13px; color:var(--color-text-muted); margin-bottom:16px;">Add a content folder to start indexing and searching your knowledge base.</p>
+            <a href="/projects" class="btn btn-primary">Add Your First Project</a>
+        </div>
+        """
+
+    from ragtools.indexing.state import IndexState
+    state_path = Path(settings.state_db)
+    index_data = {}
+    if state_path.exists():
+        state = IndexState(settings.state_db)
+        for p in settings.projects:
+            records = state.get_all_for_project(p.id)
+            index_data[p.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
+        state.close()
+
+    rows = ""
+    for p in settings.projects:
+        idx = index_data.get(p.id, {"files": 0, "chunks": 0})
+        badge = '<span class="badge badge-success">Enabled</span>' if p.enabled else '<span class="badge badge-muted">Disabled</span>'
+        info = f"{idx['files']} files, {idx['chunks']} chunks" if idx["files"] > 0 else '<span style="color:var(--color-text-muted)">Not indexed</span>'
+        rows += f'<tr><td><strong>{escape(p.name)}</strong></td><td>{badge}</td><td>{info}</td></tr>'
+
+    return f"""
+    <div class="card">
+        <div class="card-header">Projects</div>
+        <table class="table-clean">
+            <thead><tr><th>Project</th><th>Status</th><th>Indexed</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+        <div style="margin-top:10px;"><a href="/projects" class="btn btn-secondary btn-sm">Manage Projects</a></div>
+    </div>
+    """
+
+
+@page_router.get("/ui/dash/activity", response_class=HTMLResponse)
+def ui_dash_activity():
+    """Inline recent activity for dashboard — last 5 events."""
+    from ragtools.service.activity import activity_log
+    events = activity_log.get_recent(limit=5)
+
+    if not events:
+        return '<p class="activity-empty">No recent activity</p>'
+
+    rows = []
+    for e in reversed(events):
+        level_class = {
+            "info": "badge-accent", "success": "badge-success",
+            "warning": "badge-warning", "error": "badge-danger",
+        }.get(e.level, "badge-accent")
+
+        rows.append(f"""
+        <div class="activity-event">
+            <span class="activity-time">{escape(e.timestamp[11:19])}</span>
+            <span class="badge {level_class}" style="font-size:10px;">{escape(e.level)}</span>
+            <span class="activity-source">{escape(e.source)}</span>
+            <span class="activity-msg">{escape(e.message)}</span>
+        </div>
+        """)
+
+    return "".join(rows)
 
 
 # --- htmx fragment routes (return HTML snippets, not full pages) ---
@@ -133,41 +216,24 @@ def ui_projects():
 
 @page_router.get("/ui/watcher", response_class=HTMLResponse)
 def ui_watcher():
-    """Watcher status fragment with start/stop button."""
+    """Watcher status fragment (always-on, informational only)."""
     from ragtools.service.routes import _watcher_thread, _watcher_lock
     with _watcher_lock:
         running = _watcher_thread is not None and _watcher_thread.is_alive()
 
     if running:
         return """
-        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <div style="display:flex; align-items:center; gap:12px;">
             <span>Status:</span> <span class="badge badge-success">Running</span>
-            <button class="btn btn-secondary btn-sm" hx-post="/ui/watcher/toggle" hx-target="#watcher-area" hx-swap="innerHTML"
-                    hx-confirm="Stop the file watcher?">Stop Watcher</button>
+            <span style="font-size:12px; color:var(--color-text-muted);">Watches project folders for changes</span>
         </div>
         """
     else:
         return """
-        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-            <span>Status:</span> <span class="badge badge-muted">Stopped</span>
-            <button class="btn btn-primary btn-sm" hx-post="/ui/watcher/toggle" hx-target="#watcher-area" hx-swap="innerHTML">Start Watcher</button>
+        <div style="display:flex; align-items:center; gap:12px;">
+            <span>Status:</span> <span class="badge badge-muted">Starting...</span>
         </div>
         """
-
-
-@page_router.post("/ui/watcher/toggle", response_class=HTMLResponse)
-def ui_watcher_toggle():
-    """Toggle watcher and return updated fragment."""
-    from ragtools.service.routes import _watcher_thread, _watcher_lock, watcher_start, watcher_stop
-    with _watcher_lock:
-        running = _watcher_thread is not None and _watcher_thread.is_alive()
-
-    if running:
-        watcher_stop()
-    else:
-        watcher_start()
-
-    return ui_watcher()
 
 
 @page_router.get("/ui/search", response_class=HTMLResponse)
@@ -246,83 +312,12 @@ def ui_rebuild():
     """
 
 
-@page_router.get("/ui/ignore/builtin", response_class=HTMLResponse)
-def ui_ignore_builtin():
-    """Built-in ignore patterns fragment."""
-    owner = get_owner()
-    patterns = owner.ignore_rules.get_all_patterns()
-    return escape("\n".join(patterns["built-in"]))
-
-
-@page_router.get("/ui/ignore/config", response_class=HTMLResponse)
-def ui_ignore_config():
-    """Config ignore patterns for textarea."""
-    owner = get_owner()
-    patterns = owner.ignore_rules.get_all_patterns()
-    return "\n".join(patterns["config"])
-
-
-@page_router.get("/ui/ignore/ragignore", response_class=HTMLResponse)
-def ui_ignore_ragignore():
-    """List .ragignore files found."""
-    owner = get_owner()
-    patterns = owner.ignore_rules.get_all_patterns()
-    ragignore_files = patterns.get("ragignore_files", {})
-    if not ragignore_files:
-        return '<p style="color: var(--color-text-muted);">No .ragignore files found.</p>'
-
-    html = ""
-    for filepath, rules in ragignore_files.items():
-        rules_str = escape("\n".join(rules))
-        html += f"<details><summary><code>{escape(filepath)}</code></summary><pre>{rules_str}</pre></details>"
-    return html
-
-
-@page_router.put("/ui/ignore/save", response_class=HTMLResponse)
-def ui_ignore_save(
-    patterns: str = Form(""),
-    use_ragignore: bool = Form(False),
-):
-    """Save ignore patterns to config file."""
-    try:
-        pattern_list = [line.strip() for line in patterns.splitlines() if line.strip()]
-        settings = get_settings()
-
-        _save_ignore_config(settings, pattern_list, use_ragignore)
-
-        owner = get_owner()
-        from ragtools.ignore import IgnoreRules
-        owner._ignore_rules = IgnoreRules(
-            content_root=settings.content_root,
-            global_patterns=pattern_list,
-            use_ragignore=use_ragignore,
-        )
-
-        return f'<div class="flash flash-success">Saved {len(pattern_list)} pattern(s).</div>'
-    except Exception as e:
-        return f'<div class="flash flash-error">Save failed: {escape(str(e))}</div>'
-
-
-@page_router.post("/ui/ignore/test", response_class=HTMLResponse)
-def ui_ignore_test(path: str = Form("")):
-    """Test if a path would be ignored."""
-    if not path.strip():
-        return '<p style="color: var(--color-text-muted);">Enter a path to test.</p>'
-    owner = get_owner()
-    reason = owner.ignore_rules.get_reason(Path(path.strip()))
-    if reason:
-        return f'<p><span class="badge badge-danger">IGNORED</span> &mdash; {escape(reason)}</p>'
-    else:
-        return '<p><span class="badge badge-success">NOT IGNORED</span> &mdash; this file would be indexed</p>'
-
-
 @page_router.get("/ui/config", response_class=HTMLResponse)
 def ui_config():
     """Config display fragment."""
     settings = get_settings()
     groups = {
         "Indexing": {
-            "Content root": settings.content_root,
             "Chunk size": settings.chunk_size,
             "Chunk overlap": settings.chunk_overlap,
         },
@@ -359,79 +354,6 @@ def ui_config():
 
 
 # --- Startup fragments ---
-
-
-@page_router.get("/ui/startup/status", response_class=HTMLResponse)
-def ui_startup_status():
-    """Startup registration status fragment."""
-    from ragtools.service.startup import is_task_installed, get_task_info
-
-    installed = is_task_installed()
-    if installed:
-        info = get_task_info()
-        details = ""
-        if info:
-            details = f"""
-            <table class="table-clean" style="margin-top:10px;">
-                <tr><td>Status</td><td>{escape(str(info.get('status', 'Unknown')))}</td></tr>
-                <tr><td>Last run</td><td>{escape(str(info.get('last_run', 'Never')))}</td></tr>
-                <tr><td>Next run</td><td>{escape(str(info.get('next_run', 'N/A')))}</td></tr>
-            </table>
-            """
-        return f"""
-        <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
-            <span>Startup task:</span> <span class="badge badge-success">Installed</span>
-        </div>
-        {details}
-        <button class="btn btn-secondary btn-sm" hx-post="/ui/startup/toggle" hx-target="#startup-status" hx-swap="innerHTML"
-                hx-confirm="Remove automatic startup?">Uninstall Startup Task</button>
-        """
-    else:
-        return """
-        <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
-            <span>Startup task:</span> <span class="badge badge-muted">Not installed</span>
-        </div>
-        <p style="font-size:13px; color:var(--color-text-secondary);">The service will not start automatically on Windows login.</p>
-        <button class="btn btn-primary btn-sm" hx-post="/ui/startup/toggle" hx-target="#startup-status" hx-swap="innerHTML">
-            Install Startup Task</button>
-        """
-
-
-@page_router.post("/ui/startup/toggle", response_class=HTMLResponse)
-def ui_startup_toggle():
-    """Toggle startup task install/uninstall."""
-    from ragtools.service.startup import is_task_installed, install_task, uninstall_task
-
-    if is_task_installed():
-        uninstall_task()
-    else:
-        settings = get_settings()
-        try:
-            install_task(settings, delay_seconds=settings.startup_delay)
-        except RuntimeError as e:
-            return f'<div class="flash flash-error">Install failed: {escape(str(e))}</div>'
-
-    return ui_startup_status()
-
-
-@page_router.put("/ui/startup/save", response_class=HTMLResponse)
-def ui_startup_save(
-    startup_watcher: bool = Form(False),
-    startup_open_browser: bool = Form(False),
-    startup_delay: int = Form(30),
-):
-    """Save startup behavior settings to config."""
-    try:
-        settings = get_settings()
-        _save_startup_config(settings, startup_watcher, startup_open_browser, startup_delay)
-
-        from ragtools.service.startup import is_task_installed, install_task
-        if is_task_installed():
-            install_task(settings, delay_seconds=startup_delay)
-
-        return '<div class="flash flash-success">Startup settings saved.</div>'
-    except Exception as e:
-        return f'<div class="flash flash-error">Save failed: {escape(str(e))}</div>'
 
 
 # --- Project management fragments ---
@@ -643,11 +565,12 @@ def ui_activity(after: int = Query(0)):
 def ui_config_save(
     chunk_size: int = Form(None),
     chunk_overlap: int = Form(None),
-    content_root: str = Form(None),
     top_k: int = Form(None),
     score_threshold: float = Form(None),
     service_port: int = Form(None),
     log_level: str = Form(None),
+    startup_open_browser: str = Form(None),
+    startup_delay: int = Form(None),
 ):
     """Save general settings via the UI."""
     try:
@@ -658,8 +581,6 @@ def ui_config_save(
             payload["chunk_size"] = chunk_size
         if chunk_overlap is not None:
             payload["chunk_overlap"] = chunk_overlap
-        if content_root is not None and content_root.strip():
-            payload["content_root"] = content_root.strip()
         if top_k is not None:
             payload["top_k"] = top_k
         if score_threshold is not None:
@@ -669,16 +590,38 @@ def ui_config_save(
         if log_level is not None and log_level.strip():
             payload["log_level"] = log_level.strip()
 
-        if not payload:
+        # Startup settings — save to TOML [startup] section
+        startup_changed = False
+        open_browser = startup_open_browser == "true"
+        if startup_delay is not None or startup_open_browser is not None:
+            _update_toml_config("startup", {
+                "open_browser": open_browser,
+                "delay": startup_delay or 30,
+            })
+            object.__setattr__(settings, "startup_open_browser", open_browser)
+            if startup_delay is not None:
+                object.__setattr__(settings, "startup_delay", startup_delay)
+            startup_changed = True
+
+        if not payload and not startup_changed:
             return '<div class="flash flash-success">No changes to save.</div>'
 
-        # Call the API endpoint directly (internal)
-        from ragtools.service.routes import update_config, ConfigUpdateRequest
-        req = ConfigUpdateRequest(**payload)
-        result = update_config(req)
+        # Save main settings via API
+        if payload:
+            from ragtools.service.routes import update_config, ConfigUpdateRequest
+            req = ConfigUpdateRequest(**payload)
+            result = update_config(req)
+            saved_keys = result["updated"]
+            restart = result["restart_required"]
+        else:
+            saved_keys = []
+            restart = False
 
-        msg = f'Saved: {", ".join(result["updated"])}'
-        if result["restart_required"]:
+        if startup_changed:
+            saved_keys.extend(["startup_open_browser", "startup_delay"])
+
+        msg = f'Saved: {", ".join(saved_keys)}'
+        if restart:
             msg += ' <span class="badge badge-warning" style="margin-left:6px;">Restart required</span>'
 
         return f'<div class="flash flash-success">{msg}</div>'
@@ -730,23 +673,6 @@ def _update_toml_config(section: str | None, data: dict) -> None:
     logger.info("Config updated: section=%s, keys=%s", section or "root", list(data.keys()))
     from ragtools.service.activity import log_activity
     log_activity("info", "config", f"Config saved: {section or 'general'} ({', '.join(data.keys())})")
-
-
-def _save_startup_config(settings, watcher: bool, open_browser: bool, delay: int) -> None:
-    """Write startup settings to the TOML config file."""
-    _update_toml_config("startup", {
-        "watcher": watcher,
-        "open_browser": open_browser,
-        "delay": delay,
-    })
-
-
-def _save_ignore_config(settings, patterns: list[str], use_ragignore: bool) -> None:
-    """Write ignore patterns to the TOML config file."""
-    _update_toml_config("ignore", {
-        "patterns": patterns,
-        "use_ragignore_files": use_ragignore,
-    })
 
 
 def _save_projects_to_toml(projects: list) -> None:

@@ -42,11 +42,7 @@ class WatcherThread(threading.Thread):
     def run(self):
         """Main watch loop. Blocks until stop() is called or thread is killed."""
         from ragtools.service.activity import log_activity
-
-        if self._settings.has_explicit_projects:
-            self._run_multi_root(log_activity)
-        else:
-            self._run_single_root(log_activity)
+        self._run_multi_root(log_activity)
 
     def _run_multi_root(self, log_activity):
         """Watch multiple explicit project directories (v2 mode)."""
@@ -155,72 +151,6 @@ class WatcherThread(threading.Thread):
                     except Exception as e:
                         logger.error("Indexing error for project %s: %s", pid, e)
                         log_activity("error", "watcher", f"Indexing error ({pid}): {e}")
-
-        except Exception as e:
-            if not self._stop_event.is_set():
-                logger.error("Watcher error: %s", e)
-                log_activity("error", "watcher", f"Watcher error: {e}")
-
-        logger.info("Watcher stopped")
-        log_activity("info", "watcher", "Watcher stopped")
-
-    def _run_single_root(self, log_activity):
-        """Watch single content_root directory (v1 legacy mode)."""
-        content_root = self._settings.content_root
-        root_path = Path(content_root).resolve()
-
-        ignore_rules = IgnoreRules(
-            content_root=root_path,
-            global_patterns=self._settings.ignore_patterns,
-            use_ragignore=self._settings.use_ragignore_files,
-        )
-
-        def md_filter(change: Change, path: str) -> bool:
-            if Path(path).name == RAGIGNORE_FILENAME:
-                return True
-            if not path.endswith(".md"):
-                return False
-            return not ignore_rules.is_ignored(Path(path), root_path)
-
-        logger.info("Watcher started: %s (debounce=%dms)", content_root, self._debounce_ms)
-        log_activity("info", "watcher", f"Watcher started: {content_root}")
-
-        try:
-            for changes in watch(
-                content_root,
-                watch_filter=md_filter,
-                debounce=self._debounce_ms,
-                recursive=True,
-                raise_interrupt=False,
-                stop_event=self._stop_event,
-            ):
-                if self._stop_event.is_set():
-                    break
-                if not changes:
-                    continue
-
-                ragignore_changed = any(Path(p).name == RAGIGNORE_FILENAME for _, p in changes)
-                if ragignore_changed:
-                    ignore_rules.clear_cache()
-
-                md_changes = [(c, p) for c, p in changes if p.endswith(".md")]
-                if not md_changes:
-                    continue
-
-                added = sum(1 for c, _ in md_changes if c == Change.added)
-                modified = sum(1 for c, _ in md_changes if c == Change.modified)
-                deleted = sum(1 for c, _ in md_changes if c == Change.deleted)
-                logger.info("Changes detected: +%d ~%d -%d", added, modified, deleted)
-                log_activity("info", "watcher", f"Changes: +{added} ~{modified} -{deleted}")
-
-                try:
-                    stats = self._owner.run_incremental_index()
-                    if stats["indexed"] > 0 or stats["deleted"] > 0:
-                        logger.info("Indexed: %d, skipped: %d, deleted: %d",
-                                    stats["indexed"], stats["skipped"], stats["deleted"])
-                except Exception as e:
-                    logger.error("Indexing error: %s", e)
-                    log_activity("error", "watcher", f"Indexing error: {e}")
 
         except Exception as e:
             if not self._stop_event.is_set():

@@ -27,10 +27,6 @@ class IndexRequest(BaseModel):
     full: bool = False
 
 
-class IgnoreTestRequest(BaseModel):
-    path: str
-
-
 # --- Health ---
 
 @router.get("/health")
@@ -178,6 +174,18 @@ def project_create(req: ProjectCreateRequest):
     from ragtools.service.activity import log_activity
     log_activity("info", "config", f"Project added: {req.id}")
     _restart_watcher_if_running()
+
+    # Auto-index in background thread (don't block the response)
+    import threading
+    def _bg_index(project_id):
+        try:
+            owner = get_owner()
+            stats = owner.run_full_index(project_id=project_id)
+            log_activity("success", "indexer", f"Auto-indexed {project_id}: {stats.get('files_indexed', 0)} files")
+        except Exception as e:
+            log_activity("warning", "indexer", f"Auto-index failed for {project_id}: {e}")
+    threading.Thread(target=_bg_index, args=(req.id,), daemon=True).start()
+
     return {"status": "created", "project": {"id": new_project.id, "name": new_project.name, "path": new_project.path}}
 
 
@@ -214,20 +222,24 @@ def project_update(project_id: str, req: ProjectUpdateRequest):
 
 @router.delete("/api/projects/{project_id}")
 def project_delete(project_id: str):
-    """Remove a project."""
+    """Remove a project and delete its indexed data."""
     settings = get_settings()
     updated = [p for p in settings.projects if p.id != project_id]
     if len(updated) == len(settings.projects):
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
 
+    # Delete indexed data (Qdrant chunks + state DB entries)
+    owner = get_owner()
+    cleanup = owner.delete_project_data(project_id)
+
     from ragtools.service.pages import _save_projects_to_toml
     _save_projects_to_toml(updated)
-    get_owner().update_projects(updated)
+    owner.update_projects(updated)
 
     from ragtools.service.activity import log_activity
-    log_activity("warning", "config", f"Project removed: {project_id}")
+    log_activity("warning", "config", f"Project removed: {project_id} ({cleanup['files_deleted']} files deleted)")
     _restart_watcher_if_running()
-    return {"status": "removed", "project_id": project_id}
+    return {"status": "removed", "project_id": project_id, "files_deleted": cleanup["files_deleted"]}
 
 
 @router.post("/api/projects/{project_id}/toggle")
@@ -257,7 +269,6 @@ def config():
     """Return current settings."""
     settings = get_settings()
     return {
-        "content_root": settings.content_root,
         "embedding_model": settings.embedding_model,
         "chunk_size": settings.chunk_size,
         "chunk_overlap": settings.chunk_overlap,
@@ -273,7 +284,6 @@ def config():
         "state_db": settings.state_db,
         "startup_enabled": settings.startup_enabled,
         "startup_delay": settings.startup_delay,
-        "startup_watcher": settings.startup_watcher,
         "startup_open_browser": settings.startup_open_browser,
     }
 
@@ -281,7 +291,6 @@ def config():
 class ConfigUpdateRequest(BaseModel):
     chunk_size: Optional[int] = None
     chunk_overlap: Optional[int] = None
-    content_root: Optional[str] = None
     top_k: Optional[int] = None
     score_threshold: Optional[float] = None
     service_port: Optional[int] = None
@@ -289,7 +298,7 @@ class ConfigUpdateRequest(BaseModel):
 
 
 RESTART_FIELDS = {"service_port", "log_level"}
-HOT_RELOAD_FIELDS = {"chunk_size", "chunk_overlap", "content_root", "top_k", "score_threshold"}
+HOT_RELOAD_FIELDS = {"chunk_size", "chunk_overlap", "top_k", "score_threshold"}
 VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 
 
@@ -311,12 +320,6 @@ def update_config(req: ConfigUpdateRequest):
             errors.append(f"chunk_overlap must be 0-{min(500, max_overlap)}")
         else:
             updates["chunk_overlap"] = req.chunk_overlap
-
-    if req.content_root is not None:
-        if not req.content_root.strip():
-            errors.append("content_root cannot be empty")
-        else:
-            updates["content_root"] = req.content_root.strip()
 
     if req.top_k is not None:
         if not (1 <= req.top_k <= 100):
@@ -391,8 +394,9 @@ def watcher_start():
         settings = get_settings()
         _watcher_thread = WatcherThread(owner=owner, settings=settings)
         _watcher_thread.start()
-        logger.info("Watcher started for %s", settings.content_root)
-        return {"status": "started", "content_root": settings.content_root}
+        project_count = len(settings.enabled_projects) if settings.has_explicit_projects else 0
+        logger.info("Watcher started: %d projects", project_count)
+        return {"status": "started", "project_count": project_count}
 
 
 @router.post("/api/watcher/stop")
@@ -421,7 +425,7 @@ def watcher_status():
                 paths = [p.path for p in settings.enabled_projects]
                 return {"running": True, "paths": paths, "project_count": len(paths)}
             else:
-                return {"running": True, "content_root": settings.content_root}
+                return {"running": True, "project_count": 0}
         return {"running": False}
 
 
@@ -432,28 +436,6 @@ def _restart_watcher_if_running():
             watcher_stop()
             watcher_start()
             logger.info("Watcher restarted after project config change")
-
-
-# --- Ignore Rules ---
-
-@router.get("/api/ignore/rules")
-def ignore_rules():
-    """Get all active ignore patterns."""
-    owner = get_owner()
-    return owner.ignore_rules.get_all_patterns()
-
-
-@router.post("/api/ignore/test")
-def ignore_test(req: IgnoreTestRequest):
-    """Test if a path would be ignored."""
-    from pathlib import Path
-    owner = get_owner()
-    reason = owner.ignore_rules.get_reason(Path(req.path))
-    return {
-        "path": req.path,
-        "ignored": reason is not None,
-        "reason": reason,
-    }
 
 
 # --- Semantic Map ---
@@ -476,43 +458,33 @@ def map_recompute():
     return {"status": "recomputed", "count": len(points)}
 
 
-# --- Startup ---
+# --- MCP Connection ---
 
-@router.get("/api/startup/status")
-def startup_status():
-    """Get startup registration status."""
-    from ragtools.service.startup import is_task_installed, get_task_info
-    settings = get_settings()
-    installed = is_task_installed()
-    info = get_task_info() if installed else None
-    return {
-        "installed": installed,
-        "delay": settings.startup_delay,
-        "watcher": settings.startup_watcher,
-        "open_browser": settings.startup_open_browser,
-        "task_info": info,
-    }
+@router.get("/api/mcp-config")
+def mcp_config():
+    """Return the MCP server configuration JSON for Claude Code."""
+    import shutil
 
-
-@router.post("/api/startup/install")
-def startup_install():
-    """Create the Windows scheduled task."""
-    from ragtools.service.startup import install_task
-    settings = get_settings()
-    try:
-        install_task(settings, delay_seconds=settings.startup_delay)
-        return {"status": "installed", "delay": settings.startup_delay}
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/api/startup/uninstall")
-def startup_uninstall():
-    """Remove the Windows scheduled task."""
-    from ragtools.service.startup import uninstall_task
-    if uninstall_task():
-        return {"status": "uninstalled"}
-    raise HTTPException(status_code=500, detail="Failed to remove task")
+    # Use generic command name if on PATH; fall back to python -m
+    if shutil.which("rag-mcp"):
+        config = {
+            "mcpServers": {
+                "ragtools": {
+                    "command": "rag-mcp",
+                    "args": []
+                }
+            }
+        }
+    else:
+        config = {
+            "mcpServers": {
+                "ragtools": {
+                    "command": "python",
+                    "args": ["-m", "ragtools.integration.mcp_server"]
+                }
+            }
+        }
+    return {"config": config}
 
 
 # --- Activity Log ---

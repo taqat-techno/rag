@@ -23,27 +23,28 @@ from ragtools.service.map_data import (
 def test_pca_zero_points():
     embeddings = np.empty((0, 384))
     result = _pca_project(embeddings)
-    assert result.shape == (0, 2)
+    assert result.shape == (0, 3)
 
 
 def test_pca_single_point():
     embeddings = np.random.randn(1, 384).astype(np.float32)
     result = _pca_project(embeddings)
-    assert result.shape == (1, 2)
+    assert result.shape == (1, 3)
     assert result[0, 0] == pytest.approx(0.5)
     assert result[0, 1] == pytest.approx(0.5)
+    assert result[0, 2] == pytest.approx(0.5)
 
 
 def test_pca_two_points():
     embeddings = np.random.randn(2, 384).astype(np.float32)
     result = _pca_project(embeddings)
-    assert result.shape == (2, 2)
+    assert result.shape == (2, 3)
 
 
 def test_pca_many_points():
     embeddings = np.random.randn(50, 384).astype(np.float32)
     result = _pca_project(embeddings)
-    assert result.shape == (50, 2)
+    assert result.shape == (50, 3)
 
 
 def test_pca_deterministic():

@@ -205,7 +205,6 @@ class Settings(BaseSettings):
     # Startup
     startup_enabled: bool = False
     startup_delay: int = 30
-    startup_watcher: bool = True
     startup_open_browser: bool = False
 
     model_config = {"env_prefix": "RAG_", "env_file": ".env", "env_file_encoding": "utf-8"}

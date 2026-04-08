@@ -2,7 +2,7 @@
 
 Two modes determined at startup:
   - Proxy mode: service is running → forward all calls via HTTP (instant startup)
-  - Direct mode: service unavailable → load encoder + Qdrant locally (5-10s startup)
+  - Direct mode: service unavailable → load encoder, open Qdrant per-request (no persistent lock)
 
 Mode is locked for the session. No mid-session switching.
 
@@ -28,9 +28,8 @@ _mode: str = "uninitialized"  # "proxy" | "direct" | "uninitialized"
 # Proxy mode state
 _http_client = None  # httpx.Client when in proxy mode
 
-# Direct mode state (legacy)
+# Direct mode state
 _encoder = None
-_searcher = None
 _init_error: str | None = None
 
 mcp_app = FastMCP("ragtools")
@@ -38,7 +37,7 @@ mcp_app = FastMCP("ragtools")
 
 def _initialize() -> None:
     """Determine mode and initialize accordingly."""
-    global _mode, _http_client, _settings, _encoder, _searcher, _init_error
+    global _mode, _http_client, _settings, _encoder, _init_error
 
     _settings = Settings()
 
@@ -61,15 +60,13 @@ def _initialize() -> None:
     except Exception as e:
         logger.debug("Service probe failed: %s", e)
 
-    # Fallback: direct mode (load encoder + open Qdrant)
+    # Fallback: direct mode — load encoder only, Qdrant opened per-request
     _mode = "direct"
     logger.info("MCP initializing in DIRECT mode (service unavailable)")
 
     try:
         from pathlib import Path
-
         from ragtools.embedding.encoder import Encoder
-        from ragtools.retrieval.searcher import Searcher
 
         _encoder = Encoder(_settings.embedding_model)
 
@@ -81,28 +78,36 @@ def _initialize() -> None:
             )
             return
 
+        # Verify collection exists (open briefly, then release)
         client = _settings.get_qdrant_client()
+        try:
+            collections = [c.name for c in client.get_collections().collections]
+            if _settings.collection_name not in collections:
+                _init_error = (
+                    f"Collection '{_settings.collection_name}' not found. "
+                    "Run `rag index <path>` to create the index."
+                )
+                return
+        finally:
+            del client  # Release Qdrant lock immediately
 
-        collections = [c.name for c in client.get_collections().collections]
-        if _settings.collection_name not in collections:
-            _init_error = (
-                f"Collection '{_settings.collection_name}' not found. "
-                "Run `rag index <path>` to create the index."
-            )
-            return
-
-        _searcher = Searcher(client=client, encoder=_encoder, settings=_settings)
         _init_error = None
+        logger.info("MCP direct mode ready (Qdrant lock released — service can start)")
 
     except Exception as e:
         _init_error = f"Failed to initialize RAG server: {e}"
         logger.exception("Direct mode initialization failed")
 
 
+def _get_direct_client():
+    """Open a Qdrant client for a single request, caller must delete it after use."""
+    return _settings.get_qdrant_client()
+
+
 def _check_ready() -> str | None:
     """Return error message if not ready, or None if OK."""
     if _mode == "proxy":
-        return None  # Proxy is always "ready" — errors are per-request
+        return None
     return _init_error
 
 
@@ -224,7 +229,7 @@ def _proxy_error(e: Exception) -> str:
     return f"[RAG ERROR] Proxy request failed: {e}"
 
 
-# --- Direct mode implementations (preserved from original) ---
+# --- Direct mode implementations (per-request Qdrant access) ---
 
 
 def _direct_search(query: str, project: str | None, top_k: int) -> str:
@@ -232,10 +237,15 @@ def _direct_search(query: str, project: str | None, top_k: int) -> str:
     if error:
         return f"[RAG ERROR] {error}"
 
+    client = None
     try:
         from ragtools.retrieval.formatter import format_context
+        from ragtools.retrieval.searcher import Searcher
 
-        results = _searcher.search(
+        client = _get_direct_client()
+        searcher = Searcher(client=client, encoder=_encoder, settings=_settings)
+
+        results = searcher.search(
             query=query,
             project_id=project,
             top_k=top_k,
@@ -245,6 +255,9 @@ def _direct_search(query: str, project: str | None, top_k: int) -> str:
     except Exception as e:
         logger.exception("Search failed")
         return f"[RAG ERROR] Search failed: {e}"
+    finally:
+        if client:
+            del client  # Release Qdrant lock
 
 
 def _direct_list_projects() -> str:
@@ -252,8 +265,9 @@ def _direct_list_projects() -> str:
     if error:
         return f"[RAG ERROR] {error}"
 
+    client = None
     try:
-        client = _searcher.client
+        client = _get_direct_client()
         collection_name = _settings.collection_name
 
         all_project_ids: set[str] = set()
@@ -285,6 +299,9 @@ def _direct_list_projects() -> str:
     except Exception as e:
         logger.exception("list_projects failed")
         return f"[RAG ERROR] Failed to list projects: {e}"
+    finally:
+        if client:
+            del client  # Release Qdrant lock
 
 
 def _direct_index_status() -> str:
@@ -292,8 +309,9 @@ def _direct_index_status() -> str:
     if error:
         return f"[RAG STATUS] {error}"
 
+    client = None
     try:
-        client = _searcher.client
+        client = _get_direct_client()
         collection_name = _settings.collection_name
         info = client.get_collection(collection_name)
         count = info.points_count
@@ -310,12 +328,15 @@ def _direct_index_status() -> str:
             f"  Total chunks: {count}\n"
             f"  Embedding model: {_settings.embedding_model}\n"
             f"  Score threshold: {_settings.score_threshold}\n"
-            f"  Mode: direct (local encoder + Qdrant)"
+            f"  Mode: direct (per-request Qdrant access — lock released between queries)"
         )
 
     except Exception as e:
         logger.exception("index_status failed")
         return f"[RAG ERROR] Failed to get index status: {e}"
+    finally:
+        if client:
+            del client  # Release Qdrant lock
 
 
 # --- Entry point ---

@@ -20,7 +20,15 @@ def test_client():
     """Create a test FastAPI client with in-memory Qdrant and indexed fixtures."""
     with tempfile.TemporaryDirectory() as tmpdir:
         state_db = str(Path(tmpdir) / "test_state.db")
-        settings = Settings(content_root=str(FIXTURES), state_db=state_db)
+        from ragtools.config import ProjectConfig
+        settings = Settings(
+            content_root=str(FIXTURES),
+            state_db=state_db,
+            projects=[
+                ProjectConfig(id="project_a", path=str(FIXTURES / "project_a")),
+                ProjectConfig(id="project_b", path=str(FIXTURES / "project_b")),
+            ],
+        )
         client = Settings.get_memory_client()
         owner = QdrantOwner(settings=settings, client=client)
         owner.run_full_index()
@@ -148,29 +156,6 @@ def test_config_update_restart_required(test_client, monkeypatch):
         assert r.status_code == 200
         assert r.json()["restart_required"] is True
         # service_port is restart-only, not hot-reloaded, so no in-memory restore needed
-
-
-# --- Ignore ---
-
-def test_ignore_rules(test_client):
-    r = test_client.get("/api/ignore/rules")
-    assert r.status_code == 200
-    data = r.json()
-    assert "built-in" in data
-
-
-def test_ignore_test(test_client):
-    r = test_client.post("/api/ignore/test", json={"path": ".git/config"})
-    assert r.status_code == 200
-    data = r.json()
-    assert data["ignored"] is True
-    assert "built-in" in data["reason"]
-
-
-def test_ignore_test_not_ignored(test_client):
-    r = test_client.post("/api/ignore/test", json={"path": "project_a/README.md"})
-    assert r.status_code == 200
-    assert r.json()["ignored"] is False
 
 
 # --- Watcher ---

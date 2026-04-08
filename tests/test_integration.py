@@ -38,21 +38,24 @@ def mcp_env():
             relative_path=rel,
         )
 
-    searcher = Searcher(client=client, encoder=encoder, settings=settings)
-
-    # Patch module globals to use test environment
+    # Patch module globals for direct mode with per-request client
+    mcp_server._mode = "direct"
     mcp_server._settings = settings
     mcp_server._encoder = encoder
-    mcp_server._searcher = searcher
     mcp_server._init_error = None
 
-    yield settings, client, encoder, searcher
+    # Monkey-patch _get_direct_client to return the test in-memory client
+    original_get_client = mcp_server._get_direct_client
+    mcp_server._get_direct_client = lambda: client
+
+    yield settings, client, encoder
 
     # Reset globals after tests
+    mcp_server._mode = "uninitialized"
     mcp_server._settings = None
     mcp_server._encoder = None
-    mcp_server._searcher = None
     mcp_server._init_error = None
+    mcp_server._get_direct_client = original_get_client
 
 
 # --- search_knowledge_base ---
@@ -92,13 +95,16 @@ class TestSearchKnowledgeBase:
 
     def test_not_initialized(self):
         """When server hasn't been initialized, return error."""
+        old_mode = mcp_server._mode
         old_error = mcp_server._init_error
+        mcp_server._mode = "direct"
         mcp_server._init_error = "Not initialized"
         try:
             result = mcp_server.search_knowledge_base("test")
             assert "[RAG ERROR]" in result
             assert "Not initialized" in result
         finally:
+            mcp_server._mode = old_mode
             mcp_server._init_error = old_error
 
 
@@ -113,12 +119,15 @@ class TestListProjects:
         assert "Indexed projects" in result
 
     def test_not_initialized(self):
+        old_mode = mcp_server._mode
         old_error = mcp_server._init_error
+        mcp_server._mode = "direct"
         mcp_server._init_error = "Not ready"
         try:
             result = mcp_server.list_projects()
             assert "[RAG ERROR]" in result
         finally:
+            mcp_server._mode = old_mode
             mcp_server._init_error = old_error
 
 
@@ -137,11 +146,14 @@ class TestIndexStatus:
         assert "all-MiniLM-L6-v2" in result
 
     def test_not_initialized(self):
+        old_mode = mcp_server._mode
         old_error = mcp_server._init_error
+        mcp_server._mode = "direct"
         mcp_server._init_error = "Knowledge base not initialized"
         try:
             result = mcp_server.index_status()
             assert "[RAG STATUS]" in result
             assert "not initialized" in result.lower()
         finally:
+            mcp_server._mode = old_mode
             mcp_server._init_error = old_error

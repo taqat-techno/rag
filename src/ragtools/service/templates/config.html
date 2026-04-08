@@ -2,7 +2,6 @@
 {% block title %}Settings — RAG Tools{% endblock %}
 {% block header %}
 <h1 class="page-title">Settings</h1>
-<p class="page-subtitle">Configure indexing, retrieval, and service behavior</p>
 {% endblock %}
 {% block content %}
 
@@ -18,11 +17,6 @@
         <div class="form-group">
             <label class="form-label">Chunk overlap (tokens)</label>
             <input type="number" name="chunk_overlap" id="cfg-chunk-overlap" class="form-input" min="0" max="500">
-        </div>
-        <div class="form-group">
-            <label class="form-label">Content root <span class="badge badge-muted" style="margin-left:6px;font-size:10px;">Legacy</span></label>
-            <input type="text" name="content_root" id="cfg-content-root" class="form-input">
-            <small style="color:var(--color-text-muted);">Replaced by project configuration. <a href="/projects">Manage projects</a> instead.</small>
         </div>
     </div>
 
@@ -40,20 +34,35 @@
 </div>
 
 <div class="card">
-    <div class="card-header">Service <span class="badge badge-warning" style="margin-left:8px; font-size:10px;">Restart required</span></div>
+    <div class="card-header">Service &amp; Startup</div>
     <div class="grid-2">
-        <div class="form-group">
-            <label class="form-label">Port</label>
-            <input type="number" name="service_port" id="cfg-port" class="form-input" min="1024" max="65535">
+        <div>
+            <div class="form-group">
+                <label class="form-label">Port <span class="badge badge-warning" style="margin-left:4px; font-size:9px;">Restart required</span></label>
+                <input type="number" name="service_port" id="cfg-port" class="form-input" min="1024" max="65535">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Log level <span class="badge badge-warning" style="margin-left:4px; font-size:9px;">Restart required</span></label>
+                <select name="log_level" id="cfg-log-level" class="form-select">
+                    <option value="DEBUG">DEBUG</option>
+                    <option value="INFO">INFO</option>
+                    <option value="WARNING">WARNING</option>
+                    <option value="ERROR">ERROR</option>
+                </select>
+            </div>
         </div>
-        <div class="form-group">
-            <label class="form-label">Log level</label>
-            <select name="log_level" id="cfg-log-level" class="form-select">
-                <option value="DEBUG">DEBUG</option>
-                <option value="INFO">INFO</option>
-                <option value="WARNING">WARNING</option>
-                <option value="ERROR">ERROR</option>
-            </select>
+        <div>
+            <div class="form-group">
+                <label class="form-label">
+                    <input type="checkbox" name="startup_open_browser" id="cfg-open-browser" value="true">
+                    Open admin panel on startup
+                </label>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Startup delay (seconds)</label>
+                <input type="number" name="startup_delay" id="cfg-startup-delay" class="form-input" min="0" max="300" style="max-width:120px;">
+                <small style="color:var(--color-text-muted);">Wait before launching after login.</small>
+            </div>
         </div>
     </div>
 </div>
@@ -65,31 +74,60 @@
 
 </form>
 
-<div class="card">
-    <div class="card-header">Storage (read-only)</div>
-    <div class="callout" style="margin-bottom:12px;">These values are set at startup and cannot be changed from the UI.</div>
-    <table class="table-clean">
-        <tr><td>Qdrant path</td><td id="cfg-qdrant-path"><code>—</code></td></tr>
-        <tr><td>State DB</td><td id="cfg-state-db"><code>—</code></td></tr>
-        <tr><td>Collection</td><td id="cfg-collection"><code>—</code></td></tr>
-        <tr><td>Embedding model</td><td id="cfg-model"><code>—</code></td></tr>
-    </table>
-</div>
-
 <script>
 fetch('/api/config').then(r => r.json()).then(d => {
     document.getElementById('cfg-chunk-size').value = d.chunk_size;
     document.getElementById('cfg-chunk-overlap').value = d.chunk_overlap;
-    document.getElementById('cfg-content-root').value = d.content_root;
     document.getElementById('cfg-top-k').value = d.top_k;
     document.getElementById('cfg-score-threshold').value = d.score_threshold;
     document.getElementById('cfg-port').value = d.service_port;
     document.getElementById('cfg-log-level').value = d.log_level;
-    document.getElementById('cfg-qdrant-path').innerHTML = '<code>' + d.qdrant_path + '</code>';
-    document.getElementById('cfg-state-db').innerHTML = '<code>' + d.state_db + '</code>';
-    document.getElementById('cfg-collection').innerHTML = '<code>' + d.collection_name + '</code>';
-    document.getElementById('cfg-model').innerHTML = '<code>' + d.embedding_model + '</code>';
+    document.getElementById('cfg-open-browser').checked = d.startup_open_browser || false;
+    document.getElementById('cfg-startup-delay').value = d.startup_delay || 30;
 });
 </script>
+
+<div class="card" id="mcp-card">
+    <div class="card-header">Connect to Claude</div>
+    <p style="font-size:13px; color:var(--color-text-secondary); margin:0 0 12px;">
+        Add this configuration to your <code>.mcp.json</code> file so Claude Code can search your knowledge base.
+    </p>
+    <div style="position:relative;">
+        <pre id="mcp-config" style="background:var(--color-bg); border:1px solid var(--color-border); border-radius:var(--radius-sm); padding:14px 16px; font-size:12.5px; overflow-x:auto; margin:0;">Loading...</pre>
+        <button type="button" id="mcp-copy-btn" onclick="copyMcpConfig()" class="btn btn-secondary btn-sm"
+                style="position:absolute; top:8px; right:8px; font-size:11px; padding:3px 10px;">
+            Copy
+        </button>
+    </div>
+    <p style="font-size:12px; color:var(--color-text-muted); margin:10px 0 0;">
+        Paste into <code>~/.claude/.mcp.json</code> or your project's <code>.mcp.json</code>
+    </p>
+</div>
+
+<script>
+fetch('/api/mcp-config').then(r => r.json()).then(d => {
+    document.getElementById('mcp-config').textContent = JSON.stringify(d.config, null, 2);
+});
+function copyMcpConfig() {
+    var text = document.getElementById('mcp-config').textContent;
+    navigator.clipboard.writeText(text).then(function() {
+        var btn = document.getElementById('mcp-copy-btn');
+        btn.textContent = 'Copied!';
+        setTimeout(function() { btn.textContent = 'Copy'; }, 2000);
+    });
+}
+</script>
+
+<div class="card card-danger">
+    <div class="card-header" style="color: var(--color-danger);">Danger Zone</div>
+    <p style="font-size: 13px; color: var(--color-text-secondary); margin: 0 0 14px;">
+        Drop all indexed data and rebuild the knowledge base from scratch.
+    </p>
+    <button type="button" class="btn btn-danger" hx-post="/ui/rebuild" hx-target="#rebuild-result" hx-swap="innerHTML"
+            hx-confirm="This will DELETE all indexed data and rebuild from scratch. Continue?">
+        Rebuild Knowledge Base
+    </button>
+    <div id="rebuild-result" style="margin-top: 10px;"></div>
+</div>
 
 {% endblock %}

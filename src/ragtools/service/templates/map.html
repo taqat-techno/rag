@@ -2,12 +2,22 @@
 {% block title %}Semantic Map — RAG Tools{% endblock %}
 {% block header %}
 <h1 class="page-title">Semantic Map</h1>
-<p class="page-subtitle">Visual overview of your knowledge base</p>
 {% endblock %}
 {% block content %}
 
+<div class="map-toolbar">
+    <div class="map-view-toggle">
+        <button id="btn-2d" class="btn-toggle active" onclick="switchView('2d')">2D</button>
+        <button id="btn-3d" class="btn-toggle" onclick="switchView('3d')">3D</button>
+    </div>
+    <div id="map-toolbar-extra" style="display:none;">
+        <button id="btn-rotate" class="btn btn-sm btn-secondary" onclick="toggleAutoRotate()">Auto-rotate</button>
+    </div>
+</div>
+
 <div id="map-container">
     <canvas id="map-canvas"></canvas>
+    <div id="map-3d" style="display:none; width:100%; height:100%;"></div>
     <div id="map-legend"></div>
     <div id="map-tooltip" class="map-tooltip"></div>
     <div id="map-status">Loading map data...</div>
@@ -15,5 +25,85 @@
 </div>
 
 <script src="/static/map.js"></script>
+<script>
+    let _mapPoints = null;
+    let _currentView = '2d';
+    let _3dLoaded = false;
+
+    async function switchView(mode) {
+        if (mode === _currentView) return;
+        _currentView = mode;
+
+        document.getElementById('btn-2d').classList.toggle('active', mode === '2d');
+        document.getElementById('btn-3d').classList.toggle('active', mode === '3d');
+        document.getElementById('map-toolbar-extra').style.display = mode === '3d' ? '' : 'none';
+
+        const canvas = document.getElementById('map-canvas');
+        const div3d = document.getElementById('map-3d');
+        const legend = document.getElementById('map-legend');
+
+        if (mode === '2d') {
+            div3d.style.display = 'none';
+            canvas.style.display = 'block';
+            legend.style.display = '';
+            if (typeof dispose3D === 'function') dispose3D();
+            if (typeof render === 'function') render();
+        } else {
+            canvas.style.display = 'none';
+            legend.style.display = 'none';
+            div3d.style.display = 'block';
+            await load3D();
+        }
+    }
+
+    async function load3D() {
+        if (!_3dLoaded) {
+            // Lazy-load ECharts + GL scripts
+            await loadScript('/static/echarts.min.js');
+            await loadScript('/static/echarts-gl.min.js');
+            await loadScript('/static/map3d.js');
+            _3dLoaded = true;
+        }
+        // Get points (reuse from 2D if already loaded)
+        if (!_mapPoints) {
+            try {
+                const resp = await fetch('/api/map/points');
+                const data = await resp.json();
+                _mapPoints = data.points || [];
+            } catch (e) {
+                setStatus('Failed to load map data for 3D view.', true);
+                return;
+            }
+        }
+        if (_mapPoints.length === 0) {
+            setStatus('No indexed files. <a href="/index" style="color:var(--color-accent)">Run an index</a> to populate the map.');
+            return;
+        }
+        init3D(_mapPoints);
+    }
+
+    function loadScript(src) {
+        return new Promise(function (resolve, reject) {
+            if (document.querySelector('script[src="' + src + '"]')) {
+                resolve();
+                return;
+            }
+            var s = document.createElement('script');
+            s.src = src;
+            s.onload = resolve;
+            s.onerror = function () { reject(new Error('Failed to load ' + src)); };
+            document.head.appendChild(s);
+        });
+    }
+
+    // Intercept 2D init to capture points for sharing with 3D
+    var _origInit = init;
+    init = async function () {
+        await _origInit();
+        if (typeof points !== 'undefined' && points.length) {
+            _mapPoints = points;
+        }
+    };
+</script>
 
 {% endblock %}

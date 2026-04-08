@@ -2,46 +2,30 @@
 {% block title %}Dashboard — RAG Tools{% endblock %}
 {% block header %}
 <h1 class="page-title">Dashboard</h1>
-<p class="page-subtitle">Knowledge base overview and quick actions</p>
 {% endblock %}
 {% block content %}
 
-<div class="grid-2">
-    <div class="card">
-        <div class="card-header">Collection Stats</div>
-        <div id="stats-area" hx-get="/ui/status" hx-trigger="load" hx-swap="innerHTML">
-            <span class="loading-placeholder">Loading stats...</span>
-        </div>
-    </div>
+<div class="card" style="padding: 14px 20px;">
+    <form action="/search" method="get" style="display:flex; gap:10px; align-items:center;">
+        <input type="text" name="query" placeholder="Search your knowledge base..." class="form-input"
+               style="flex:1; margin:0; height:40px;" autofocus>
+        <button type="submit" class="btn btn-primary" style="height:40px; padding:0 20px; white-space:nowrap;">Search</button>
+    </form>
+</div>
 
-    <div class="card">
-        <div class="card-header">File Watcher</div>
-        <div id="watcher-area" hx-get="/ui/watcher" hx-trigger="load" hx-swap="innerHTML">
-            <span class="loading-placeholder">Loading status...</span>
-        </div>
-    </div>
+<div id="dash-status" hx-get="/ui/dash/status" hx-trigger="load" hx-swap="innerHTML">
+    <span class="loading-placeholder">Loading...</span>
+</div>
+
+<div id="dash-projects" hx-get="/ui/dash/projects" hx-trigger="load" hx-swap="innerHTML">
+    <span class="loading-placeholder">Loading projects...</span>
 </div>
 
 <div class="card">
-    <div class="card-header">Indexed Projects</div>
-    <div id="projects-area" hx-get="/ui/projects" hx-trigger="load" hx-swap="innerHTML">
-        <span class="loading-placeholder">Loading projects...</span>
+    <div class="card-header">Recent Activity</div>
+    <div id="dash-activity" hx-get="/ui/dash/activity" hx-trigger="load, every 10s" hx-swap="innerHTML">
+        <span class="loading-placeholder">Loading...</span>
     </div>
-</div>
-
-<div class="card">
-    <div class="card-header">Quick Actions</div>
-    <div style="display: flex; gap: 12px; flex-wrap: wrap;">
-        <button class="btn btn-primary" hx-post="/ui/index" hx-target="#action-result" hx-swap="innerHTML"
-                hx-confirm="Run incremental index now?">
-            Index Now
-        </button>
-        <button class="btn btn-secondary" hx-post="/ui/index?full=true" hx-target="#action-result" hx-swap="innerHTML"
-                hx-confirm="Run full re-index? This may take a while.">
-            Full Re-index
-        </button>
-    </div>
-    <div id="action-result" style="margin-top: 12px;"></div>
 </div>
 
 {% endblock %}

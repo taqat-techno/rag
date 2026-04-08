@@ -28,3 +28,14 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local config and dev artifacts
+ragtools.toml
+.mcp.json
+.playwright-mcp/
+
+# Audit/test screenshots
+audit-*.png
+test-*.png
+flow-*.png
+final-*.png

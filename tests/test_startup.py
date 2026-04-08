@@ -139,8 +139,6 @@ def test_settings_has_startup_fields():
     settings = Settings()
     assert hasattr(settings, "startup_enabled")
     assert hasattr(settings, "startup_delay")
-    assert hasattr(settings, "startup_watcher")
     assert hasattr(settings, "startup_open_browser")
     assert settings.startup_delay == 30
-    assert settings.startup_watcher is True
     assert settings.startup_open_browser is False

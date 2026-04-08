@@ -2,7 +2,6 @@
 {% block title %}Search — RAG Tools{% endblock %}
 {% block header %}
 <h1 class="page-title">Search</h1>
-<p class="page-subtitle">Test semantic search against the knowledge base</p>
 {% endblock %}
 {% block content %}
 
@@ -53,6 +52,23 @@
     });
 </script>
 
-<div id="results"></div>
+<div id="results">
+    <div style="text-align:center; padding:48px 20px; color:var(--color-text-muted);">
+        <p style="font-size:18px; margin-bottom:6px;">Search your knowledge base</p>
+        <p style="font-size:13px;">Enter a query above to find relevant content across all indexed projects.</p>
+    </div>
+</div>
+
+<script>
+    // Auto-fill and search if query parameter is in URL (from dashboard quick search)
+    var params = new URLSearchParams(window.location.search);
+    var q = params.get('query');
+    if (q) {
+        var input = document.querySelector('input[name=query]');
+        input.value = q;
+        // Trigger htmx search after a short delay (let project dropdown populate)
+        setTimeout(function() { htmx.trigger(input.closest('form'), 'submit'); }, 300);
+    }
+</script>
 
 {% endblock %}

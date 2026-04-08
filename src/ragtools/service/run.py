@@ -42,23 +42,35 @@ def setup_logging(settings: Settings) -> None:
 
 
 def _post_startup(settings: Settings, from_scheduler: bool) -> None:
-    """Run post-startup tasks: auto-watcher, browser open."""
+    """Run post-startup tasks: watcher, auto-register startup, optional browser."""
     logger = logging.getLogger("ragtools.service")
 
-    # Auto-start watcher if configured
-    if settings.startup_watcher:
-        try:
-            import httpx
-            r = httpx.post(
-                f"http://{settings.service_host}:{settings.service_port}/api/watcher/start",
-                timeout=5.0,
-            )
-            if r.status_code == 200:
-                logger.info("Watcher auto-started")
-            else:
-                logger.warning("Watcher auto-start returned %d", r.status_code)
-        except Exception as e:
-            logger.warning("Failed to auto-start watcher: %s", e)
+    # Always start the file watcher
+    try:
+        import httpx
+        r = httpx.post(
+            f"http://{settings.service_host}:{settings.service_port}/api/watcher/start",
+            timeout=5.0,
+        )
+        if r.status_code == 200:
+            logger.info("Watcher auto-started")
+        else:
+            logger.warning("Watcher auto-start returned %d", r.status_code)
+    except Exception as e:
+        logger.warning("Failed to auto-start watcher: %s", e)
+
+    # Auto-register Windows startup task (idempotent — skips if already installed)
+    try:
+        import sys as _sys
+        if _sys.platform == "win32":
+            from ragtools.service.startup import is_task_installed, install_task
+            if not is_task_installed():
+                install_task(settings, delay_seconds=settings.startup_delay)
+                logger.info("Auto-registered Windows startup task (delay=%ds)", settings.startup_delay)
+                from ragtools.service.activity import log_activity
+                log_activity("success", "startup", "Auto-registered Windows login startup task")
+    except Exception as e:
+        logger.warning("Failed to auto-register startup task (non-fatal): %s", e)
 
     # Open browser if configured and launched from scheduler
     if from_scheduler and settings.startup_open_browser:
@@ -125,8 +137,7 @@ def main():
                     pass
             logger.warning("Post-startup tasks skipped — service did not become ready in time")
 
-        if settings.startup_watcher or (args.from_scheduler and settings.startup_open_browser):
-            threading.Thread(target=_delayed_post_startup, daemon=True).start()
+        threading.Thread(target=_delayed_post_startup, daemon=True).start()
 
         uvicorn.run(app, host=host, port=port, log_level="warning")
     finally:

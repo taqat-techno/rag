@@ -1,9 +1,9 @@
-"""Semantic Map data pipeline — file-level 2D projection.
+"""Semantic Map data pipeline — file-level 2D/3D projection.
 
 Pipeline:
   1. Scroll all chunk vectors from Qdrant
   2. Group by file_path → compute mean embedding per file
-  3. PCA reduce to 2D
+  3. PCA reduce to 3D (2D view uses x,y; 3D view uses x,y,z)
   4. Normalize coordinates to [0, 1]
   5. Cache in SQLite
 """
@@ -23,13 +23,14 @@ from ragtools.config import Settings
 
 logger = logging.getLogger("ragtools.service.map")
 
-CACHE_KEY = "file_map"
+CACHE_KEY = "file_map_v2"
 
 
 def compute_map_points(client: QdrantClient, settings: Settings) -> list[dict]:
-    """Compute 2D coordinates for all indexed files.
+    """Compute 2D/3D coordinates for all indexed files.
 
-    Returns a list of dicts with: file_path, project_id, x, y, chunk_count, headings.
+    Returns a list of dicts with: file_path, project_id, x, y, z, chunk_count, headings.
+    The 2D canvas view uses x,y; the 3D ECharts GL view uses all three.
     """
     # Step 1: Scroll all points with vectors
     file_vectors: dict[str, list[np.ndarray]] = defaultdict(list)
@@ -73,11 +74,11 @@ def compute_map_points(client: QdrantClient, settings: Settings) -> list[dict]:
         np.mean(file_vectors[fp], axis=0) for fp in file_paths
     ])
 
-    # Step 3: PCA to 2D
-    coords_2d = _pca_project(mean_embeddings)
+    # Step 3: PCA to 3D
+    coords_3d = _pca_project(mean_embeddings)
 
     # Step 4: Normalize to [0, 1]
-    coords_norm = _normalize_coords(coords_2d)
+    coords_norm = _normalize_coords(coords_3d)
 
     # Step 5: Build result
     points = []
@@ -88,6 +89,7 @@ def compute_map_points(client: QdrantClient, settings: Settings) -> list[dict]:
             "project_id": meta.get("project_id", ""),
             "x": float(coords_norm[i, 0]),
             "y": float(coords_norm[i, 1]),
+            "z": float(coords_norm[i, 2]) if coords_norm.shape[1] > 2 else 0.5,
             "chunk_count": len(file_vectors[fp]),
             "headings": meta.get("headings", []),
         })
@@ -97,39 +99,38 @@ def compute_map_points(client: QdrantClient, settings: Settings) -> list[dict]:
 
 
 def _pca_project(embeddings: np.ndarray) -> np.ndarray:
-    """Reduce embeddings to 2D using PCA.
+    """Reduce embeddings to 3D using PCA.
 
     Handles edge cases:
     - 0 points: returns empty array
-    - 1 point: returns [[0.5, 0.5]]
-    - 2+ points: standard PCA
+    - 1 point: returns [[0.5, 0.5, 0.5]]
+    - 2+ points: standard PCA (up to 3 components)
     """
     n = embeddings.shape[0]
     if n == 0:
-        return np.empty((0, 2))
+        return np.empty((0, 3))
     if n == 1:
-        return np.array([[0.5, 0.5]])
+        return np.array([[0.5, 0.5, 0.5]])
 
     from sklearn.decomposition import PCA
 
-    n_components = min(2, n, embeddings.shape[1])
+    n_components = min(3, n, embeddings.shape[1])
     pca = PCA(n_components=n_components, random_state=42)
     result = pca.fit_transform(embeddings)
 
-    # If only 1 component was possible (e.g., 2 points in high-dim space can only have 1 PC),
-    # pad with zeros for the second dimension
-    if result.shape[1] < 2:
+    # Pad to 3 columns if fewer components were possible
+    while result.shape[1] < 3:
         result = np.column_stack([result, np.zeros(n)])
 
     return result
 
 
 def _normalize_coords(coords: np.ndarray) -> np.ndarray:
-    """Normalize 2D coordinates to [0, 1] range with padding."""
+    """Normalize coordinates to [0, 1] range with padding."""
     if coords.shape[0] <= 1:
         return coords
 
-    for dim in range(2):
+    for dim in range(coords.shape[1]):
         col = coords[:, dim]
         vmin, vmax = col.min(), col.max()
         span = vmax - vmin

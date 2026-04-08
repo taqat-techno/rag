@@ -15,10 +15,17 @@ FIXTURES = Path(__file__).parent / "fixtures"
 @pytest.fixture(scope="module")
 def owner():
     """Create a QdrantOwner with in-memory Qdrant and test fixtures."""
-    # Use a temp dir for state DB to avoid polluting real data
+    from ragtools.config import ProjectConfig
     with tempfile.TemporaryDirectory() as tmpdir:
         state_db = str(Path(tmpdir) / "test_state.db")
-        settings = Settings(content_root=str(FIXTURES), state_db=state_db)
+        settings = Settings(
+            content_root=str(FIXTURES),
+            state_db=state_db,
+            projects=[
+                ProjectConfig(id="project_a", path=str(FIXTURES / "project_a")),
+                ProjectConfig(id="project_b", path=str(FIXTURES / "project_b")),
+            ],
+        )
         client = Settings.get_memory_client()
         o = QdrantOwner(settings=settings, client=client)
         o.run_full_index()

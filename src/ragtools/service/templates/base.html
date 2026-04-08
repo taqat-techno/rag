@@ -4,49 +4,29 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}RAG Tools{% endblock %}</title>
-    <link rel="icon" href="/static/logo.png" type="image/png">
-    <link rel="stylesheet" href="/static/pico.min.css">
+    <link rel="icon" href="/static/favicon.png" type="image/png">
     <link rel="stylesheet" href="/static/design.css">
     <script src="/static/htmx.min.js"></script>
 </head>
 <body>
     <aside class="sidebar">
         <div class="sidebar-brand">
-            <img src="/static/logo.png" alt="" onerror="this.style.display='none'">
-            <span>RAG Tools</span>
+            <img src="/static/logo.png" alt="TaqaTechno" class="brand-logo">
+            <div class="brand-text">
+                <span class="brand-name">TaqaTechno</span>
+                <span class="brand-product">RAG Tools</span>
+            </div>
         </div>
         <nav class="sidebar-nav">
             <div class="sidebar-group-label">Overview</div>
-            <a href="/" class="sidebar-link {% if page == 'dashboard' %}active{% endif %}">
-                <span class="icon">&#9670;</span> Dashboard
-            </a>
-            <a href="/map" class="sidebar-link {% if page == 'map' %}active{% endif %}">
-                <span class="icon">&#9673;</span> Map
-            </a>
-            <a href="/search" class="sidebar-link {% if page == 'search' %}active{% endif %}">
-                <span class="icon">&#9906;</span> Search
-            </a>
-            <a href="/index" class="sidebar-link {% if page == 'index' %}active{% endif %}">
-                <span class="icon">&#9881;</span> Index
-            </a>
+            <a href="/" class="sidebar-link {% if page == 'dashboard' %}active{% endif %}">Dashboard</a>
+            <a href="/map" class="sidebar-link {% if page == 'map' %}active{% endif %}">Map</a>
+            <a href="/search" class="sidebar-link {% if page == 'search' %}active{% endif %}">Search</a>
 
             <div class="sidebar-group-label">Management</div>
-            <a href="/projects" class="sidebar-link {% if page == 'projects' %}active{% endif %}">
-                <span class="icon">&#9776;</span> Projects
-            </a>
-            <a href="/ignore" class="sidebar-link {% if page == 'ignore' %}active{% endif %}">
-                <span class="icon">&#9949;</span> Ignore Rules
-            </a>
-            <a href="/config" class="sidebar-link {% if page == 'config' %}active{% endif %}">
-                <span class="icon">&#9881;</span> Settings
-            </a>
-            <a href="/startup" class="sidebar-link {% if page == 'startup' %}active{% endif %}">
-                <span class="icon">&#9211;</span> Startup
-            </a>
+            <a href="/projects" class="sidebar-link {% if page == 'projects' %}active{% endif %}">Projects</a>
+            <a href="/config" class="sidebar-link {% if page == 'config' %}active{% endif %}">Settings</a>
         </nav>
-        <div class="sidebar-footer">
-            v1.0.0 &middot; localhost only
-        </div>
     </aside>
 
     <div class="main-content">
@@ -56,9 +36,6 @@
         <div class="content-body">
             {% block content %}{% endblock %}
         </div>
-        <footer class="main-footer">
-            RAG Tools &mdash; Local AI Knowledge Base Manager
-        </footer>
 
         <div id="activity-drawer" class="activity-drawer">
             <div class="activity-bar" onclick="document.getElementById('activity-drawer').classList.toggle('open')">
@@ -70,5 +47,31 @@
             </div>
         </div>
     </div>
+
+    <div id="confirm-modal" class="confirm-overlay">
+        <div class="confirm-dialog">
+            <p id="confirm-msg" class="confirm-message"></p>
+            <div class="confirm-actions">
+                <button id="confirm-cancel" class="btn btn-secondary btn-sm">Cancel</button>
+                <button id="confirm-ok" class="btn btn-danger btn-sm">Confirm</button>
+            </div>
+        </div>
+    </div>
+    <script>
+    document.body.addEventListener('htmx:confirm', function(e) {
+        if (!e.detail.question) return;
+        e.preventDefault();
+        var modal = document.getElementById('confirm-modal');
+        document.getElementById('confirm-msg').textContent = e.detail.question;
+        modal.classList.add('open');
+        document.getElementById('confirm-ok').onclick = function() {
+            modal.classList.remove('open');
+            e.detail.issueRequest(true);
+        };
+        document.getElementById('confirm-cancel').onclick = function() {
+            modal.classList.remove('open');
+        };
+    });
+    </script>
 </body>
 </html>

@@ -6,54 +6,13 @@
       "Write",
       "Glob",
       "Grep",
-      "Bash(pip:*)",
-      "Bash(pip install:*)",
-      "Bash(pip show:*)",
-      "Bash(pip list:*)",
-      "Bash(pip freeze:*)",
-      "Bash(python:*)",
-      "Bash(python -m:*)",
-      "Bash(pytest:*)",
-      "Bash(mkdir:*)",
-      "Bash(ls:*)",
-      "Bash(cat:*)",
-      "Bash(cp:*)",
-      "Bash(rm:*)",
-      "Bash(mv:*)",
-      "Bash(touch:*)",
-      "Bash(head:*)",
-      "Bash(tail:*)",
-      "Bash(wc:*)",
-      "Bash(find:*)",
-      "Bash(echo:*)",
-      "Bash(git:*)",
-      "Bash(git status:*)",
-      "Bash(git diff:*)",
-      "Bash(git log:*)",
-      "Bash(git add:*)",
-      "Bash(git commit:*)",
-      "Bash(git branch:*)",
-      "Bash(git checkout:*)",
-      "Bash(rag:*)",
-      "Bash(source:*)",
-      "Bash(. .venv:*)",
-      "Bash(curl:*)",
-      "Bash(sqlite3:*)",
-      "Bash(du:*)",
-      "Bash(tree:*)",
+      "Bash",
       "WebSearch",
       "WebFetch",
       "Agent",
-      "TodoWrite"
+      "TodoWrite",
+      "mcp__plugin_playwright_playwright__*"
     ],
-    "deny": [],
-    "defaultMode": "allowEdits"
-  },
-  "mcpServers": {
-    "ragtools": {
-      "command": "c:/MY-WorkSpace/rag/.venv/Scripts/python.exe",
-      "args": ["-m", "ragtools.integration.mcp_server"],
-      "cwd": "c:/MY-WorkSpace/rag"
-    }
+    "deny": []
   }
 }

@@ -23,26 +23,10 @@ app.add_typer(project_app, name="project")
 console = Console()
 
 
-def _get_settings(content_root: str | None = None):
-    """Load settings, optionally overriding content_root."""
+def _get_settings():
+    """Load settings."""
     from ragtools.config import Settings
-
-    if content_root:
-        return Settings(content_root=content_root)
     return Settings()
-
-
-def _get_ignore_rules(settings=None, content_root: str | None = None):
-    """Create IgnoreRules from settings."""
-    from ragtools.ignore import IgnoreRules
-
-    if settings is None:
-        settings = _get_settings(content_root)
-    return IgnoreRules(
-        content_root=settings.content_root,
-        global_patterns=settings.ignore_patterns,
-        use_ragignore=settings.use_ragignore_files,
-    )
 
 
 def _probe_service(settings=None) -> bool:
@@ -75,29 +59,14 @@ def _service_url(settings=None) -> str:
 
 @app.command()
 def index(
-    path: str = typer.Argument(".", help="Root directory to scan for projects"),
     full: bool = typer.Option(False, "--full", help="Force full re-index (ignore state)"),
     project: str = typer.Option(None, "--project", "-p", help="Index only this project"),
-    show_ignored: bool = typer.Option(False, "--show-ignored", help="Print ignored files"),
 ):
-    """Index Markdown files. Incremental by default, skips unchanged files."""
+    """Index all configured projects. Incremental by default, skips unchanged files."""
     settings = _get_settings()
-
-    # v2: warn if path argument is used with explicit projects
-    if settings.has_explicit_projects and path != ".":
-        console.print("[yellow]Note:[/yellow] Explicit projects are configured. The path argument is ignored.")
-        console.print("Use [bold]rag project add[/bold] to manage project folders, or [bold]-p <project_id>[/bold] to index a specific project.")
-    elif not settings.has_explicit_projects:
-        settings = _get_settings(path)
-
     start = time.time()
 
-    if show_ignored:
-        ignore_rules = _get_ignore_rules(settings)
-        _print_ignored_files(path, ignore_rules)
-
     if _probe_service(settings):
-        # Route through service
         import httpx
         try:
             r = httpx.post(
@@ -113,22 +82,8 @@ def index(
             console.print(f"[red]Indexing via service failed:[/red] {e}")
             raise typer.Exit(1)
     else:
-        # Direct mode
-        ignore_rules = _get_ignore_rules(settings)
-        try:
-            if full:
-                from ragtools.indexing.indexer import run_full_index
-                console.print(f"[bold]Full indexing[/bold] from {settings.content_root}")
-                stats = run_full_index(settings, project_id=project, ignore_rules=ignore_rules)
-            else:
-                from ragtools.indexing.indexer import run_incremental_index
-                console.print(f"[bold]Incremental indexing[/bold] from {settings.content_root}")
-                stats = run_incremental_index(settings, project_id=project, ignore_rules=ignore_rules)
-            elapsed = time.time() - start
-            _print_index_stats(stats, full, elapsed)
-        except Exception as e:
-            console.print(f"[red]Indexing failed:[/red] {e}")
-            raise typer.Exit(1)
+        console.print("[yellow]Service is not running.[/yellow] Start with: [bold]rag service start[/bold]")
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -304,11 +259,9 @@ def doctor():
 
 
 @app.command()
-def rebuild(
-    path: str = typer.Argument(".", help="Root directory to scan for projects"),
-):
+def rebuild():
     """Drop all data and rebuild index from scratch."""
-    settings = _get_settings(path)
+    settings = _get_settings()
 
     console.print("[yellow]This will delete all indexed data and rebuild from Markdown source.[/yellow]")
     typer.confirm("Continue?", abort=True)
@@ -409,13 +362,10 @@ def projects():
 
 
 @app.command()
-def watch(
-    path: str = typer.Argument(".", help="Root directory to watch for changes"),
-    debounce: int = typer.Option(3000, "--debounce", "-d", help="Debounce delay in milliseconds"),
-):
-    """Watch Markdown files and auto-index on changes.
+def watch():
+    """Start the file watcher (via the service).
 
-    NOTE: Do not run simultaneously with Claude CLI (MCP server).
+    The watcher auto-starts with the service. This command is a convenience alias.
     """
     settings = _get_settings()
     if _probe_service(settings):
@@ -423,14 +373,13 @@ def watch(
         try:
             r = httpx.post(f"{_service_url(settings)}/api/watcher/start", timeout=5.0)
             r.raise_for_status()
-            console.print(f"[green]Watcher started via service[/green]")
-            console.print("Stop with: rag service stop (or POST /api/watcher/stop)")
+            console.print("[green]Watcher started via service[/green]")
         except Exception as e:
             console.print(f"[red]Failed to start watcher via service:[/red] {e}")
             raise typer.Exit(1)
     else:
-        from ragtools.watcher.observer import run_watch
-        run_watch(content_root=path, debounce_ms=debounce)
+        console.print("[yellow]Service is not running.[/yellow] Start with: [bold]rag service start[/bold]")
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -797,31 +746,6 @@ def _print_index_stats(stats: dict, full: bool, elapsed: float) -> None:
     if elapsed > 0:
         table.add_row("Time", f"{elapsed:.1f}s")
     console.print(table)
-
-
-def _print_ignored_files(content_root: str, ignore_rules) -> None:
-    """Print files that would be ignored during indexing."""
-    from ragtools.indexing.scanner import discover_projects
-
-    root = Path(content_root).resolve()
-    projects = discover_projects(content_root)
-    ignored_count = 0
-
-    for pid, project_dir in projects.items():
-        for md in project_dir.rglob("*.md"):
-            reason = ignore_rules.get_reason(md, root)
-            if reason:
-                try:
-                    rel = md.relative_to(root)
-                except ValueError:
-                    rel = md
-                console.print(f"  [dim]IGNORED {rel} — {reason}[/dim]")
-                ignored_count += 1
-
-    if ignored_count:
-        console.print(f"  [dim]{ignored_count} file(s) ignored[/dim]\n")
-    else:
-        console.print("  [dim]No files ignored[/dim]\n")
 
 
 if __name__ == "__main__":

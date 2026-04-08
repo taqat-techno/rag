@@ -50,6 +50,33 @@ def ensure_collection(client: QdrantClient, name: str, dim: int) -> None:
     )
 
 
+def recreate_collection(client: QdrantClient, name: str, dim: int) -> None:
+    """Drop and recreate the collection, guaranteeing a clean slate.
+
+    Qdrant local mode may not fully release files on delete_collection,
+    so we first try delete+create, falling back to deleting all points
+    if the collection still exists with stale data.
+    """
+    try:
+        client.delete_collection(name)
+    except Exception:
+        pass
+
+    existing = [c.name for c in client.get_collections().collections]
+    if name in existing:
+        # Collection survived deletion (local mode quirk) — purge all points
+        from qdrant_client.models import FilterSelector
+        client.delete(
+            collection_name=name,
+            points_selector=FilterSelector(filter=Filter()),
+        )
+    else:
+        client.create_collection(
+            collection_name=name,
+            vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+        )
+
+
 def chunks_to_points(chunks: list[Chunk], embeddings, file_hash: str) -> list[PointStruct]:
     """Convert chunks + embeddings into Qdrant PointStruct objects.
 
