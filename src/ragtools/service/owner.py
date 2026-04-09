@@ -101,10 +101,15 @@ class QdrantOwner:
         query: str,
         project_id: str | None = None,
         top_k: int | None = None,
+        compact: bool = False,
     ) -> dict:
         """Search and return both raw results and formatted context."""
         results = self.search(query, project_id, top_k)
-        formatted = format_context(results, query)
+        if compact:
+            from ragtools.retrieval.formatter import format_context_compact
+            formatted = format_context_compact(results, query)
+        else:
+            formatted = format_context(results, query)
         return {
             "query": query,
             "count": len(results),

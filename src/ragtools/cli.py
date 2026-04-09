@@ -393,8 +393,9 @@ def version():
 def serve():
     """Start the MCP server for Claude CLI integration."""
     from ragtools.integration.mcp_server import main as mcp_main
-    console.print("[bold]Starting RAG MCP server (stdio transport)...[/bold]", err=True)
-    console.print("Press Ctrl+C to stop.", err=True)
+    err_console = Console(stderr=True)
+    err_console.print("[bold]Starting RAG MCP server (stdio transport)...[/bold]")
+    err_console.print("Press Ctrl+C to stop.")
     mcp_main()
 
 

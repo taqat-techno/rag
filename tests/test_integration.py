@@ -64,18 +64,20 @@ def mcp_env():
 class TestSearchKnowledgeBase:
     def test_basic_search(self, mcp_env):
         result = mcp_server.search_knowledge_base("backend architecture")
-        assert "[RAG CONTEXT" in result
-        assert "Source:" in result
+        # Compact format: [N] file.md > Heading (score):
+        assert "[1]" in result
+        assert "(" in result  # score in parens
 
     def test_project_filter(self, mcp_env):
         result = mcp_server.search_knowledge_base("documentation", project="project_a")
-        assert "project_a" in result
+        # Compact format uses filename only, not full path with project_id
+        assert "README.md" in result or "guide.md" in result
 
     def test_top_k(self, mcp_env):
         result = mcp_server.search_knowledge_base("architecture", top_k=2)
-        assert "[RAG CONTEXT" in result
-        source_lines = [l for l in result.split("\n") if "Source:" in l]
-        assert len(source_lines) <= 2
+        assert "[1]" in result
+        # Should have at most 2 numbered results
+        assert "[3]" not in result
 
     def test_empty_query(self, mcp_env):
         result = mcp_server.search_knowledge_base("")
@@ -90,8 +92,8 @@ class TestSearchKnowledgeBase:
         result = mcp_server.search_knowledge_base(
             "xyzzy flurbo garbanzoid completely irrelevant nonsense"
         )
-        # Should get either RAG NOTICE (no results) or RAG CONTEXT with low confidence
-        assert "[RAG" in result
+        # Compact format: "No relevant content found" or low-relevance warning
+        assert "No relevant" in result or "LOW RELEVANCE" in result or "[1]" in result
 
     def test_not_initialized(self):
         """When server hasn't been initialized, return error."""

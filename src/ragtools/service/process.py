@@ -65,12 +65,19 @@ def start_service(settings: Settings) -> int:
 
     import subprocess
 
-    # Build command
-    cmd = [
-        sys.executable, "-m", "ragtools.service.run",
-        "--host", settings.service_host,
-        "--port", str(settings.service_port),
-    ]
+    # Build command — frozen exe doesn't support `-m`, use CLI subcommand instead
+    if getattr(sys, "frozen", False):
+        cmd = [
+            sys.executable, "service", "run",
+            "--host", settings.service_host,
+            "--port", str(settings.service_port),
+        ]
+    else:
+        cmd = [
+            sys.executable, "-m", "ragtools.service.run",
+            "--host", settings.service_host,
+            "--port", str(settings.service_port),
+        ]
 
     # Log file
     log_dir = Path(settings.qdrant_path).parent / "logs"

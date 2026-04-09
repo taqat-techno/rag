@@ -46,10 +46,11 @@ def search(
     query: str = Query(..., description="Search query"),
     project: Optional[str] = Query(None, description="Filter by project"),
     top_k: int = Query(10, description="Max results"),
+    compact: bool = Query(False, description="Token-efficient output for MCP"),
 ):
     """Search the knowledge base."""
     owner = get_owner()
-    return owner.search_formatted(query=query, project_id=project, top_k=top_k)
+    return owner.search_formatted(query=query, project_id=project, top_k=top_k, compact=compact)
 
 
 # --- Indexing ---
@@ -175,16 +176,31 @@ def project_create(req: ProjectCreateRequest):
     log_activity("info", "config", f"Project added: {req.id}")
     _restart_watcher_if_running()
 
-    # Auto-index in background thread (don't block the response)
+    # Auto-index via self-HTTP call in a background thread.
+    # Uses HTTP instead of direct owner call to avoid RLock contention
+    # with the watcher restart. Thread is non-daemon so it survives.
     import threading
-    def _bg_index(project_id):
+    import time as _time
+    def _bg_index(project_id, host, port):
         try:
-            owner = get_owner()
-            stats = owner.run_full_index(project_id=project_id)
-            log_activity("success", "indexer", f"Auto-indexed {project_id}: {stats.get('files_indexed', 0)} files")
+            _time.sleep(2)  # Let watcher restart settle
+            import httpx
+            log_activity("info", "indexer", f"Auto-indexing {project_id}...")
+            r = httpx.post(
+                f"http://{host}:{port}/api/index",
+                json={"full": True, "project": project_id},
+                timeout=300.0,
+            )
+            if r.status_code == 200:
+                stats = r.json().get("stats", {})
+                log_activity("success", "indexer",
+                    f"Auto-indexed {project_id}: {stats.get('files_indexed', 0)} files, {stats.get('chunks_indexed', 0)} chunks")
+            else:
+                log_activity("warning", "indexer", f"Auto-index returned {r.status_code} for {project_id}")
         except Exception as e:
-            log_activity("warning", "indexer", f"Auto-index failed for {project_id}: {e}")
-    threading.Thread(target=_bg_index, args=(req.id,), daemon=True).start()
+            log_activity("error", "indexer", f"Auto-index failed for {project_id}: {e}")
+    s = get_settings()
+    threading.Thread(target=_bg_index, args=(req.id, s.service_host, s.service_port)).start()
 
     return {"status": "created", "project": {"id": new_project.id, "name": new_project.name, "path": new_project.path}}
 

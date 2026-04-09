@@ -9,8 +9,8 @@
 ;   iscc installer.iss
 
 #define MyAppName "RAG Tools"
-#define MyAppVersion "2.0.0"
-#define MyAppPublisher "RAG Tools"
+#define MyAppVersion "2.1.0"
+#define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
 #define MyAppExeName "rag.exe"
 
@@ -38,7 +38,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "addtopath"; Description: "Add to PATH (recommended)"; GroupDescription: "Additional options:"
 Name: "startup"; Description: "Start automatically on Windows login"; GroupDescription: "Additional options:"
-Name: "startnow"; Description: "Start service after installation"; GroupDescription: "Additional options:"; Flags: unchecked
+Name: "startnow"; Description: "Start service and open admin panel after installation"; GroupDescription: "Additional options:"
 
 [Files]
 ; Main application (PyInstaller one-dir output)
@@ -60,6 +60,8 @@ Filename: "cmd.exe"; Parameters: "/c mkdir ""{localappdata}\RAGTools\data"" 2>nu
 Filename: "{app}\rag.exe"; Parameters: "service install"; StatusMsg: "Registering startup task..."; Tasks: startup; Flags: runhidden
 ; Start service now if selected
 Filename: "{app}\rag.exe"; Parameters: "service start"; StatusMsg: "Starting service..."; Tasks: startnow; Flags: runhidden nowait
+; Open admin panel in browser after a delay (let service start)
+Filename: "cmd.exe"; Parameters: "/c timeout /t 15 /nobreak >nul & start http://localhost:21420"; StatusMsg: "Opening admin panel..."; Tasks: startnow; Flags: runhidden nowait
 
 [UninstallRun]
 ; Stop service before uninstall

@@ -171,7 +171,7 @@ def index_status() -> str:
 
 def _proxy_search(query: str, project: str | None, top_k: int) -> str:
     try:
-        params = {"query": query, "top_k": top_k}
+        params = {"query": query, "top_k": top_k, "compact": True}
         if project:
             params["project"] = project
         r = _http_client.get("/api/search", params=params)
@@ -239,7 +239,7 @@ def _direct_search(query: str, project: str | None, top_k: int) -> str:
 
     client = None
     try:
-        from ragtools.retrieval.formatter import format_context
+        from ragtools.retrieval.formatter import format_context_compact
         from ragtools.retrieval.searcher import Searcher
 
         client = _get_direct_client()
@@ -251,7 +251,7 @@ def _direct_search(query: str, project: str | None, top_k: int) -> str:
             top_k=top_k,
             score_threshold=_settings.score_threshold,
         )
-        return format_context(results, query)
+        return format_context_compact(results, query)
     except Exception as e:
         logger.exception("Search failed")
         return f"[RAG ERROR] Search failed: {e}"
@@ -344,6 +344,16 @@ def _direct_index_status() -> str:
 
 def main():
     """Entry point for the MCP server."""
+    # Force all logging to stderr so stdout stays clean for MCP stdio protocol
+    logging.basicConfig(
+        level=logging.WARNING,
+        stream=sys.stderr,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+    # Suppress httpx INFO logs that would corrupt stdio
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     _initialize()
     mcp_app.run(transport="stdio")
 
