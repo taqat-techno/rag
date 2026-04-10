@@ -124,6 +124,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,  # Don't compress — causes AV false positives
+    icon=os.path.join(PROJECT_ROOT, "app.ico"),
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,

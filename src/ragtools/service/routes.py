@@ -144,6 +144,30 @@ def projects_configured():
     ]}
 
 
+def _schedule_auto_index(project_id: str):
+    """Start auto-indexing a project in a background thread.
+
+    Uses a timer thread (3s delay) so the HTTP response completes first
+    and the watcher restart releases the RLock before indexing begins.
+    """
+    import threading
+    from ragtools.service.activity import log_activity
+
+    def _run():
+        try:
+            log_activity("info", "indexer", f"Auto-indexing {project_id}...")
+            owner = get_owner()
+            stats = owner.run_full_index(project_id=project_id)
+            log_activity("success", "indexer",
+                f"Auto-indexed {project_id}: {stats.get('files_indexed', 0)} files, {stats.get('chunks_indexed', 0)} chunks")
+        except Exception as e:
+            log_activity("error", "indexer", f"Auto-index failed for {project_id}: {e}")
+
+    timer = threading.Timer(3.0, _run)
+    timer.daemon = False
+    timer.start()
+
+
 @router.post("/api/projects")
 def project_create(req: ProjectCreateRequest):
     """Add a new project."""
@@ -162,6 +186,14 @@ def project_create(req: ProjectCreateRequest):
     if not P(path).is_dir():
         raise HTTPException(status_code=422, detail=f"Path does not exist or is not a directory: {req.path}")
 
+    # Block exact duplicate paths
+    for p in settings.projects:
+        if str(P(p.path).resolve()) == path:
+            raise HTTPException(
+                status_code=422,
+                detail=f"This folder is already configured as project '{p.id}'"
+            )
+
     new_project = ProjectConfig(
         id=req.id, name=req.name or req.id, path=path,
         enabled=req.enabled, ignore_patterns=req.ignore_patterns,
@@ -176,31 +208,8 @@ def project_create(req: ProjectCreateRequest):
     log_activity("info", "config", f"Project added: {req.id}")
     _restart_watcher_if_running()
 
-    # Auto-index via self-HTTP call in a background thread.
-    # Uses HTTP instead of direct owner call to avoid RLock contention
-    # with the watcher restart. Thread is non-daemon so it survives.
-    import threading
-    import time as _time
-    def _bg_index(project_id, host, port):
-        try:
-            _time.sleep(2)  # Let watcher restart settle
-            import httpx
-            log_activity("info", "indexer", f"Auto-indexing {project_id}...")
-            r = httpx.post(
-                f"http://{host}:{port}/api/index",
-                json={"full": True, "project": project_id},
-                timeout=300.0,
-            )
-            if r.status_code == 200:
-                stats = r.json().get("stats", {})
-                log_activity("success", "indexer",
-                    f"Auto-indexed {project_id}: {stats.get('files_indexed', 0)} files, {stats.get('chunks_indexed', 0)} chunks")
-            else:
-                log_activity("warning", "indexer", f"Auto-index returned {r.status_code} for {project_id}")
-        except Exception as e:
-            log_activity("error", "indexer", f"Auto-index failed for {project_id}: {e}")
-    s = get_settings()
-    threading.Thread(target=_bg_index, args=(req.id, s.service_host, s.service_port)).start()
+    # Schedule auto-index (runs after response completes)
+    _schedule_auto_index(req.id)
 
     return {"status": "created", "project": {"id": new_project.id, "name": new_project.name, "path": new_project.path}}
 
@@ -446,15 +455,54 @@ def watcher_status():
 
 
 def _restart_watcher_if_running():
-    """Restart the watcher if it's currently running. Called after project config changes."""
-    with _watcher_lock:
-        if _watcher_thread is not None and _watcher_thread.is_alive():
-            watcher_stop()
-            watcher_start()
-            logger.info("Watcher restarted after project config change")
+    """Restart the watcher if it's currently running. Called after project config changes.
+
+    Runs in a background thread so it doesn't block the HTTP response.
+    """
+    import threading as _th
+    def _do_restart():
+        with _watcher_lock:
+            if _watcher_thread is not None and _watcher_thread.is_alive():
+                watcher_stop()
+                watcher_start()
+                logger.info("Watcher restarted after project config change")
+    _th.Thread(target=_do_restart, daemon=True).start()
 
 
 # --- Semantic Map ---
+
+# --- Folder Picker (localhost-only, native OS dialog) ---
+
+@router.get("/api/pick-folder")
+def pick_folder():
+    """Open the native OS folder picker dialog. Returns the selected path."""
+    import threading
+
+    result = {"path": None}
+
+    def _pick():
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askdirectory(title="Choose project folder")
+            root.destroy()
+            if path:
+                result["path"] = path.replace("/", "\\") if "\\" in __import__("os").sep else path
+        except Exception:
+            pass
+
+    # Tkinter must run in a thread (uvicorn's event loop blocks otherwise)
+    t = threading.Thread(target=_pick)
+    t.start()
+    t.join(timeout=120)  # Wait up to 2 minutes for user to pick
+
+    if result["path"]:
+        return {"path": result["path"]}
+    return {"path": None}
+
 
 @router.get("/api/map/points")
 def map_points(project: Optional[str] = Query(None, description="Filter by project")):
@@ -478,11 +526,27 @@ def map_recompute():
 
 @router.get("/api/mcp-config")
 def mcp_config():
-    """Return the MCP server configuration JSON for Claude Code."""
+    """Return the MCP server configuration JSON for Claude Code.
+
+    Detects the runtime environment:
+    - Frozen exe (installed): returns full path to rag.exe + 'serve' subcommand
+    - Dev/pip install: returns generic 'rag-mcp' entry point
+    """
+    import sys
     import shutil
 
-    # Use generic command name if on PATH; fall back to python -m
-    if shutil.which("rag-mcp"):
+    if getattr(sys, "frozen", False):
+        # Installed via exe: use the actual executable path
+        config = {
+            "mcpServers": {
+                "ragtools": {
+                    "command": sys.executable,
+                    "args": ["serve"]
+                }
+            }
+        }
+    elif shutil.which("rag-mcp"):
+        # Dev/pip install: use the entry point
         config = {
             "mcpServers": {
                 "ragtools": {
@@ -492,6 +556,7 @@ def mcp_config():
             }
         }
     else:
+        # Fallback: python module
         config = {
             "mcpServers": {
                 "ragtools": {

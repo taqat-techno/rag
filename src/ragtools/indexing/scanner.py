@@ -8,6 +8,7 @@ Supports two modes:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -106,6 +107,10 @@ def scan_configured_projects(
 ) -> list[tuple[str, Path]]:
     """Scan explicitly configured projects for markdown files (v2).
 
+    Handles nested project paths: if project A = C:/docs and project B = C:/docs/sub,
+    files in sub/ are only assigned to project B (the deeper one). Project A
+    automatically excludes files that belong to a more specific child project.
+
     Args:
         projects: List of ProjectConfig entries. Only enabled projects are scanned.
         global_ignore_patterns: Global ignore patterns (applied to all projects).
@@ -115,15 +120,24 @@ def scan_configured_projects(
     """
     from ragtools.ignore import IgnoreRules
 
+    # Build resolved path map for all projects (including disabled, for exclusion)
+    all_resolved = {p.id: Path(p.path).resolve() for p in projects}
+
     results = []
     for project in projects:
         if not project.enabled:
             continue
 
-        project_path = Path(project.path)
+        project_path = Path(project.path).resolve()
         if not project_path.exists() or not project_path.is_dir():
             logger.warning("Project '%s' path does not exist: %s", project.id, project.path)
             continue
+
+        # Find child project paths nested inside this project
+        child_paths = [
+            rp for pid, rp in all_resolved.items()
+            if pid != project.id and _is_subpath(rp, project_path)
+        ]
 
         # Merge global + per-project ignore patterns
         combined_patterns = list(global_ignore_patterns or []) + list(project.ignore_patterns)
@@ -135,9 +149,27 @@ def scan_configured_projects(
         )
 
         for md_file in discover_markdown_files(project_path, ignore_rules=ignore_rules):
+            # Skip files that belong to a more specific child project
+            if child_paths:
+                file_resolved = md_file.resolve()
+                owned_by_child = any(
+                    str(file_resolved).startswith(str(cp) + os.sep) or file_resolved == cp
+                    for cp in child_paths
+                )
+                if owned_by_child:
+                    continue
             results.append((project.id, md_file))
 
     return results
+
+
+def _is_subpath(path: Path, parent: Path) -> bool:
+    """Check if path is inside parent directory (strict — not equal)."""
+    try:
+        path.relative_to(parent)
+        return path != parent
+    except ValueError:
+        return False
 
 
 def get_project_relative_path(file_path: Path, project_path: str, project_id: str) -> str:

@@ -358,17 +358,25 @@ class QdrantOwner:
             return {"project_id": project_id, "files_deleted": deleted_files}
 
     def _scan_files(self, project_id: str | None = None) -> list[tuple[str, Path]]:
-        """Scan files from configured projects."""
-        projects = self._settings.enabled_projects
-        if project_id:
-            projects = [p for p in projects if p.id == project_id]
-            if not projects:
-                raise ValueError(f"Project '{project_id}' not found in configuration")
-        return scan_configured_projects(
-            projects,
+        """Scan files from configured projects.
+
+        Always passes ALL projects to the scanner so nested path scoping
+        works correctly (parent excludes child project files). Filters
+        results by project_id afterward if requested.
+        """
+        if project_id and not any(p.id == project_id for p in self._settings.enabled_projects):
+            raise ValueError(f"Project '{project_id}' not found in configuration")
+
+        # Pass all projects (including disabled) so scanner detects nested path overlaps
+        all_files = scan_configured_projects(
+            self._settings.projects,
             global_ignore_patterns=self._settings.ignore_patterns,
             use_ragignore=self._settings.use_ragignore_files,
         )
+
+        if project_id:
+            return [(pid, fp) for pid, fp in all_files if pid == project_id]
+        return all_files
 
     def _resolve_relative_path(self, project_id: str, file_path: Path) -> str:
         """Compute the storage-relative path for a file."""

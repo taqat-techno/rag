@@ -72,6 +72,28 @@ def _post_startup(settings: Settings, from_scheduler: bool) -> None:
     except Exception as e:
         logger.warning("Failed to auto-register startup task (non-fatal): %s", e)
 
+    # Startup sync: check all projects for offline changes (non-blocking)
+    import threading
+    def _startup_sync():
+        try:
+            from ragtools.service.app import get_owner
+            from ragtools.service.activity import log_activity
+            log_activity("info", "indexer", "Startup sync: checking for offline changes...")
+            owner = get_owner()
+            stats = owner.run_incremental_index()
+            indexed = stats.get("indexed", 0)
+            deleted = stats.get("deleted", 0)
+            skipped = stats.get("skipped", 0)
+            if indexed > 0 or deleted > 0:
+                log_activity("success", "indexer",
+                    f"Startup sync: {indexed} indexed, {deleted} deleted, {skipped} unchanged")
+            else:
+                log_activity("info", "indexer",
+                    f"Startup sync: all {skipped} files up to date")
+        except Exception as e:
+            logger.warning("Startup sync failed (non-fatal): %s", e)
+    threading.Timer(5.0, _startup_sync).start()
+
     # Open browser if configured and launched from scheduler
     if from_scheduler and settings.startup_open_browser:
         try:

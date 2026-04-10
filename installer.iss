@@ -9,7 +9,7 @@
 ;   iscc installer.iss
 
 #define MyAppName "RAG Tools"
-#define MyAppVersion "2.1.0"
+#define MyAppVersion "2.2.0"
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
 #define MyAppExeName "rag.exe"
@@ -25,6 +25,8 @@ DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 OutputDir=dist
 OutputBaseFilename=RAGTools-Setup-{#MyAppVersion}
+SetupIconFile=app.ico
+UninstallDisplayIcon={app}\rag.exe
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -37,16 +39,19 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "addtopath"; Description: "Add to PATH (recommended)"; GroupDescription: "Additional options:"
+; Auto-start ON by default — the product is designed to always run
 Name: "startup"; Description: "Start automatically on Windows login"; GroupDescription: "Additional options:"
 Name: "startnow"; Description: "Start service and open admin panel after installation"; GroupDescription: "Additional options:"
 
 [Files]
 ; Main application (PyInstaller one-dir output)
 Source: "dist\rag\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Silent launcher script
+Source: "scripts\launch.vbs"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\RAG Tools Admin"; Filename: "http://localhost:21420"; Comment: "Open RAG Tools Admin Panel"
-Name: "{group}\RAG Tools CLI"; Filename: "cmd.exe"; Parameters: "/k ""{app}\rag.exe"" --help"; Comment: "RAG Tools Command Line"
+; Smart launcher: starts service if needed, opens admin panel
+Name: "{group}\RAG Tools"; Filename: "{app}\launch.vbs"; IconFilename: "{app}\rag.exe"; Comment: "Start RAG Tools and open admin panel"
 Name: "{group}\Uninstall RAG Tools"; Filename: "{uninstallexe}"
 
 [Registry]
@@ -56,9 +61,9 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; Value
 [Run]
 ; Create data directory structure
 Filename: "cmd.exe"; Parameters: "/c mkdir ""{localappdata}\RAGTools\data"" 2>nul & mkdir ""{localappdata}\RAGTools\logs"" 2>nul"; Flags: runhidden
-; Register startup task if selected
+; Register startup task (ON by default)
 Filename: "{app}\rag.exe"; Parameters: "service install"; StatusMsg: "Registering startup task..."; Tasks: startup; Flags: runhidden
-; Start service now if selected
+; Start service now (ON by default)
 Filename: "{app}\rag.exe"; Parameters: "service start"; StatusMsg: "Starting service..."; Tasks: startnow; Flags: runhidden nowait
 ; Open admin panel in browser after a delay (let service start)
 Filename: "cmd.exe"; Parameters: "/c timeout /t 15 /nobreak >nul & start http://localhost:21420"; StatusMsg: "Opening admin panel..."; Tasks: startnow; Flags: runhidden nowait
@@ -70,8 +75,15 @@ Filename: "{app}\rag.exe"; Parameters: "service stop"; Flags: runhidden; RunOnce
 Filename: "{app}\rag.exe"; Parameters: "service uninstall"; Flags: runhidden; RunOnceId: "RemoveTask"
 
 [UninstallDelete]
-; Clean up PID file if exists
+; Clean up PID file
 Type: files; Name: "{localappdata}\RAGTools\service.pid"
+; Clean up .bak leftovers from in-place upgrades
+Type: files; Name: "{app}\rag.exe.bak"
+Type: filesandordirs; Name: "{app}\_internal.bak"
+; Clean up model cache in install directory
+Type: filesandordirs; Name: "{app}\model_cache"
+; Clean entire install directory (catches any remaining stale files)
+Type: filesandordirs; Name: "{app}"
 
 [Code]
 // Check if {app} is already in PATH
@@ -104,20 +116,17 @@ begin
   end;
 end;
 
-// Post-install: re-register task if it was installed before upgrade
-procedure CurStepChanged2(CurStep: TSetupStep);
-begin
-  // This is handled by the [Run] section tasks
-end;
-
-// Uninstall: ask about keeping data
+// Uninstall: ask about keeping user data
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    if MsgBox('Do you want to keep your RAG Tools data (indexed content, config, logs)?',
+    if MsgBox('Do you want to keep your RAG Tools data?' + #13#10 +
+              '(indexed content, config, logs, model cache)' + #13#10 + #13#10 +
+              'Click "No" to delete everything.',
               mbConfirmation, MB_YESNO) = IDNO then
     begin
+      // Delete user data directory (Qdrant DB, logs, config)
       DelTree(ExpandConstant('{localappdata}\RAGTools'), True, True, True);
     end;
   end;
