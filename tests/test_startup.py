@@ -23,13 +23,12 @@ def test_task_name():
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 def test_check_windows_passes():
-    startup._check_windows()  # Should not raise
+    assert startup._check_windows() is True
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Non-Windows only")
-def test_check_windows_raises_on_non_windows():
-    with pytest.raises(RuntimeError, match="only available on Windows"):
-        startup._check_windows()
+def test_check_windows_returns_false_on_non_windows():
+    assert startup._check_windows() is False
 
 
 # --- Install task ---
