@@ -38,16 +38,18 @@ PrivilegesRequiredOverridesAllowed=dialog
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "addtopath"; Description: "Add to PATH (recommended)"; GroupDescription: "Additional options:"
+Name: "addtopath"; Description: "Add to PATH (recommended)"; GroupDescription: "Additional options:"; Flags: checked
 ; Auto-start ON by default — the product is designed to always run
-Name: "startup"; Description: "Start automatically on Windows login"; GroupDescription: "Additional options:"
-Name: "startnow"; Description: "Start service and open admin panel after installation"; GroupDescription: "Additional options:"
+Name: "startup"; Description: "Start automatically on Windows login"; GroupDescription: "Additional options:"; Flags: checked
+Name: "startnow"; Description: "Start service and open admin panel after installation"; GroupDescription: "Additional options:"; Flags: checked
 
 [Files]
 ; Main application (PyInstaller one-dir output)
 Source: "dist\rag\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Silent launcher script
 Source: "scripts\launch.vbs"; DestDir: "{app}"; Flags: ignoreversion
+; Folder picker script
+Source: "scripts\pick_folder.vbs"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; Smart launcher: starts service if needed, opens admin panel

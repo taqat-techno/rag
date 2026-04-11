@@ -1,10 +1,11 @@
-"""Tests for Windows startup integration (Task Scheduler).
+"""Tests for Windows startup integration (Startup folder).
 
-Uses mocks for schtasks — no real task creation in CI.
+Uses temp directories to avoid modifying the real Startup folder.
 """
 
 import sys
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+from pathlib import Path
 
 import pytest
 
@@ -16,33 +17,6 @@ from ragtools.service import startup
 
 def test_task_name():
     assert startup.TASK_NAME == "RAGTools Service"
-
-
-# --- Delay formatting ---
-
-def test_delay_str_30_seconds():
-    assert startup._delay_str(30) == "0000:01"  # Min 1 minute
-
-
-def test_delay_str_60_seconds():
-    assert startup._delay_str(60) == "0000:01"
-
-
-def test_delay_str_120_seconds():
-    assert startup._delay_str(120) == "0000:02"
-
-
-def test_delay_str_3600_seconds():
-    assert startup._delay_str(3600) == "0001:00"
-
-
-# --- Command building ---
-
-def test_build_task_command():
-    settings = Settings()
-    cmd = startup._build_task_command(settings)
-    assert "ragtools.service.run" in cmd
-    assert "--from-scheduler" in cmd
 
 
 # --- Platform check ---
@@ -58,73 +32,87 @@ def test_check_windows_raises_on_non_windows():
         startup._check_windows()
 
 
-# --- Install task (mocked) ---
+# --- Install task ---
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
-@patch("subprocess.run")
-def test_install_task_success(mock_run):
-    mock_run.return_value = MagicMock(returncode=0, stdout="SUCCESS", stderr="")
+def test_install_task_success(tmp_path):
+    """Install creates a VBScript in the startup folder."""
     settings = Settings()
-    result = startup.install_task(settings, delay_seconds=30)
+    with patch.object(startup, "_get_startup_folder", return_value=tmp_path):
+        result = startup.install_task(settings, delay_seconds=30)
     assert result is True
-    mock_run.assert_called_once()
-    cmd = mock_run.call_args[0][0]
-    assert "schtasks" in cmd
-    assert "/create" in cmd
-    assert startup.TASK_NAME in cmd
+    script = tmp_path / startup.STARTUP_FILENAME
+    assert script.exists()
+    content = script.read_text()
+    assert "RAGTools Auto-Start" in content
+    assert "WScript.Sleep 30000" in content
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
-@patch("subprocess.run")
-def test_install_task_failure(mock_run):
-    mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Access denied")
+def test_install_task_custom_delay(tmp_path):
+    """Install respects custom delay."""
     settings = Settings()
-    with pytest.raises(RuntimeError, match="schtasks failed"):
+    with patch.object(startup, "_get_startup_folder", return_value=tmp_path):
+        startup.install_task(settings, delay_seconds=60)
+    script = tmp_path / startup.STARTUP_FILENAME
+    content = script.read_text()
+    assert "WScript.Sleep 60000" in content
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
+def test_install_task_overwrites(tmp_path):
+    """Install overwrites existing script."""
+    settings = Settings()
+    script = tmp_path / startup.STARTUP_FILENAME
+    script.write_text("old content")
+    with patch.object(startup, "_get_startup_folder", return_value=tmp_path):
         startup.install_task(settings, delay_seconds=30)
+    content = script.read_text()
+    assert "RAGTools Auto-Start" in content
+    assert "old content" not in content
+
+
+# --- Uninstall task ---
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
+def test_uninstall_task_success(tmp_path):
+    """Uninstall removes the startup script."""
+    script = tmp_path / startup.STARTUP_FILENAME
+    script.write_text("test")
+    with patch.object(startup, "_get_startup_folder", return_value=tmp_path):
+        with patch.object(startup, "_get_startup_script_path", return_value=script):
+            result = startup.uninstall_task()
+    assert result is True
+    assert not script.exists()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
-@patch("subprocess.run")
-def test_install_task_custom_delay(mock_run):
-    mock_run.return_value = MagicMock(returncode=0, stdout="SUCCESS", stderr="")
-    settings = Settings()
-    startup.install_task(settings, delay_seconds=300)
-    cmd = mock_run.call_args[0][0]
-    assert "0000:05" in cmd  # 300s = 5min
-
-
-# --- Uninstall task (mocked) ---
-
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
-@patch("subprocess.run")
-def test_uninstall_task_success(mock_run):
-    mock_run.return_value = MagicMock(returncode=0, stdout="SUCCESS", stderr="")
-    result = startup.uninstall_task()
+def test_uninstall_task_not_found(tmp_path):
+    """Uninstall succeeds even if script doesn't exist."""
+    script = tmp_path / startup.STARTUP_FILENAME
+    with patch.object(startup, "_get_startup_folder", return_value=tmp_path):
+        with patch.object(startup, "_get_startup_script_path", return_value=script):
+            result = startup.uninstall_task()
     assert result is True
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
-@patch("subprocess.run")
-def test_uninstall_task_not_found(mock_run):
-    mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="ERROR: cannot find the file")
-    result = startup.uninstall_task()
-    assert result is True  # Not found = success (idempotent)
-
-
-# --- Is task installed (mocked) ---
+# --- Is task installed ---
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
-@patch("subprocess.run")
-def test_is_task_installed_yes(mock_run):
-    mock_run.return_value = MagicMock(returncode=0)
-    assert startup.is_task_installed() is True
+def test_is_task_installed_yes(tmp_path):
+    """Returns True when startup script exists."""
+    script = tmp_path / startup.STARTUP_FILENAME
+    script.write_text("test")
+    with patch.object(startup, "_get_startup_script_path", return_value=script):
+        assert startup.is_task_installed() is True
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
-@patch("subprocess.run")
-def test_is_task_installed_no(mock_run):
-    mock_run.return_value = MagicMock(returncode=1)
-    assert startup.is_task_installed() is False
+def test_is_task_installed_no(tmp_path):
+    """Returns False when startup script doesn't exist."""
+    script = tmp_path / startup.STARTUP_FILENAME
+    with patch.object(startup, "_get_startup_script_path", return_value=script):
+        assert startup.is_task_installed() is False
 
 
 def test_is_task_installed_non_windows():

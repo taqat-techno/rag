@@ -1,13 +1,14 @@
-"""Windows Task Scheduler integration for automatic service startup.
+"""Windows startup integration for automatic service launch.
 
-Uses schtasks.exe to create/remove a logon-triggered task.
-No admin privileges required for user-level tasks.
+Uses the Windows Startup folder (shell:startup) to register a VBScript
+launcher that runs on user login. No elevation or admin privileges required.
+
+Replaces the previous schtasks approach which required elevation for
+/sc onlogon triggers — causing "Access is denied" on standard user accounts.
 """
 
-import csv
-import io
 import logging
-import subprocess
+import os
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from ragtools.config import Settings
 logger = logging.getLogger("ragtools.service")
 
 TASK_NAME = "RAGTools Service"
+STARTUP_FILENAME = "RAGTools.vbs"
 
 
 def _check_windows() -> None:
@@ -24,146 +26,166 @@ def _check_windows() -> None:
         raise RuntimeError("Startup integration is only available on Windows")
 
 
-def _get_exe_path() -> str:
-    """Get the Python executable path for the scheduled task command."""
-    return sys.executable
+def _get_startup_folder() -> Path:
+    """Get the Windows Startup folder path."""
+    # %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
+    appdata = os.environ.get("APPDATA", "")
+    if not appdata:
+        raise RuntimeError("APPDATA environment variable not set")
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 
 
-def _build_task_command(settings: Settings) -> str:
-    """Build the command string the scheduled task will execute.
+def _get_startup_script_path() -> Path:
+    """Get the full path to the startup script."""
+    return _get_startup_folder() / STARTUP_FILENAME
 
-    Uses absolute paths to avoid CWD dependency (Task Scheduler runs
-    from C:\\Windows\\system32 by default).
+
+def _build_startup_script(settings: Settings, delay_seconds: int) -> str:
+    """Build a VBScript that starts the RAG service after a delay.
+
+    The script:
+    1. Waits for the configured delay (lets the system settle after login)
+    2. Checks if the service is already running (health check)
+    3. If not running, starts it silently
+    4. Optionally opens the browser
     """
-    from ragtools.config import is_packaged, get_data_dir
-
-    exe = _get_exe_path()
+    from ragtools.config import is_packaged
 
     if is_packaged():
-        # Packaged mode: paths resolve via %LOCALAPPDATA% automatically
-        return f'"{exe}" -m ragtools.service.run --from-scheduler'
+        exe_path = sys.executable
     else:
-        # Dev mode: set RAG_DATA_DIR to ensure absolute path resolution
-        data_dir = str(Path(settings.qdrant_path).parent.resolve())
-        return f'cmd /c "set RAG_DATA_DIR={data_dir} && "{exe}" -m ragtools.service.run --from-scheduler"'
+        exe_path = sys.executable
+        # In dev mode, we need to run python -m ragtools.service.run
+        # But VBScript can't easily do this, so use the CLI entry point
+        # which should be on PATH after pip install -e .
 
+    # For packaged mode: use the exe directly
+    # For dev mode: use python path with module
+    if is_packaged():
+        start_cmd = f'"""{exe_path}""" service start'
+    else:
+        start_cmd = f'"""{exe_path}""" -m ragtools.cli service start'
 
-def _delay_str(seconds: int) -> str:
-    """Convert seconds to schtasks delay format (HHHH:MM)."""
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    if seconds < 60:
-        minutes = 1  # Minimum 1 minute for schtasks
-    return f"{hours:04d}:{minutes:02d}"
+    return f"""' RAGTools Auto-Start Script
+' Created by RAGTools service install
+' Starts the RAG service after login with a delay
+
+Dim shell
+Set shell = CreateObject("WScript.Shell")
+
+' Wait for system to settle after login
+WScript.Sleep {delay_seconds * 1000}
+
+' Check if service is already running
+Dim healthy
+healthy = False
+On Error Resume Next
+Dim http
+Set http = CreateObject("MSXML2.XMLHTTP")
+http.Open "GET", "http://127.0.0.1:{settings.service_port}/health", False
+http.Send
+If http.Status = 200 Then healthy = True
+Set http = Nothing
+On Error GoTo 0
+
+' Start service if not already running
+If Not healthy Then
+    shell.Run {start_cmd}, 0, False
+End If
+"""
 
 
 def install_task(settings: Settings, delay_seconds: int | None = None) -> bool:
-    """Create a Windows scheduled task that starts the service at user logon.
+    """Register RAG Tools to start automatically on Windows login.
+
+    Places a VBScript in the Windows Startup folder. This approach:
+    - Requires NO elevation (unlike schtasks /sc onlogon)
+    - Is visible in Task Manager > Startup tab
+    - Survives reboots
+    - Can be disabled by the user via Task Manager
 
     Args:
         settings: Application settings.
-        delay_seconds: Seconds to delay after logon. Uses settings.startup_delay if None.
+        delay_seconds: Seconds to delay after login. Uses settings.startup_delay if None.
 
     Returns:
-        True if task was created successfully.
+        True if startup registration succeeded.
 
     Raises:
-        RuntimeError: If not on Windows or schtasks fails.
+        RuntimeError: If not on Windows or file operation fails.
     """
     _check_windows()
 
     delay = delay_seconds if delay_seconds is not None else settings.startup_delay
-    command = _build_task_command(settings)
-    delay_fmt = _delay_str(delay)
+    startup_dir = _get_startup_folder()
 
-    cmd = [
-        "schtasks", "/create",
-        "/tn", TASK_NAME,
-        "/tr", command,
-        "/sc", "onlogon",
-        "/delay", delay_fmt,
-        "/f",                # Force overwrite if exists
-        "/rl", "limited",    # Run with limited privileges
-    ]
+    if not startup_dir.exists():
+        raise RuntimeError(f"Startup folder not found: {startup_dir}")
 
-    logger.info("Installing scheduled task: %s (delay=%ds)", TASK_NAME, delay)
-    logger.debug("Command: %s", " ".join(cmd))
+    script_content = _build_startup_script(settings, delay)
+    script_path = _get_startup_script_path()
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        error = result.stderr.strip() or result.stdout.strip()
-        logger.error("Failed to create task: %s", error)
-        raise RuntimeError(f"schtasks failed: {error}")
-
-    logger.info("Scheduled task created successfully")
+    logger.info("Installing startup script: %s (delay=%ds)", script_path, delay)
+    script_path.write_text(script_content, encoding="utf-8")
+    logger.info("Startup script installed successfully")
     return True
 
 
 def uninstall_task() -> bool:
-    """Remove the Windows scheduled task.
+    """Remove RAG Tools from Windows startup.
 
     Returns:
-        True if task was removed or didn't exist.
+        True if removed or didn't exist.
     """
     _check_windows()
 
-    cmd = ["schtasks", "/delete", "/tn", TASK_NAME, "/f"]
+    script_path = _get_startup_script_path()
+    logger.info("Removing startup script: %s", script_path)
 
-    logger.info("Removing scheduled task: %s", TASK_NAME)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    if script_path.exists():
+        script_path.unlink()
+        logger.info("Startup script removed")
+    else:
+        logger.info("Startup script was not installed")
 
-    if result.returncode != 0:
-        # Task might not exist — that's fine
-        if "cannot find" in result.stderr.lower() or "cannot find" in result.stdout.lower():
-            logger.info("Task was not installed")
-            return True
-        error = result.stderr.strip() or result.stdout.strip()
-        logger.error("Failed to delete task: %s", error)
-        return False
+    # Also clean up old schtasks-based task if it exists
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["schtasks", "/delete", "/tn", TASK_NAME, "/f"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            logger.info("Removed legacy scheduled task: %s", TASK_NAME)
+    except Exception:
+        pass
 
-    logger.info("Scheduled task removed")
     return True
 
 
 def is_task_installed() -> bool:
-    """Check if the scheduled task exists."""
+    """Check if RAG Tools is registered for startup."""
     if sys.platform != "win32":
         return False
-
-    cmd = ["schtasks", "/query", "/tn", TASK_NAME]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.returncode == 0
+    return _get_startup_script_path().exists()
 
 
 def get_task_info() -> dict | None:
-    """Get detailed task information.
+    """Get startup registration details.
 
     Returns:
-        Dict with task details, or None if task doesn't exist.
+        Dict with details, or None if not registered.
     """
     if sys.platform != "win32":
         return None
 
-    cmd = ["schtasks", "/query", "/tn", TASK_NAME, "/fo", "CSV", "/v"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if result.returncode != 0:
+    script_path = _get_startup_script_path()
+    if not script_path.exists():
         return None
 
-    try:
-        reader = csv.DictReader(io.StringIO(result.stdout))
-        for row in reader:
-            return {
-                "task_name": row.get("TaskName", TASK_NAME),
-                "status": row.get("Status", "Unknown"),
-                "last_run": row.get("Last Run Time", "Never"),
-                "last_result": row.get("Last Result", "N/A"),
-                "next_run": row.get("Next Run Time", "N/A"),
-                "command": row.get("Task To Run", "N/A"),
-            }
-    except Exception as e:
-        logger.debug("Failed to parse task info: %s", e)
-        # Fallback: task exists but can't parse details
-        return {"task_name": TASK_NAME, "status": "Installed", "last_run": "Unknown"}
-
-    return None
+    return {
+        "task_name": TASK_NAME,
+        "status": "Installed",
+        "location": str(script_path),
+        "method": "Startup folder",
+    }

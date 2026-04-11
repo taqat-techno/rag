@@ -471,36 +471,74 @@ def _restart_watcher_if_running():
 
 # --- Semantic Map ---
 
-# --- Folder Picker (localhost-only, native OS dialog) ---
+# --- Folder Resolver (browser-native folder picker support) ---
 
-@router.get("/api/pick-folder")
-def pick_folder():
-    """Open the native OS folder picker dialog. Returns the selected path."""
-    import threading
 
-    result = {"path": None}
+class ResolveFolderRequest(BaseModel):
+    name: str
+    files: list[str] = []
 
-    def _pick():
+
+@router.post("/api/resolve-folder")
+def resolve_folder(req: ResolveFolderRequest):
+    """Resolve a folder name + sample files to an absolute path.
+
+    The browser's <input webkitdirectory> gives us the folder name and
+    relative file paths but NOT the absolute path (security restriction).
+    This endpoint finds the actual folder on disk by searching common locations.
+    """
+    from pathlib import Path as P
+    import sys
+
+    name = req.name.strip()
+    if not name:
+        return {"path": None}
+
+    sample = req.files[:5]
+
+    def _check(candidate: P) -> bool:
+        if not candidate.is_dir():
+            return False
+        if not sample:
+            return True
+        return any((candidate / f).exists() for f in sample)
+
+    # Build search roots
+    home = P.home()
+    roots = [home]
+    try:
+        roots.extend(d for d in home.iterdir() if d.is_dir() and not d.name.startswith('.'))
+    except OSError:
+        pass
+
+    if sys.platform == "win32":
+        import string
+        for letter in string.ascii_uppercase:
+            drive = P(f"{letter}:\\")
+            if drive.exists():
+                roots.append(drive)
+    else:
+        for mp in [P("/mnt"), P("/media"), P("/opt"), P("/tmp")]:
+            if mp.is_dir():
+                roots.append(mp)
+
+    # Search: <root>/name
+    for root in roots:
+        candidate = root / name
+        if _check(candidate):
+            return {"path": str(candidate)}
+
+    # Depth-2: <root>/*/name
+    for root in roots[:5]:
         try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            path = filedialog.askdirectory(title="Choose project folder")
-            root.destroy()
-            if path:
-                result["path"] = path.replace("/", "\\") if "\\" in __import__("os").sep else path
-        except Exception:
-            pass
+            for sub in root.iterdir():
+                if sub.is_dir() and not sub.name.startswith('.'):
+                    candidate = sub / name
+                    if _check(candidate):
+                        return {"path": str(candidate)}
+        except OSError:
+            continue
 
-    # Tkinter must run in a thread (uvicorn's event loop blocks otherwise)
-    t = threading.Thread(target=_pick)
-    t.start()
-    t.join(timeout=120)  # Wait up to 2 minutes for user to pick
-
-    if result["path"]:
-        return {"path": result["path"]}
     return {"path": None}
 
 

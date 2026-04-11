@@ -32,8 +32,11 @@
                 <div style="display:flex; gap:8px;">
                     <input type="text" name="path" id="project-path" class="form-input"
                            placeholder="C:\path\to\project\folder" required style="flex:1;">
-                    <button type="button" class="btn btn-secondary" id="browse-btn" onclick="pickFolder()"
+                    <button type="button" class="btn btn-secondary" id="browse-btn"
+                            onclick="event.stopPropagation(); pickFolder()"
                             style="white-space:nowrap; flex-shrink:0;">Browse</button>
+                    <input type="file" id="folder-input" webkitdirectory style="display:none"
+                           onchange="handleFolderSelect(this)">
                 </div>
             </div>
             <details style="margin-top: 4px;">
@@ -61,22 +64,47 @@
 
 <script>
 function pickFolder() {
+    document.getElementById('folder-input').click();
+}
+
+function handleFolderSelect(input) {
+    var files = input.files;
+    if (!files.length) return;
+
     var btn = document.getElementById('browse-btn');
-    btn.textContent = 'Opening...';
+    btn.textContent = 'Resolving...';
     btn.disabled = true;
 
-    fetch('/api/pick-folder')
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            if (data.path) {
-                document.getElementById('project-path').value = data.path;
-            }
-        })
-        .catch(function() {})
-        .finally(function() {
-            btn.textContent = 'Browse';
-            btn.disabled = false;
-        });
+    var folderName = files[0].webkitRelativePath.split('/')[0];
+
+    var sampleFiles = [];
+    for (var i = 0; i < Math.min(files.length, 10); i++) {
+        var rel = files[i].webkitRelativePath;
+        sampleFiles.push(rel.substring(folderName.length + 1));
+    }
+
+    fetch('/api/resolve-folder', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: folderName, files: sampleFiles})
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (d.path) {
+            document.getElementById('project-path').value = d.path;
+        } else {
+            document.getElementById('project-path').value = folderName;
+        }
+    })
+    .catch(function() {
+        document.getElementById('project-path').value = folderName;
+    })
+    .finally(function() {
+        btn.textContent = 'Browse';
+        btn.disabled = false;
+    });
+
+    input.value = '';
 }
 </script>
 
