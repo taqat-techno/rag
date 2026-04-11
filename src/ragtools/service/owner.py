@@ -14,10 +14,13 @@ from qdrant_client import QdrantClient
 from ragtools.config import Settings
 from ragtools.embedding.encoder import Encoder
 from ragtools.ignore import IgnoreRules
+from ragtools.chunking.markdown import chunk_markdown_file
 from ragtools.indexing.indexer import (
     ensure_collection,
     recreate_collection,
     delete_file_points,
+    chunks_to_points,
+    upsert_points,
     index_file,
 )
 from ragtools.indexing.scanner import (
@@ -28,6 +31,9 @@ from ragtools.indexing.state import IndexState
 from ragtools.models import SearchResult
 from ragtools.retrieval.formatter import format_context
 from ragtools.retrieval.searcher import Searcher
+
+# Batch size for windowed lock release during indexing
+_INDEX_BATCH_SIZE = 30
 
 logger = logging.getLogger("ragtools.service")
 
@@ -58,6 +64,12 @@ class QdrantOwner:
                      settings.embedding_model, settings.collection_name)
         from ragtools.service.activity import log_activity
         log_activity("info", "service", f"Engine initialized (model={settings.embedding_model})")
+
+        # Validate configured project paths
+        for p in settings.enabled_projects:
+            if not Path(p.path).exists():
+                logger.warning("Project '%s' path does not exist: %s", p.id, p.path)
+                log_activity("warning", "config", f"Project '{p.id}' path missing: {p.path}")
 
     @property
     def client(self) -> QdrantClient:
@@ -144,72 +156,177 @@ class QdrantOwner:
             return points
 
     def run_full_index(self, project_id: str | None = None) -> dict:
-        """Full index — re-index everything. Thread-safe."""
+        """Full index — re-index everything.
+
+        Uses split-lock strategy like run_incremental_index:
+        scan/hash/chunk outside lock, encode/upsert inside lock in batches.
+        """
         from ragtools.service.activity import log_activity
         log_activity("info", "indexer", "Full index started")
+
+        # --- Phase 1: outside lock — scan and chunk all files ---
+        files = self._scan_files(project_id)
+        pending = []  # (pid, relative_path, file_hash, chunks)
+
+        for pid, file_path in files:
+            relative_path = self._resolve_relative_path(pid, file_path)
+            file_hash = IndexState.hash_file(file_path)
+            chunks = chunk_markdown_file(
+                file_path=file_path,
+                project_id=pid,
+                relative_path=relative_path,
+                chunk_size=self._settings.chunk_size,
+                chunk_overlap=self._settings.chunk_overlap,
+            )
+            if chunks:
+                pending.append((pid, relative_path, file_hash, chunks))
+
+        # --- Phase 2: inside lock — encode, upsert, update state in batches ---
+        stats = {"files_indexed": 0, "chunks_indexed": 0, "projects": set()}
+
+        for i in range(0, max(len(pending), 1), _INDEX_BATCH_SIZE):
+            batch = pending[i : i + _INDEX_BATCH_SIZE]
+            if not batch:
+                break
+            with self._lock:
+                state = IndexState(self._settings.state_db)
+
+                all_chunks = []
+                chunk_file_map = []
+                for pid, relative_path, file_hash, chunks in batch:
+                    start = len(all_chunks)
+                    all_chunks.extend(chunks)
+                    chunk_file_map.append((start, len(chunks), pid, relative_path, file_hash))
+
+                all_texts = [c.text for c in all_chunks]
+                all_embeddings = self._encoder.encode_batch(all_texts)
+
+                for start, count, pid, relative_path, file_hash in chunk_file_map:
+                    file_chunks = all_chunks[start : start + count]
+                    file_embeddings = all_embeddings[start : start + count]
+                    points = chunks_to_points(file_chunks, file_embeddings, file_hash)
+                    upsert_points(self._client, self._settings.collection_name, points)
+                    state.update(relative_path, pid, file_hash, count)
+                    stats["files_indexed"] += 1
+                    stats["chunks_indexed"] += count
+                    stats["projects"].add(pid)
+
+                state.commit()
+                state.close()
+
         with self._lock:
-            result = self._run_full_index_inner(project_id)
             self._invalidate_map_cache()
+
+        stats["projects"] = sorted(stats["projects"])
+        logger.info("Full index: %d files, %d chunks", stats["files_indexed"], stats["chunks_indexed"])
         log_activity("success", "indexer",
-                     f"Full index: {result['files_indexed']} files, {result['chunks_indexed']} chunks")
-        return result
+                     f"Full index: {stats['files_indexed']} files, {stats['chunks_indexed']} chunks")
+        return stats
 
     def run_incremental_index(self, project_id: str | None = None) -> dict:
-        """Incremental index — only new/changed/deleted. Thread-safe."""
+        """Incremental index — only new/changed/deleted.
+
+        Uses split-lock strategy: scan/hash/chunk outside lock (I/O only),
+        then encode/upsert/state-update inside lock in batches, releasing
+        between batches so search requests aren't blocked for minutes.
+        """
+        # --- Phase 1: outside lock — scan, hash, chunk, detect changes ---
+        files = self._scan_files(project_id)
+
+        # Open a read-only state connection for change detection
+        read_state = IndexState(self._settings.state_db)
+        current_paths = set()
+        pending = []  # (pid, relative_path, file_hash, chunks)
+
+        tracked_paths = read_state.get_all_paths()
+        if project_id:
+            project_records = read_state.get_all_for_project(project_id)
+            tracked_paths = {r["file_path"] for r in project_records}
+
+        stats = {"indexed": 0, "skipped": 0, "deleted": 0, "chunks_indexed": 0, "projects": set()}
+
+        for pid, file_path in files:
+            relative_path = self._resolve_relative_path(pid, file_path)
+            current_paths.add(relative_path)
+            current_hash = IndexState.hash_file(file_path)
+
+            if not read_state.file_changed(relative_path, current_hash):
+                stats["skipped"] += 1
+                continue
+
+            # Chunk the file (pure I/O, no shared resources)
+            chunks = chunk_markdown_file(
+                file_path=file_path,
+                project_id=pid,
+                relative_path=relative_path,
+                chunk_size=self._settings.chunk_size,
+                chunk_overlap=self._settings.chunk_overlap,
+            )
+            if chunks:
+                pending.append((pid, relative_path, current_hash, chunks))
+            else:
+                stats["skipped"] += 1
+
+        deleted_paths = tracked_paths - current_paths
+        read_state.close()
+
+        # --- Phase 2: inside lock — delete, encode, upsert, update state ---
+        # Process deletes in one locked batch
+        if deleted_paths:
+            with self._lock:
+                state = IndexState(self._settings.state_db)
+                for del_path in deleted_paths:
+                    delete_file_points(self._client, self._settings.collection_name, del_path)
+                    state.remove(del_path)
+                    stats["deleted"] += 1
+                state.commit()
+                state.close()
+
+        # Process inserts in windowed batches (release lock between batches)
+        for i in range(0, len(pending), _INDEX_BATCH_SIZE):
+            batch = pending[i : i + _INDEX_BATCH_SIZE]
+            with self._lock:
+                state = IndexState(self._settings.state_db)
+
+                # Encode all chunks from this batch together
+                all_chunks = []
+                chunk_file_map = []  # (index_in_all, pid, relative_path, file_hash)
+                for pid, relative_path, file_hash, chunks in batch:
+                    start = len(all_chunks)
+                    all_chunks.extend(chunks)
+                    chunk_file_map.append((start, len(chunks), pid, relative_path, file_hash))
+
+                all_texts = [c.text for c in all_chunks]
+                all_embeddings = self._encoder.encode_batch(all_texts)
+
+                # Distribute embeddings back to files, create points, upsert
+                for start, count, pid, relative_path, file_hash in chunk_file_map:
+                    file_chunks = all_chunks[start : start + count]
+                    file_embeddings = all_embeddings[start : start + count]
+
+                    delete_file_points(self._client, self._settings.collection_name, relative_path)
+                    points = chunks_to_points(file_chunks, file_embeddings, file_hash)
+                    upsert_points(self._client, self._settings.collection_name, points)
+                    state.update(relative_path, pid, file_hash, count)
+
+                    stats["indexed"] += 1
+                    stats["chunks_indexed"] += count
+                    stats["projects"].add(pid)
+
+                state.commit()
+                state.close()
+
+        # Finalize
         with self._lock:
-            state = IndexState(self._settings.state_db)
-
-            files = self._scan_files(project_id)
-            current_paths = {
-                self._resolve_relative_path(pid, fp) for pid, fp in files
-            }
-
-            tracked_paths = state.get_all_paths()
-            if project_id:
-                project_records = state.get_all_for_project(project_id)
-                tracked_paths = {r["file_path"] for r in project_records}
-
-            deleted_paths = tracked_paths - current_paths
-            stats = {"indexed": 0, "skipped": 0, "deleted": 0, "chunks_indexed": 0, "projects": set()}
-
-            for del_path in deleted_paths:
-                delete_file_points(self._client, self._settings.collection_name, del_path)
-                state.remove(del_path)
-                stats["deleted"] += 1
-
-            for pid, file_path in files:
-                relative_path = self._resolve_relative_path(pid, file_path)
-                current_hash = IndexState.hash_file(file_path)
-
-                if not state.file_changed(relative_path, current_hash):
-                    stats["skipped"] += 1
-                    continue
-
-                delete_file_points(self._client, self._settings.collection_name, relative_path)
-                count = index_file(
-                    client=self._client,
-                    encoder=self._encoder,
-                    collection_name=self._settings.collection_name,
-                    project_id=pid,
-                    file_path=file_path,
-                    relative_path=relative_path,
-                    chunk_size=self._settings.chunk_size,
-                    chunk_overlap=self._settings.chunk_overlap,
-                )
-                state.update(relative_path, pid, current_hash, count)
-                stats["indexed"] += 1
-                stats["chunks_indexed"] += count
-                stats["projects"].add(pid)
-
-            stats["projects"] = sorted(stats["projects"])
-            state.close()
             self._invalidate_map_cache()
-            logger.info("Incremental index: %d indexed, %d skipped, %d deleted",
-                        stats["indexed"], stats["skipped"], stats["deleted"])
-            from ragtools.service.activity import log_activity
-            log_activity("success", "indexer",
-                         f"Incremental: {stats['indexed']} indexed, {stats['skipped']} skipped, {stats['deleted']} deleted")
-            return stats
+
+        stats["projects"] = sorted(stats["projects"])
+        logger.info("Incremental index: %d indexed, %d skipped, %d deleted",
+                    stats["indexed"], stats["skipped"], stats["deleted"])
+        from ragtools.service.activity import log_activity
+        log_activity("success", "indexer",
+                     f"Incremental: {stats['indexed']} indexed, {stats['skipped']} skipped, {stats['deleted']} deleted")
+        return stats
 
     def rebuild(self) -> dict:
         """Drop all data and rebuild from scratch. Thread-safe."""

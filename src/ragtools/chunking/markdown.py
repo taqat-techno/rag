@@ -7,6 +7,11 @@ from pathlib import Path
 from ragtools.chunking.metadata import estimate_tokens, extract_frontmatter
 from ragtools.models import Chunk
 
+# Pre-compiled regex patterns for hot paths
+_HEADING_RE = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
+_PARAGRAPH_RE = re.compile(r'\n\n+')
+_SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
+
 
 def chunk_markdown_file(
     file_path: Path,
@@ -86,11 +91,9 @@ def _split_by_headings(content: str) -> list[tuple[list[str], str]]:
     - "### Bar" under "## Foo" → ["## Foo", "### Bar"]
     - "## Baz" resets → ["## Baz"]
     """
-    heading_pattern = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
-
     # Find all heading positions
     headings_found = []
-    for match in heading_pattern.finditer(content):
+    for match in _HEADING_RE.finditer(content):
         level = len(match.group(1))
         title = match.group(2).strip()
         start = match.start()
@@ -142,7 +145,7 @@ def _split_large_section(
 
     Falls back to sentence-level splitting if paragraphs are still too large.
     """
-    paragraphs = re.split(r'\n\n+', text)
+    paragraphs = _PARAGRAPH_RE.split(text)
 
     chunks = []
     current_parts: list[str] = []
@@ -200,7 +203,7 @@ def _split_by_sentences(
 ) -> list[str]:
     """Last-resort splitting by sentence boundaries."""
     # Simple sentence splitting — split on . ! ? followed by space or newline
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = _SENTENCE_RE.split(text)
 
     chunks = []
     current_parts: list[str] = []

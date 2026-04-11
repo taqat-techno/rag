@@ -68,7 +68,7 @@
 </div>
 
 <div style="display:flex; gap:12px; align-items:center; margin-bottom:16px;">
-    <button type="submit" class="btn btn-primary">Save Settings</button>
+    <button type="submit" class="btn btn-primary" hx-disabled-elt="this">Save Settings</button>
     <span id="save-result"></span>
 </div>
 
@@ -124,7 +124,9 @@ function copyMcpConfig() {
         Drop all indexed data and rebuild the knowledge base from scratch.
     </p>
     <button type="button" class="btn btn-danger" hx-post="/ui/rebuild" hx-target="#rebuild-result" hx-swap="innerHTML"
-            hx-confirm="This will DELETE all indexed data and rebuild from scratch. Continue?">
+            hx-confirm="This will DELETE all indexed data and rebuild from scratch. Continue?"
+            hx-disabled-elt="this"
+            data-processing-msg="Rebuilding knowledge base... this may take several minutes">
         Rebuild Knowledge Base
     </button>
     <div id="rebuild-result" style="margin-top: 10px;"></div>

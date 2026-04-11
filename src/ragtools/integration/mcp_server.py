@@ -41,24 +41,28 @@ def _initialize() -> None:
 
     _settings = Settings()
 
-    # Try proxy mode first — probe the service
-    try:
-        import httpx
+    # Try proxy mode — probe the service with one retry
+    import httpx
+    import time
 
-        url = f"http://{_settings.service_host}:{_settings.service_port}/health"
-        r = httpx.get(url, timeout=2.0)
-        if r.status_code == 200:
-            _mode = "proxy"
-            _http_client = httpx.Client(
-                base_url=f"http://{_settings.service_host}:{_settings.service_port}",
-                timeout=httpx.Timeout(5.0, read=120.0),
-            )
-            _init_error = None
-            logger.info("MCP initialized in PROXY mode (service at %s:%d)",
-                        _settings.service_host, _settings.service_port)
-            return
-    except Exception as e:
-        logger.debug("Service probe failed: %s", e)
+    url = f"http://{_settings.service_host}:{_settings.service_port}/health"
+    for attempt in range(2):
+        try:
+            r = httpx.get(url, timeout=2.0)
+            if r.status_code == 200:
+                _mode = "proxy"
+                _http_client = httpx.Client(
+                    base_url=f"http://{_settings.service_host}:{_settings.service_port}",
+                    timeout=httpx.Timeout(5.0, read=120.0),
+                )
+                _init_error = None
+                logger.info("MCP initialized in PROXY mode (service at %s:%d)",
+                            _settings.service_host, _settings.service_port)
+                return
+        except Exception as e:
+            logger.debug("Service probe %d failed: %s", attempt + 1, e)
+        if attempt == 0:
+            time.sleep(2)  # Brief retry — service may be starting
 
     # Fallback: direct mode — load encoder only, Qdrant opened per-request
     _mode = "direct"

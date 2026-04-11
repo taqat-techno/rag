@@ -18,6 +18,24 @@ templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
 page_router = APIRouter()
 
 
+# --- Helpers ---
+
+
+def _load_index_stats(settings) -> dict:
+    """Load file/chunk counts per project from the index state DB."""
+    from ragtools.indexing.state import IndexState
+
+    state_path = Path(settings.state_db)
+    index_data = {}
+    if state_path.exists():
+        state = IndexState(settings.state_db)
+        for p in settings.projects:
+            records = state.get_all_for_project(p.id)
+            index_data[p.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
+        state.close()
+    return index_data
+
+
 # --- Full page routes ---
 
 
@@ -87,15 +105,7 @@ def ui_dash_projects():
         </div>
         """
 
-    from ragtools.indexing.state import IndexState
-    state_path = Path(settings.state_db)
-    index_data = {}
-    if state_path.exists():
-        state = IndexState(settings.state_db)
-        for p in settings.projects:
-            records = state.get_all_for_project(p.id)
-            index_data[p.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
-        state.close()
+    index_data = _load_index_stats(settings)
 
     rows = ""
     for p in settings.projects:
@@ -171,15 +181,7 @@ def ui_projects():
     settings = get_settings()
 
     if settings.has_explicit_projects:
-        from ragtools.indexing.state import IndexState
-        state_path = Path(settings.state_db)
-        index_data = {}
-        if state_path.exists():
-            state = IndexState(settings.state_db)
-            for p in settings.projects:
-                records = state.get_all_for_project(p.id)
-                index_data[p.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
-            state.close()
+        index_data = _load_index_stats(settings)
 
         if not settings.projects:
             return '<p style="color: var(--color-text-muted);">No projects configured. <a href="/projects">Add a project</a></p>'
@@ -368,15 +370,7 @@ def _render_projects_list() -> str:
             <p style="font-size:13px;">Use the form above to add your first content folder.</p>
         </div>'''
 
-    from ragtools.indexing.state import IndexState
-    state_path = Path(settings.state_db)
-    index_data = {}
-    if state_path.exists():
-        state = IndexState(settings.state_db)
-        for p in settings.projects:
-            records = state.get_all_for_project(p.id)
-            index_data[p.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
-        state.close()
+    index_data = _load_index_stats(settings)
 
     rows = ""
     for p in settings.projects:
@@ -397,12 +391,15 @@ def _render_projects_list() -> str:
             <td>{chunks}</td>
             <td style="white-space:nowrap">
                 <button class="btn btn-secondary btn-sm"
-                    hx-get="/ui/projects/{escape(p.id)}/edit" hx-target="#project-row-{escape(p.id)}" hx-swap="outerHTML">Edit</button>
+                    hx-get="/ui/projects/{escape(p.id)}/edit" hx-target="#project-row-{escape(p.id)}" hx-swap="outerHTML"
+                    hx-disabled-elt="this" hx-indicator="#projects-overlay">Edit</button>
                 <button class="btn btn-secondary btn-sm"
-                    hx-post="/ui/projects/{escape(p.id)}/toggle" hx-target="#projects-list" hx-swap="innerHTML">{toggle_label}</button>
+                    hx-post="/ui/projects/{escape(p.id)}/toggle" hx-target="#projects-list" hx-swap="innerHTML"
+                    hx-disabled-elt="this" hx-indicator="#projects-overlay">{toggle_label}</button>
                 <button class="btn btn-danger btn-sm"
                     hx-delete="/ui/projects/{escape(p.id)}/remove" hx-target="#projects-list" hx-swap="innerHTML"
-                    hx-confirm="Remove project '{escape(p.name)}'? Indexed data will be kept.">Remove</button>
+                    hx-confirm="Remove project '{escape(p.name)}' and its indexed data?"
+                    hx-disabled-elt="this" hx-indicator="#projects-overlay">Remove</button>
             </td>
         </tr>"""
 
@@ -471,9 +468,11 @@ def ui_projects_edit(project_id: str):
                     </div>
                 </details>
                 <div style="display:flex;gap:8px;margin-top:10px;">
-                    <button type="submit" class="btn btn-primary btn-sm">Save</button>
+                    <button type="submit" class="btn btn-primary btn-sm"
+                        hx-disabled-elt="this" hx-indicator="#projects-overlay">Save</button>
                     <button type="button" class="btn btn-secondary btn-sm"
-                        hx-get="/ui/projects/list" hx-target="#projects-list" hx-swap="innerHTML">Cancel</button>
+                        hx-get="/ui/projects/list" hx-target="#projects-list" hx-swap="innerHTML"
+                        hx-disabled-elt="this" hx-indicator="#projects-overlay">Cancel</button>
                 </div>
             </form>
         </td>
@@ -513,10 +512,37 @@ def ui_projects_toggle(project_id: str):
 
 @page_router.delete("/ui/projects/{project_id}/remove", response_class=HTMLResponse)
 def ui_projects_remove(project_id: str):
-    """Remove a project via UI."""
+    """Remove a project via UI. Deletes data in background to avoid timeout."""
+    import threading
+
     try:
-        from ragtools.service.routes import project_delete
-        project_delete(project_id)
+        from ragtools.service.routes import _restart_watcher_if_running
+        from ragtools.service.activity import log_activity
+
+        settings = get_settings()
+        project = next((p for p in settings.projects if p.id == project_id), None)
+        if not project:
+            return f'<div class="flash flash-error">Project not found</div>' + _render_projects_list()
+
+        # Remove from config immediately (fast)
+        updated = [p for p in settings.projects if p.id != project_id]
+        _save_projects_to_toml(updated)
+        get_owner().update_projects(updated)
+        log_activity("info", "config", f"Project removed: {project_id}")
+        _restart_watcher_if_running()
+
+        # Delete indexed data in background (slow for large projects)
+        def _bg_delete(pid):
+            try:
+                owner = get_owner()
+                result = owner.delete_project_data(pid)
+                files = result.get("files_deleted", 0)
+                log_activity("warning", "config", f"Project data cleaned: {pid} ({files} files deleted)")
+            except Exception as e:
+                log_activity("error", "config", f"Failed to clean project data {pid}: {e}")
+
+        threading.Timer(1.0, _bg_delete, args=[project_id]).start()
+
         return _render_projects_list()
     except Exception as e:
         detail = getattr(e, "detail", str(e))
@@ -577,7 +603,6 @@ def ui_config_save(
 ):
     """Save general settings via the UI."""
     try:
-        import httpx
         settings = get_settings()
         payload = {}
         if chunk_size is not None:
@@ -629,9 +654,7 @@ def ui_config_save(
 
         return f'<div class="flash flash-success">{msg}</div>'
     except Exception as e:
-        detail = str(e)
-        if hasattr(e, 'detail'):
-            detail = e.detail
+        detail = getattr(e, "detail", str(e))
         return f'<div class="flash flash-error">Save failed: {escape(str(detail))}</div>'
 
 

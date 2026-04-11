@@ -12,6 +12,7 @@
             + New Project
         </summary>
         <form hx-post="/ui/projects/add" hx-target="#projects-list" hx-swap="innerHTML"
+              hx-indicator="#projects-overlay" hx-disabled-elt="find .btn"
               style="margin-top: 14px;">
             <div class="grid-2">
                 <div class="form-group">
@@ -59,8 +60,13 @@
 
 <div class="card">
     <div class="card-header">Configured Projects</div>
-    <div id="projects-list" hx-get="/ui/projects/list" hx-trigger="load, every 10s" hx-swap="innerHTML">
-        <span class="loading-placeholder">Loading projects...</span>
+    <div style="position: relative;">
+        <div id="projects-list" hx-get="/ui/projects/list" hx-trigger="load" hx-swap="innerHTML">
+            <span class="loading-placeholder">Loading projects...</span>
+        </div>
+        <div id="projects-overlay" class="section-overlay">
+            <span class="overlay-spinner"></span>
+        </div>
     </div>
 </div>
 

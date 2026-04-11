@@ -43,9 +43,14 @@
                 <span class="activity-chevron">&#9650;</span>
             </div>
             <div class="activity-panel" id="activity-panel"
-                 hx-get="/ui/activity" hx-trigger="every 5s" hx-swap="innerHTML">
+                 hx-get="/ui/activity" hx-trigger="every 15s" hx-swap="innerHTML">
             </div>
         </div>
+    </div>
+
+    <div id="global-processing" class="global-processing-banner">
+        <span class="overlay-spinner"></span>
+        <span id="global-processing-msg">Processing...</span>
     </div>
 
     <div id="confirm-modal" class="confirm-overlay">
@@ -58,6 +63,32 @@
         </div>
     </div>
     <script>
+    // Global processing guard for long operations
+    document.body.addEventListener('htmx:beforeRequest', function(e) {
+        var msg = e.detail.elt.getAttribute('data-processing-msg');
+        if (msg) {
+            document.getElementById('global-processing-msg').textContent = msg;
+            document.getElementById('global-processing').classList.add('active');
+        }
+        // Section overlay: show when hx-indicator points to a .section-overlay
+        var indId = e.detail.elt.getAttribute('hx-indicator') || e.detail.elt.closest('[hx-indicator]')?.getAttribute('hx-indicator');
+        if (indId) {
+            var overlay = document.querySelector(indId);
+            if (overlay && overlay.classList.contains('section-overlay')) overlay.classList.add('active');
+        }
+    });
+    document.body.addEventListener('htmx:afterRequest', function(e) {
+        if (e.detail.elt.getAttribute('data-processing-msg')) {
+            document.getElementById('global-processing').classList.remove('active');
+        }
+        var indId = e.detail.elt.getAttribute('hx-indicator') || e.detail.elt.closest('[hx-indicator]')?.getAttribute('hx-indicator');
+        if (indId) {
+            var overlay = document.querySelector(indId);
+            if (overlay && overlay.classList.contains('section-overlay')) overlay.classList.remove('active');
+        }
+    });
+
+    // Custom confirm modal
     document.body.addEventListener('htmx:confirm', function(e) {
         if (!e.detail.question) return;
         e.preventDefault();

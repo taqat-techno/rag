@@ -29,6 +29,16 @@ def _get_settings():
     return Settings()
 
 
+def _get_ignore_rules(settings, content_root=None):
+    """Build IgnoreRules from settings."""
+    from ragtools.ignore import IgnoreRules
+    return IgnoreRules(
+        content_root=content_root or settings.content_root,
+        global_patterns=settings.ignore_patterns,
+        use_ragignore=settings.use_ragignore_files,
+    )
+
+
 def _probe_service(settings=None) -> bool:
     """Check if the service is running and healthy."""
     try:
@@ -596,7 +606,6 @@ def project_list():
         status = "[green]Enabled[/green]" if p["enabled"] else "[dim]Disabled[/dim]"
         files = str(p["files"]) if p["files"] > 0 else "[dim]--[/dim]"
         chunks = str(p["chunks"]) if p["chunks"] > 0 else "[dim]--[/dim]"
-        console.print() if False else None  # placeholder
         table.add_row(p["id"], p["name"], p["path"], status, files, chunks)
     console.print(table)
 

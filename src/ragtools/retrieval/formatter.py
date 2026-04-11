@@ -4,6 +4,8 @@ import re
 
 from ragtools.models import SearchResult
 
+_VERSION_SUFFIX_RE = re.compile(r"_v\d+")
+
 
 def format_context(results: list[SearchResult], query: str) -> str:
     """Format search results into a full context block for the admin UI.
@@ -122,7 +124,7 @@ def _deduplicate(results: list[SearchResult]) -> list[SearchResult]:
     seen: dict[str, SearchResult] = {}
     for r in results:
         # Normalize: strip version suffixes like _v2, _v3 from file path
-        normalized_path = re.sub(r"_v\d+", "", r.file_path)
+        normalized_path = _VERSION_SUFFIX_RE.sub("", r.file_path)
         first_heading = r.headings[0] if r.headings else ""
         key = f"{normalized_path}::{first_heading}"
         if key not in seen or r.score > seen[key].score:

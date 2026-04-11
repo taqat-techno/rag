@@ -9,7 +9,7 @@
 ;   iscc installer.iss
 
 #define MyAppName "RAG Tools"
-#define MyAppVersion "2.3.1"
+#define MyAppVersion "2.4.0"
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
 #define MyAppExeName "rag.exe"
@@ -48,8 +48,6 @@ Name: "startnow"; Description: "Start service and open admin panel after install
 Source: "dist\rag\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Silent launcher script
 Source: "scripts\launch.vbs"; DestDir: "{app}"; Flags: ignoreversion
-; Folder picker script
-Source: "scripts\pick_folder.vbs"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; Smart launcher: starts service if needed, opens admin panel

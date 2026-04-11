@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import signal
 import threading
 from typing import Optional
@@ -107,7 +108,6 @@ class ProjectUpdateRequest(BaseModel):
     ignore_patterns: Optional[list[str]] = None
 
 
-import re
 def _validate_project_id(pid: str) -> str | None:
     if not pid or not pid.strip():
         return "Project ID is required"

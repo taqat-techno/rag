@@ -9,6 +9,7 @@ Uses the QdrantOwner's shared client instead of creating its own.
 
 import logging
 import threading
+import time
 from pathlib import Path
 
 from watchfiles import watch, Change
@@ -39,10 +40,30 @@ class WatcherThread(threading.Thread):
         self._debounce_ms = debounce_ms
         self._stop_event = threading.Event()
 
+    _MAX_RETRIES = 5
+    _BASE_BACKOFF = 5  # seconds
+
     def run(self):
-        """Main watch loop. Blocks until stop() is called or thread is killed."""
+        """Main watch loop with automatic restart on failure."""
         from ragtools.service.activity import log_activity
-        self._run_multi_root(log_activity)
+        retries = 0
+        while not self._stop_event.is_set():
+            try:
+                self._run_multi_root(log_activity)
+                break  # Clean exit (stop_event set or no projects)
+            except Exception as e:
+                retries += 1
+                if self._stop_event.is_set():
+                    break
+                if retries > self._MAX_RETRIES:
+                    logger.error("Watcher giving up after %d failures: %s", retries, e)
+                    log_activity("error", "watcher", f"Watcher stopped after {retries} failures: {e}")
+                    break
+                backoff = self._BASE_BACKOFF * (2 ** (retries - 1))
+                logger.warning("Watcher crashed (attempt %d/%d), restarting in %ds: %s",
+                               retries, self._MAX_RETRIES, backoff, e)
+                log_activity("warning", "watcher", f"Watcher crashed, restarting in {backoff}s (attempt {retries})")
+                self._stop_event.wait(backoff)  # Sleep but respect stop signal
 
     def _run_multi_root(self, log_activity):
         """Watch multiple explicit project directories (v2 mode)."""

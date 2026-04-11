@@ -30,6 +30,9 @@ class IndexState:
                 last_indexed TEXT NOT NULL
             )
         """)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_state_project_id ON file_state(project_id)"
+        )
         self.conn.commit()
 
     def get(self, file_path: str) -> dict | None:
@@ -100,6 +103,10 @@ class IndexState:
             "projects": [r["project_id"] for r in projects],
             "last_indexed": row["last"],
         }
+
+    def commit(self) -> None:
+        """Explicitly commit pending changes. Used by batch operations."""
+        self.conn.commit()
 
     def close(self) -> None:
         """Close the database connection."""
