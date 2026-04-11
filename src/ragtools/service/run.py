@@ -76,8 +76,16 @@ def _post_startup(settings: Settings, from_scheduler: bool) -> None:
     import threading
     def _startup_sync():
         try:
-            from ragtools.service.app import get_owner
+            from ragtools.service.app import get_owner, get_settings
             from ragtools.service.activity import log_activity
+
+            # Guard: do not run sync if no projects loaded (may be config load failure)
+            s = get_settings()
+            if not s.projects:
+                log_activity("warning", "indexer", "Startup sync skipped: no projects configured (check config path)")
+                logger.warning("Startup sync skipped — no projects in config. Config may not have loaded correctly.")
+                return
+
             log_activity("info", "indexer", "Startup sync: checking for offline changes...")
             owner = get_owner()
             stats = owner.run_incremental_index()

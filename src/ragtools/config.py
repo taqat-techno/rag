@@ -96,6 +96,31 @@ def _find_config_path() -> Path | None:
     return None
 
 
+def get_config_write_path() -> Path:
+    """Get the correct path for writing config, even if it doesn't exist yet.
+
+    In packaged mode, always uses %LOCALAPPDATA%/RAGTools/config.toml.
+    In dev mode, uses ./ragtools.toml (CWD-relative).
+    """
+    explicit = os.environ.get("RAG_CONFIG_PATH")
+    if explicit:
+        return Path(explicit)
+
+    existing = _find_config_path()
+    if existing:
+        return existing
+
+    # No config exists yet — choose the correct location for this mode
+    if is_packaged() and sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            config_dir = Path(local_app_data) / "RAGTools"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            return config_dir / "config.toml"
+
+    return Path("ragtools.toml")
+
+
 # --- TOML Loading ---
 
 

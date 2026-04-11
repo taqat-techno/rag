@@ -71,6 +71,10 @@ def _build_startup_script(settings: Settings, delay_seconds: int) -> str:
     # Result: shell.Run """C:\path\to\python.exe"" -m ragtools.cli service start", 0, False
     vbs_cmd = f'"""{exe_path}"" {run_args}"'
 
+    # Determine the working directory for the service process
+    from ragtools.config import get_data_dir
+    work_dir = str(get_data_dir().parent)  # Parent of data dir (e.g., %LOCALAPPDATA%\RAGTools)
+
     return f"""' RAGTools Auto-Start Script
 ' Created by RAGTools service install
 ' Starts the RAG service after login with a delay
@@ -95,6 +99,7 @@ On Error GoTo 0
 
 ' Start service if not already running
 If Not healthy Then
+    shell.CurrentDirectory = "{work_dir}"
     shell.Run {vbs_cmd}, 0, False
 End If
 """

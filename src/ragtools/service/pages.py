@@ -663,18 +663,10 @@ def ui_config_save(
 
 def _update_toml_config(section: str | None, data: dict) -> None:
     """Update the TOML config file. If section is None, update root level."""
-    import os
     import tomli_w
-    from ragtools.config import _find_config_path
+    from ragtools.config import get_config_write_path
 
-    # Check explicit override first (for both reading and writing)
-    explicit = os.environ.get("RAG_CONFIG_PATH")
-    if explicit:
-        config_path = Path(explicit)
-    else:
-        config_path = _find_config_path()
-        if config_path is None:
-            config_path = Path("ragtools.toml")
+    config_path = get_config_write_path()
 
     existing = {}
     if config_path.exists():
@@ -706,12 +698,10 @@ def _save_projects_to_toml(projects: list) -> None:
 
     Writes the entire [[projects]] array atomically (not merged key-by-key).
     """
-    import os as _os
     import tomli_w
-    from ragtools.config import _find_config_path
+    from ragtools.config import get_config_write_path
 
-    explicit = _os.environ.get("RAG_CONFIG_PATH")
-    config_path = Path(explicit) if explicit else (_find_config_path() or Path("ragtools.toml"))
+    config_path = get_config_write_path()
 
     existing = {}
     if config_path.exists():
