@@ -52,23 +52,33 @@ def is_packaged() -> bool:
     return getattr(sys, "frozen", False)
 
 
+def _get_app_dir() -> Path | None:
+    """Get the platform-specific application data directory, or None for dev mode."""
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            return Path(local_app_data) / "RAGTools"
+    elif sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "RAGTools"
+    return None
+
+
 def get_data_dir() -> Path:
     """Resolve the data directory based on mode.
 
-    Packaged/installed mode: %LOCALAPPDATA%/RAGTools
+    Packaged/installed mode:
+      Windows: %LOCALAPPDATA%/RAGTools
+      macOS:   ~/Library/Application Support/RAGTools
     Dev mode: ./data (relative to CWD)
     """
     explicit = os.environ.get("RAG_DATA_DIR")
     if explicit:
         return Path(explicit)
 
-    if is_packaged() or (sys.platform == "win32" and os.environ.get("LOCALAPPDATA")):
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        if local_app_data:
-            installed_dir = Path(local_app_data) / "RAGTools"
-            if is_packaged() or installed_dir.exists():
-                installed_dir.mkdir(parents=True, exist_ok=True)
-                return installed_dir
+    app_dir = _get_app_dir()
+    if app_dir and (is_packaged() or app_dir.exists()):
+        app_dir.mkdir(parents=True, exist_ok=True)
+        return app_dir
 
     return Path("data").resolve()
 
@@ -82,12 +92,11 @@ def _find_config_path() -> Path | None:
             return p
         return None
 
-    if sys.platform == "win32":
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            installed = Path(local_app_data) / "RAGTools" / "config.toml"
-            if installed.is_file():
-                return installed
+    app_dir = _get_app_dir()
+    if app_dir:
+        installed = app_dir / "config.toml"
+        if installed.is_file():
+            return installed
 
     dev = Path("ragtools.toml")
     if dev.is_file():
@@ -111,12 +120,11 @@ def get_config_write_path() -> Path:
         return existing
 
     # No config exists yet — choose the correct location for this mode
-    if is_packaged() and sys.platform == "win32":
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        if local_app_data:
-            config_dir = Path(local_app_data) / "RAGTools"
-            config_dir.mkdir(parents=True, exist_ok=True)
-            return config_dir / "config.toml"
+    if is_packaged():
+        app_dir = _get_app_dir()
+        if app_dir:
+            app_dir.mkdir(parents=True, exist_ok=True)
+            return app_dir / "config.toml"
 
     return Path("ragtools.toml")
 

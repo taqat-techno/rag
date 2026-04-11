@@ -20,10 +20,12 @@ TASK_NAME = "RAGTools Service"
 STARTUP_FILENAME = "RAGTools.vbs"
 
 
-def _check_windows() -> None:
-    """Raise if not on Windows."""
+def _check_windows() -> bool:
+    """Check if on Windows. Returns False on other platforms instead of crashing."""
     if sys.platform != "win32":
-        raise RuntimeError("Startup integration is only available on Windows")
+        logger.info("Startup integration: skipped (not Windows, current platform: %s)", sys.platform)
+        return False
+    return True
 
 
 def _get_startup_folder() -> Path:
@@ -122,9 +124,10 @@ def install_task(settings: Settings, delay_seconds: int | None = None) -> bool:
         True if startup registration succeeded.
 
     Raises:
-        RuntimeError: If not on Windows or file operation fails.
+        RuntimeError: If file operation fails.
     """
-    _check_windows()
+    if not _check_windows():
+        return False
 
     delay = delay_seconds if delay_seconds is not None else settings.startup_delay
     startup_dir = _get_startup_folder()
@@ -147,7 +150,8 @@ def uninstall_task() -> bool:
     Returns:
         True if removed or didn't exist.
     """
-    _check_windows()
+    if not _check_windows():
+        return True
 
     script_path = _get_startup_script_path()
     logger.info("Removing startup script: %s", script_path)

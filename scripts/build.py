@@ -65,7 +65,10 @@ def copy_model_to_dist():
 
 def verify_build():
     """Quick verification that the bundle works."""
-    rag_exe = DIST_DIR / "rag.exe"
+    if sys.platform == "win32":
+        rag_exe = DIST_DIR / "rag.exe"
+    else:
+        rag_exe = DIST_DIR / "rag"
     if not rag_exe.exists():
         print(f"ERROR: {rag_exe} not found!")
         sys.exit(1)

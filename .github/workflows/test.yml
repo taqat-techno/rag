@@ -8,10 +8,13 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
     strategy:
+      fail-fast: false
       matrix:
+        os: [windows-latest, macos-14]
         python-version: ["3.12"]
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -24,15 +27,15 @@ jobs:
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
-          path: ~\AppData\Local\pip\Cache
+          path: ${{ runner.os == 'Windows' && '~\AppData\Local\pip\Cache' || '~/Library/Caches/pip' }}
           key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-${{ runner.os }}-
 
       - name: Cache SentenceTransformer model
         uses: actions/cache@v4
         with:
-          path: ~\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2
-          key: model-all-MiniLM-L6-v2-v1
+          path: ${{ runner.os == 'Windows' && '~\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2' || '~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2' }}
+          key: model-all-MiniLM-L6-v2-${{ runner.os }}-v1
 
       - name: Install dependencies
         run: pip install -e ".[dev]"
