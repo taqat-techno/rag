@@ -59,12 +59,17 @@ def _build_startup_script(settings: Settings, delay_seconds: int) -> str:
         # But VBScript can't easily do this, so use the CLI entry point
         # which should be on PATH after pip install -e .
 
-    # For packaged mode: use the exe directly
-    # For dev mode: use python path with module
+    # Build the shell.Run command string with proper VBScript quoting.
+    # In VBScript: "" inside a string literal = escaped double-quote.
+    # shell.Run expects: shell.Run "full command string", 0, False
     if is_packaged():
-        start_cmd = f'"""{exe_path}""" service start'
+        run_args = "service start"
     else:
-        start_cmd = f'"""{exe_path}""" -m ragtools.cli service start'
+        run_args = "-m ragtools.cli service start"
+
+    # Escape the exe path for VBScript (double quotes around path with spaces)
+    # Result: shell.Run """C:\path\to\python.exe"" -m ragtools.cli service start", 0, False
+    vbs_cmd = f'"""{exe_path}"" {run_args}"'
 
     return f"""' RAGTools Auto-Start Script
 ' Created by RAGTools service install
@@ -90,7 +95,7 @@ On Error GoTo 0
 
 ' Start service if not already running
 If Not healthy Then
-    shell.Run {start_cmd}, 0, False
+    shell.Run {vbs_cmd}, 0, False
 End If
 """
 

@@ -29,23 +29,25 @@
             </div>
             <div class="form-group">
                 <label class="form-label">Folder Path</label>
-                <div style="display:flex; gap:8px;">
-                    <input type="text" name="path" id="project-path" class="form-input"
-                           placeholder="C:\path\to\project\folder" required style="flex:1;">
-                    <button type="button" class="btn btn-secondary" id="browse-btn"
-                            onclick="event.stopPropagation(); pickFolder()"
-                            style="white-space:nowrap; flex-shrink:0;">Browse</button>
-                    <input type="file" id="folder-input" webkitdirectory style="display:none"
-                           onchange="handleFolderSelect(this)">
-                </div>
+                <input type="text" name="path" class="form-input"
+                       placeholder="C:\path\to\project\folder" required>
             </div>
             <details style="margin-top: 4px;">
                 <summary style="font-size:13px; color:var(--color-text-secondary); cursor:pointer;">
-                    Advanced: Ignore Patterns
+                    Ignore Patterns
                 </summary>
-                <div class="form-group" style="margin-top:8px;">
-                    <textarea name="ignore_patterns" rows="3" class="form-textarea"
-                              placeholder="One pattern per line (gitignore syntax)"></textarea>
+                <div style="margin-top:8px;">
+                    <div style="font-size:12px; color:var(--color-text-muted); margin-bottom:6px;">
+                        <strong style="color:var(--color-text-secondary);">Always ignored:</strong>
+                        <span style="font-family:monospace; font-size:11px;">
+                            .git/ &middot; .venv/ &middot; node_modules/ &middot; __pycache__/ &middot; dist/ &middot; build/ &middot; .cache/ &middot; .claude/ &middot; CLAUDE.md &middot; *.pyc
+                        </span>
+                    </div>
+                    <div class="form-group" style="margin-top:4px;">
+                        <label class="form-label" style="font-size:12px;">Additional patterns for this project</label>
+                        <textarea name="ignore_patterns" rows="3" class="form-textarea"
+                                  placeholder="One pattern per line (gitignore syntax)"></textarea>
+                    </div>
                 </div>
             </details>
             <div style="margin-top: 12px;">
@@ -61,51 +63,5 @@
         <span class="loading-placeholder">Loading projects...</span>
     </div>
 </div>
-
-<script>
-function pickFolder() {
-    document.getElementById('folder-input').click();
-}
-
-function handleFolderSelect(input) {
-    var files = input.files;
-    if (!files.length) return;
-
-    var btn = document.getElementById('browse-btn');
-    btn.textContent = 'Resolving...';
-    btn.disabled = true;
-
-    var folderName = files[0].webkitRelativePath.split('/')[0];
-
-    var sampleFiles = [];
-    for (var i = 0; i < Math.min(files.length, 10); i++) {
-        var rel = files[i].webkitRelativePath;
-        sampleFiles.push(rel.substring(folderName.length + 1));
-    }
-
-    fetch('/api/resolve-folder', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: folderName, files: sampleFiles})
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-        if (d.path) {
-            document.getElementById('project-path').value = d.path;
-        } else {
-            document.getElementById('project-path').value = folderName;
-        }
-    })
-    .catch(function() {
-        document.getElementById('project-path').value = folderName;
-    })
-    .finally(function() {
-        btn.textContent = 'Browse';
-        btn.disabled = false;
-    });
-
-    input.value = '';
-}
-</script>
 
 {% endblock %}

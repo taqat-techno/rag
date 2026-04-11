@@ -429,11 +429,14 @@ def ui_projects_add(
 ):
     """Add a new project via UI form."""
     try:
+        from fastapi.responses import HTMLResponse as HR
         from ragtools.service.routes import project_create, ProjectCreateRequest
         patterns = [line.strip() for line in ignore_patterns.splitlines() if line.strip()]
         req = ProjectCreateRequest(id=id.strip().lower(), name=name.strip(), path=path.strip(), ignore_patterns=patterns)
         project_create(req)
-        return _render_projects_list()
+        response = HR(content=_render_projects_list())
+        response.headers["HX-Trigger"] = "projectAdded"
+        return response
     except Exception as e:
         detail = getattr(e, "detail", str(e))
         return f'<div class="flash flash-error">Failed to add project: {escape(str(detail))}</div>' + _render_projects_list()

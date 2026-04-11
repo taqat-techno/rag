@@ -34,9 +34,12 @@ BUILTIN_PATTERNS = [
     ".stversions/",
     # Additional defaults
     ".cache/",
+    ".claude/",
     # File patterns
     "*.pyc",
     "*.pyo",
+    # Files already read by Claude directly (no need to index)
+    "CLAUDE.md",
 ]
 
 RAGIGNORE_FILENAME = ".ragignore"
