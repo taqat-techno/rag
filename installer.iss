@@ -9,7 +9,7 @@
 ;   iscc installer.iss
 
 #define MyAppName "RAG Tools"
-#define MyAppVersion "2.2.0"
+#define MyAppVersion "2.3.0"
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
 #define MyAppExeName "rag.exe"
@@ -38,10 +38,10 @@ PrivilegesRequiredOverridesAllowed=dialog
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "addtopath"; Description: "Add to PATH (recommended)"; GroupDescription: "Additional options:"; Flags: checked
-; Auto-start ON by default — the product is designed to always run
-Name: "startup"; Description: "Start automatically on Windows login"; GroupDescription: "Additional options:"; Flags: checked
-Name: "startnow"; Description: "Start service and open admin panel after installation"; GroupDescription: "Additional options:"; Flags: checked
+; All tasks checked by default (no "unchecked" flag = checked)
+Name: "addtopath"; Description: "Add to PATH (recommended)"; GroupDescription: "Additional options:"
+Name: "startup"; Description: "Start automatically on Windows login"; GroupDescription: "Additional options:"
+Name: "startnow"; Description: "Start service and open admin panel after installation"; GroupDescription: "Additional options:"
 
 [Files]
 ; Main application (PyInstaller one-dir output)
