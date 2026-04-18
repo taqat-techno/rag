@@ -1,0 +1,145 @@
+name: Docs Freshness Audit
+
+on:
+  schedule:
+    # First day of each month at 06:00 UTC.
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+    inputs:
+      minor_threshold:
+        description: 'Flag pages whose Last-validated version lags current by more than N minor versions'
+        required: false
+        default: '1'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/docs-freshness.yml'
+
+# Phase 10 deliverable: monthly audit of wiki-src "Last validated against version" metadata.
+# Does not block any workflow — emits a job summary that maintainers can consume.
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Audit freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine current version
+        id: version
+        run: |
+          current=$(grep -E '^version = ' pyproject.toml | head -1 | sed -E 's/^version = "([^"]+)".*/\1/')
+          if [ -z "$current" ]; then
+            echo "Could not parse version from pyproject.toml" >&2
+            exit 1
+          fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "Current version: $current"
+
+      - name: Scan wiki-src for Last-validated
+        id: scan
+        env:
+          CURRENT: ${{ steps.version.outputs.current }}
+          THRESHOLD: ${{ inputs.minor_threshold || '1' }}
+        run: |
+          set -e
+          current="$CURRENT"
+          threshold="${THRESHOLD:-1}"
+          c_major=$(echo "$current" | cut -d. -f1)
+          c_minor=$(echo "$current" | cut -d. -f2)
+
+          stale_count=0
+          missing_count=0
+          total=0
+
+          echo "# Docs Freshness Report" > report.md
+          echo "" >> report.md
+          echo "Current repo version: \`$current\`  " >> report.md
+          echo "Minor-version lag threshold: \`$threshold\`" >> report.md
+          echo "" >> report.md
+          echo "## Stale pages" >> report.md
+          echo "" >> report.md
+          echo "| Page | Last validated | Lag | Status |" >> report.md
+          echo "|---|---|---|---|" >> report.md
+
+          missing_list=""
+
+          while IFS= read -r f; do
+            total=$((total + 1))
+
+            # Skip template pages — they document metadata, not real content.
+            case "$f" in
+              docs/wiki-src/Templates/*) continue ;;
+              docs/wiki-src/_Sidebar.md|docs/wiki-src/_Footer.md) continue ;;
+            esac
+
+            # Extract "| **Last validated against version** | X.Y.Z |"
+            validated=$(grep -E '^\| \*\*Last validated against version\*\* \|' "$f" | head -1 \
+              | sed -E 's/.*\| \*\*Last validated against version\*\* \| +([^ |]+).*/\1/' || true)
+
+            # Extract "| **Status** | ... |" — stubs and blocked pages are expected to be versionless.
+            status=$(grep -E '^\| \*\*Status\*\* \|' "$f" | head -1 \
+              | sed -E 's/.*\| \*\*Status\*\* \| +([^|]+).*/\1/' | xargs || true)
+
+            case "$validated" in
+              ''|'N/A')
+                if echo "$status" | grep -qiE '(BLOCKED|STUB)'; then
+                  continue  # expected — stubs are not validated
+                fi
+                missing_count=$((missing_count + 1))
+                missing_list="${missing_list}- \`$f\` (no Last-validated field)"$'\n'
+                continue
+                ;;
+            esac
+
+            v_major=$(echo "$validated" | cut -d. -f1)
+            v_minor=$(echo "$validated" | cut -d. -f2)
+
+            if [ "$v_major" != "$c_major" ]; then
+              echo "| \`$f\` | $validated | major mismatch | STALE |" >> report.md
+              stale_count=$((stale_count + 1))
+              continue
+            fi
+
+            lag=$((c_minor - v_minor))
+            if [ "$lag" -gt "$threshold" ]; then
+              echo "| \`$f\` | $validated | $lag minor versions | STALE |" >> report.md
+              stale_count=$((stale_count + 1))
+            fi
+          done < <(find docs/wiki-src -type f -name '*.md' -not -name '.gitkeep' | sort)
+
+          if [ "$stale_count" -eq 0 ]; then
+            echo "| _(none)_ | | | |" >> report.md
+          fi
+
+          echo "" >> report.md
+          echo "## Pages missing Last-validated metadata" >> report.md
+          echo "" >> report.md
+          if [ -z "$missing_list" ]; then
+            echo "_(none)_" >> report.md
+          else
+            echo "$missing_list" >> report.md
+          fi
+
+          echo "" >> report.md
+          echo "## Summary" >> report.md
+          echo "" >> report.md
+          echo "- Total pages scanned: $total" >> report.md
+          echo "- Stale (lag > $threshold minor): $stale_count" >> report.md
+          echo "- Missing metadata (non-stub): $missing_count" >> report.md
+
+          cat report.md
+
+          echo "stale_count=$stale_count" >> "$GITHUB_OUTPUT"
+          echo "missing_count=$missing_count" >> "$GITHUB_OUTPUT"
+
+      - name: Write job summary
+        run: cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Flag in annotation
+        if: steps.scan.outputs.stale_count != '0' || steps.scan.outputs.missing_count != '0'
+        run: |
+          echo "::warning title=Docs Freshness::${{ steps.scan.outputs.stale_count }} stale pages, ${{ steps.scan.outputs.missing_count }} missing metadata. See job summary."

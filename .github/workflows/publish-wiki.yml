@@ -1,0 +1,185 @@
+name: Publish Wiki
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/wiki-src/**'
+      - '.github/workflows/publish-wiki.yml'
+      - 'scripts/publish_wiki.ps1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run only (validate, do not push to wiki)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+# Phase 10 deliverable: active publish workflow.
+# Validates docs/wiki-src/ then syncs to <repo>.wiki.git.
+# Slug transform mirrors scripts/publish_wiki.ps1 exactly so manual and CI runs produce identical output.
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-wiki
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate wiki-src
+    runs-on: ubuntu-latest
+    outputs:
+      dry_run_flag: ${{ steps.mode.outputs.dry_run_flag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry_run_flag=true" >> "$GITHUB_OUTPUT"
+            echo "Mode: DRY RUN (workflow_dispatch with dry_run=true)"
+          else
+            echo "dry_run_flag=false" >> "$GITHUB_OUTPUT"
+            echo "Mode: PUBLISH"
+          fi
+
+      - name: List wiki-src pages
+        run: |
+          echo "Pages in docs/wiki-src/:"
+          find docs/wiki-src -type f -name '*.md' -not -name '.gitkeep' | sort
+          count=$(find docs/wiki-src -type f -name '*.md' -not -name '.gitkeep' | wc -l)
+          echo ""
+          echo "Total: $count markdown files"
+
+      - name: Preview slug transforms
+        run: |
+          find docs/wiki-src -type f -name '*.md' -not -name '.gitkeep' | while read -r f; do
+            rel="${f#docs/wiki-src/}"
+            case "$rel" in
+              _Sidebar.md|_Footer.md|Home.md)
+                slug="$rel"
+                ;;
+              *)
+                noext="${rel%.md}"
+                slug="${noext//\//-}"
+                slug="${slug//./-}"
+                slug="$slug.md"
+                ;;
+            esac
+            printf '  %s -> %s\n' "$rel" "$slug"
+          done | sort
+
+      - name: Markdown lint (informational)
+        continue-on-error: true
+        run: |
+          npx --yes markdownlint-cli2 'docs/wiki-src/**/*.md' || true
+
+      - name: Link check with lychee (blocking)
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --no-progress 'docs/wiki-src/**/*.md'
+          fail: true
+
+      - name: Mermaid sanity check (informational)
+        continue-on-error: true
+        run: |
+          set +e
+          exit_code=0
+          while IFS= read -r f; do
+            # Count mermaid fence openings and code fence closings inside mermaid regions.
+            opens=$(grep -c '^```mermaid' "$f" || true)
+            if [ "$opens" -eq 0 ]; then
+              continue
+            fi
+            # Basic check: every ```mermaid must be followed by a closing ``` before the next ```mermaid.
+            awk '
+              /^```mermaid/ { in_m=1; next }
+              in_m && /^```/ { in_m=0; closed++; next }
+              END {
+                if (in_m) { exit 1 }
+              }
+            ' "$f"
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "WARN: unclosed mermaid block in $f"
+              exit_code=1
+            fi
+            # Ensure each block starts with a recognized diagram type.
+            awk '
+              /^```mermaid/ { in_m=1; first=1; next }
+              in_m && first {
+                first=0
+                if ($0 !~ /^(flowchart|graph|sequenceDiagram|stateDiagram|stateDiagram-v2|classDiagram|gantt|pie|journey|gitGraph|erDiagram|mindmap|timeline|quadrantChart|xychart-beta|packet-beta|block-beta|requirementDiagram|C4Context)/) {
+                  printf "WARN: %s: mermaid block may have non-standard leading type: %s\n", FILENAME, $0
+                }
+              }
+              in_m && /^```/ { in_m=0 }
+            ' "$f"
+          done < <(find docs/wiki-src -type f -name '*.md' -not -name '.gitkeep')
+          exit $exit_code
+
+  publish:
+    name: Sync to GitHub Wiki
+    needs: validate
+    if: needs.validate.outputs.dry_run_flag != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Clone wiki repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.wiki.git" wiki
+
+      - name: Configure git identity
+        working-directory: wiki
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Sync wiki-src into wiki (with slug transform)
+        run: |
+          set -e
+          # Purge everything except .git so orphan pages are removed.
+          find wiki -mindepth 1 -maxdepth 1 -not -name '.git' -exec rm -rf {} +
+
+          find src/docs/wiki-src -type f -name '*.md' -not -name '.gitkeep' | while read -r f; do
+            rel="${f#src/docs/wiki-src/}"
+            case "$rel" in
+              _Sidebar.md|_Footer.md|Home.md)
+                slug="$rel"
+                ;;
+              *)
+                noext="${rel%.md}"
+                slug="${noext//\//-}"
+                slug="${slug//./-}"
+                slug="$slug.md"
+                ;;
+            esac
+            cp "$f" "wiki/$slug"
+          done
+
+          echo "Wiki now contains:"
+          ls -1 wiki | grep -v '^\.git' | sort
+
+      - name: Commit and push
+        working-directory: wiki
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to publish."
+            exit 0
+          fi
+          source_sha="${{ github.sha }}"
+          short_sha="${source_sha:0:7}"
+          git commit -m "docs(wiki): sync from ${short_sha}"
+          git push
+          echo "Published from ${short_sha}."
