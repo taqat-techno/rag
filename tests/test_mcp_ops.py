@@ -589,11 +589,85 @@ def test_ops_server_declares_all_phase3_tools():
     expected = {
         "run_index",
         "reindex_project",
+        "add_project",
         "add_project_ignore_rule",
         "remove_project_ignore_rule",
     }
     for name in expected:
         assert hasattr(mcp_ops_server, name), f"server missing {name}"
+
+
+def test_add_project_posts_payload(proxy_state):
+    """Happy path: proxies POST /api/projects with the full payload."""
+    proxy_state.http.post.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {
+            "status": "created",
+            "project": {"id": "alpha", "name": "Alpha", "path": "/tmp/alpha"},
+        },
+    )
+    r = mcp_ops_server.add_project("alpha", "/tmp/alpha", name="Alpha")
+    assert r["ok"] is True
+    call = proxy_state.http.post.call_args
+    assert call.args[0] == "/api/projects"
+    assert call.kwargs["json"] == {
+        "id": "alpha",
+        "name": "Alpha",
+        "path": "/tmp/alpha",
+        "enabled": True,
+        "ignore_patterns": [],
+    }
+
+
+def test_add_project_defaults_name_to_id(proxy_state):
+    """If ``name`` is None, it should default to the project_id."""
+    proxy_state.http.post.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {"status": "created"},
+    )
+    mcp_ops_server.add_project("alpha", "/tmp/alpha")
+    call = proxy_state.http.post.call_args
+    assert call.kwargs["json"]["name"] == "alpha"
+
+
+def test_add_project_refuses_in_degraded_mode(degraded_state):
+    r = mcp_ops_server.add_project("alpha", "/tmp/alpha")
+    assert r["ok"] is False
+    assert r["error_code"] == "SERVICE_DOWN"
+
+
+def test_add_project_rejects_empty_project_id(proxy_state):
+    r = mcp_ops_server.add_project("", "/tmp/alpha")
+    assert r["ok"] is False
+    assert r["error_code"] == "INVALID_ARG"
+    assert not proxy_state.http.post.called
+
+
+def test_add_project_rejects_empty_path(proxy_state):
+    r = mcp_ops_server.add_project("alpha", "")
+    assert r["ok"] is False
+    assert r["error_code"] == "INVALID_ARG"
+    assert not proxy_state.http.post.called
+
+
+def test_add_project_returns_cooldown_when_blocked(proxy_state):
+    """Second call within the cooldown window must surface COOLDOWN
+    without hitting the backend."""
+    import ragtools.integration.mcp_server as m
+    from ragtools.integration.mcp_common import WriteCooldown
+    proxy_state.http.post.return_value = MagicMock(
+        status_code=200, json=lambda: {"status": "created"},
+    )
+    orig = m._write_cooldown
+    m._write_cooldown = WriteCooldown({"add_project": 10.0})
+    try:
+        r1 = m.add_project("alpha", "/tmp/alpha")
+        assert r1["ok"] is True
+        r2 = m.add_project("beta", "/tmp/beta")
+        assert r2["ok"] is False
+        assert r2["error_code"] == "COOLDOWN"
+    finally:
+        m._write_cooldown = orig
 
 
 # ---------------------------------------------------------------------------
@@ -1127,7 +1201,7 @@ def test_register_ops_tools_defaults_to_enabled_for_unknown_names(tmp_path, monk
 
     # With an empty dict the registrar's ``access.get(name, True)`` default
     # kicks in for every tool — so ALL optional tools should register.
-    expected_tool_count = 18  # 9 diagnostics + 5 project read + 4 project write
+    expected_tool_count = 19  # 9 diagnostics + 5 project read + 5 project write
     assert len(added) == expected_tool_count
 
 
@@ -1145,7 +1219,7 @@ def test_settings_default_mcp_tools_covers_all_optional_tools():
         "project_status", "project_summary", "list_project_files",
         "get_project_ignore_rules", "preview_ignore_effect",
         # project-scoped writes
-        "run_index", "reindex_project",
+        "run_index", "reindex_project", "add_project",
         "add_project_ignore_rule", "remove_project_ignore_rule",
     }
     assert set(s.mcp_tools.keys()) == expected
@@ -1163,7 +1237,7 @@ def test_default_mcp_tools_project_on_debug_off():
     project_tools = {
         "project_status", "project_summary", "list_project_files",
         "get_project_ignore_rules", "preview_ignore_effect",
-        "run_index", "reindex_project",
+        "run_index", "reindex_project", "add_project",
         "add_project_ignore_rule", "remove_project_ignore_rule",
     }
     debug_tools = {

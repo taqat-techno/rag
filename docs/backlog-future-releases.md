@@ -2,7 +2,7 @@
 
 Items explicitly deferred from the current release. Do not forget these.
 
-**Last updated:** 2026-04-18 (post v2.5.0 planning)
+**Last updated:** 2026-04-18 (post v2.5.1 — Linux packaging shipped)
 
 ---
 
@@ -134,6 +134,21 @@ Phase 1–3 delivered agent tooling for inspection, diagnostics, and project-sco
 | `project_clusters(project)` | Heading-based or HDBSCAN clusters. Map content structure. |
 
 **Why deferred:** Phase 4 is speculative. Build after Phase 2/3 tools prove themselves in real workflows. The signal we'd look for: agents consistently struggling with "why didn't search find X?" questions.
+
+---
+
+## Linux Desktop Integration (Deferred from v2.5.1)
+
+**Context:** v2.5.1 shipped Linux packaging (`RAGTools-{version}-linux-x86_64.tar.gz`, XDG data path). The following desktop-integration surfaces are deferred — source users can still run everything via CLI and the admin panel.
+
+**Deferred items:**
+- **System tray on Linux** — `pystray` backends on Linux are inconsistent across Wayland / GNOME / KDE / XFCE. Admin panel is the supported control surface on Linux.
+- **Login-startup helper** — No `rag service install` equivalent on Linux yet. Options: systemd user unit (`~/.config/systemd/user/ragtools.service` + `systemctl --user enable`), or `.desktop` autostart file in `~/.config/autostart/`.
+- **Watchdog task** — Windows Task Scheduler equivalent on Linux: a systemd user timer or cron entry. Same two-tier recovery, different mechanism.
+- **Desktop notifications on Linux** — Currently only Windows (`winotify`) and macOS (`osascript`) backends. Linux would use `notify-send` (libnotify) with graceful fallback.
+- **Packaging polish** — `.deb` / `.rpm` / AppImage / Flatpak. The tar.gz bundle covers "it works"; OS-native packages would give menu entries, icons, and proper uninstall. Deferred until demand materialises.
+
+**Why deferred:** Ubuntu-usable via tar.gz + admin panel today. Systemd integration is well-scoped but adds test matrix weight; desktop-notify and packaging polish are post-validation concerns.
 
 ---
 

@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.5.1] — 2026-04-18
+
+Adds **first-class Linux (Ubuntu) packaging** to the release pipeline,
+plus two targeted improvements discovered during v2.5.0 field use:
+installer upgrade flow and an MCP `add_project` tool.
+
+### Added — MCP `add_project` tool
+
+- **`add_project(project_id, path, name?, enabled?)`** — new project-tier
+  MCP tool so agents can onboard a folder the user asked about without
+  leaving chat. Proxies `POST /api/projects` with full server-side
+  validation: path must exist, be a directory, and not duplicate an
+  existing project ID or path. Auto-indexes 3 s after the response.
+- **Default ON** in the project-tools tier (alongside `run_index`,
+  `reindex_project`, etc.). 2-second write-cooldown guard.
+- **Proxy-only**: returns `SERVICE_DOWN` in degraded/direct mode —
+  config writes require the running service.
+- Admin panel "MCP Tool Access" card now lists `add_project` under
+  Project tools so users can opt it out per-install.
+- Deletion remains CLI-only (`rag project remove`) — destructive by
+  design (wipes indexed Qdrant data).
+
+### Fixed — Installer upgrade flow
+
+- **Installer now force-closes running RAG processes before copying
+  files.** Pre-v2.5.1, upgrading over a running install required ending
+  `rag.exe` tasks manually in Task Manager because the tray / supervisor
+  / MCP processes held file handles on `rag.exe`. Three-layer fix:
+  - Inno Setup `CloseApplications=yes` + `RestartApplications=no` —
+    Windows Restart Manager dialog offers to close running instances.
+  - Belt-and-suspenders `taskkill /F /IM rag.exe /T` after the graceful
+    `service stop`, covering any processes Restart Manager missed
+    (tray, supervisor, orphaned workers). Runs on both install and
+    uninstall paths.
+  - `SetupMutex` prevents two installers running concurrently.
+- **User data in `%LOCALAPPDATA%\RAGTools` is never touched** — only the
+  install directory gets replaced.
+
+### Added — Linux platform support
+
+- **`RAGTools-{version}-linux-x86_64.tar.gz`** produced on every tag by a
+  new `build-linux` job in `release.yml` (runs on `ubuntu-22.04`).
+  PyInstaller one-dir bundle, same layout as the macOS tar.
+- **Linux arm in `_get_app_dir`** — Ubuntu/Debian/Fedora/Arch resolve the
+  app data directory to `$XDG_DATA_HOME/RAGTools`, falling back to
+  `~/.local/share/RAGTools`. Honours the XDG Base Directory spec.
+- **Cross-platform tests** — `test.yml` matrix now includes
+  `ubuntu-22.04` alongside `windows-latest` and `macos-14`, with
+  per-platform pip and HuggingFace cache paths.
+- **Clipboard fallback chain** — tray's "Copy URL" action on Linux tries
+  `wl-copy` (Wayland) → `xclip` → `xsel` via `shutil.which`, logging a
+  warning instead of crashing when none are available. Previous behaviour
+  shelled out to `xclip` unconditionally, which failed silently on
+  minimal distros.
+- **README Linux install section** with Ubuntu-primary instructions
+  covering bundle extraction, clipboard package hint, and data-dir
+  location.
+
+### Notes
+
+- **Platform status (Portability Audit Release Gate):**
+  Windows: `READY`, macOS: `READY`, Linux: `READY` (previously
+  `SOURCE_ONLY`).
+- **Deferred on Linux**: system tray (Linux has no cross-distro tray
+  equivalent with the pystray backends we use), login-startup helper
+  (no systemd-user integration yet), Task Scheduler watchdog (Windows-
+  only by design).
+- **No behavioural changes** on Windows or macOS. `_get_app_dir`,
+  `get_data_dir`, and `get_config_write_path` produce identical results
+  on those platforms.
+
+---
+
 ## [2.5.0] — 2026-04-18
 
 A big reliability + agent-tooling release. Closes the "silent failure" class

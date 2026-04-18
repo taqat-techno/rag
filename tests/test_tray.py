@@ -517,3 +517,119 @@ def test_tray_startup_script_includes_tray_command(tmp_path):
     settings = _settings(tmp_path)
     script = _build_tray_script(settings)
     assert "tray" in script  # invokes ``rag tray``
+
+
+# ---------------------------------------------------------------------------
+# Linux clipboard fallback chain (v2.5.1 — was the xclip hardcode)
+# ---------------------------------------------------------------------------
+
+
+def test_linux_clipboard_uses_first_available_tool(tmp_path, monkeypatch):
+    """On Linux, _on_copy_url must walk wl-copy → xclip → xsel and pick
+    whichever is on PATH. Missing tools must not raise; if none are found,
+    the action logs a warning and returns cleanly."""
+    import subprocess
+    from ragtools import tray as tray_mod
+
+    # Force the Linux branch
+    monkeypatch.setattr(tray_mod.sys, "platform", "linux")
+
+    app = TrayApp(_settings(tmp_path))
+
+    # Prime shutil.which so only xclip is "available"
+    import shutil
+    real_which = shutil.which
+
+    def fake_which(tool):
+        return "/usr/bin/xclip" if tool == "xclip" else None
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+
+    # Capture subprocess.run calls
+    calls = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda argv, **kw: calls.append((argv, kw)))
+
+    app._on_copy_url()
+
+    assert len(calls) == 1
+    assert calls[0][0][0] == "xclip"
+    assert calls[0][0][1:] == ["-selection", "clipboard"]
+
+
+def test_linux_clipboard_prefers_wl_copy_on_wayland(tmp_path, monkeypatch):
+    """If wl-copy is available (Wayland session), it takes precedence over
+    xclip/xsel — xclip won't work on Wayland without XWayland fallback."""
+    import subprocess
+    from ragtools import tray as tray_mod
+
+    monkeypatch.setattr(tray_mod.sys, "platform", "linux")
+    app = TrayApp(_settings(tmp_path))
+
+    import shutil
+    monkeypatch.setattr(shutil, "which",
+                        lambda tool: "/usr/bin/wl-copy" if tool == "wl-copy" else "/usr/bin/xclip")
+
+    calls = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda argv, **kw: calls.append(argv))
+
+    app._on_copy_url()
+
+    assert len(calls) == 1
+    assert calls[0][0] == "wl-copy"   # preferred even if xclip is also present
+
+
+def test_linux_clipboard_logs_warning_when_nothing_available(tmp_path, monkeypatch, caplog):
+    """When no clipboard tool is present (minimal/headless Linux), the
+    tool must log a warning — no exception, no silent failure."""
+    import logging
+    import subprocess
+    from ragtools import tray as tray_mod
+
+    monkeypatch.setattr(tray_mod.sys, "platform", "linux")
+    app = TrayApp(_settings(tmp_path))
+
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+
+    ran = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: ran.append(a))
+
+    with caplog.at_level(logging.WARNING):
+        app._on_copy_url()
+
+    assert ran == []  # no external process launched
+    assert any("no clipboard tool" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Config Linux arm (v2.5.1 — was returning None)
+# ---------------------------------------------------------------------------
+
+
+def test_get_app_dir_has_linux_arm(monkeypatch):
+    """Linux installed-mode data dir should honour XDG_DATA_HOME with a
+    sensible ~/.local/share fallback. Was previously returning None."""
+    from pathlib import Path as _P
+    import ragtools.config as cfg
+
+    monkeypatch.setattr(cfg.sys, "platform", "linux")
+
+    # With XDG_DATA_HOME set
+    monkeypatch.setenv("XDG_DATA_HOME", "/var/lib/demo/data")
+    result = cfg._get_app_dir()
+    assert result == _P("/var/lib/demo/data") / "RAGTools"
+
+    # Without XDG_DATA_HOME — fall back to ~/.local/share
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    result = cfg._get_app_dir()
+    assert result == _P.home() / ".local" / "share" / "RAGTools"
+
+
+def test_get_app_dir_none_for_unknown_platform(monkeypatch):
+    """Backwards-compat: anything that isn't win32/darwin/linux still
+    returns None (dev-mode CWD fallback). Not a regression."""
+    import ragtools.config as cfg
+    monkeypatch.setattr(cfg.sys, "platform", "freebsd13")
+    assert cfg._get_app_dir() is None

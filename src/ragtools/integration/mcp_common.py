@@ -81,6 +81,7 @@ class WriteCooldown:
     DEFAULTS: dict[str, float] = {
         "run_index":                   2.0,
         "reindex_project":            30.0,
+        "add_project":                 2.0,
         "add_project_ignore_rule":     1.0,
         "remove_project_ignore_rule":  1.0,
     }

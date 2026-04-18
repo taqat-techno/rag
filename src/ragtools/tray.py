@@ -242,17 +242,31 @@ class TrayApp:
 
     def _on_copy_url(self) -> None:
         try:
+            import shutil
             import subprocess
             url = _admin_url(self.settings)
             if sys.platform == "win32":
                 subprocess.run(["clip"], input=url.encode("utf-8"), check=False)
-            elif sys.platform == "darwin":
+                return
+            if sys.platform == "darwin":
                 subprocess.run(["pbcopy"], input=url.encode("utf-8"), check=False)
-            else:
-                subprocess.run(
-                    ["xclip", "-selection", "clipboard"],
-                    input=url.encode("utf-8"), check=False,
-                )
+                return
+            # Linux / other Unix — try a portable fallback chain covering
+            # Wayland (wl-copy), X11 with xclip, X11 with xsel. Each candidate
+            # is checked with shutil.which first so missing tools don't raise.
+            for tool, args in (
+                ("wl-copy", []),
+                ("xclip",   ["-selection", "clipboard"]),
+                ("xsel",    ["--clipboard", "--input"]),
+            ):
+                if shutil.which(tool):
+                    subprocess.run([tool, *args],
+                                   input=url.encode("utf-8"), check=False)
+                    return
+            logger.warning(
+                "Copy URL: no clipboard tool found on PATH "
+                "(tried wl-copy, xclip, xsel). URL: %s", url,
+            )
         except Exception as e:
             logger.warning("Copy URL failed: %s", e)
 

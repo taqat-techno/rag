@@ -11,8 +11,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-14]
+        os: [windows-latest, macos-14, ubuntu-22.04]
         python-version: ["3.12"]
+        include:
+          - os: windows-latest
+            pip-cache: ~\AppData\Local\pip\Cache
+            hf-cache: ~\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2
+          - os: macos-14
+            pip-cache: ~/Library/Caches/pip
+            hf-cache: ~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2
+          - os: ubuntu-22.04
+            pip-cache: ~/.cache/pip
+            hf-cache: ~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2
 
     runs-on: ${{ matrix.os }}
 
@@ -27,14 +37,14 @@ jobs:
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
-          path: ${{ runner.os == 'Windows' && '~\AppData\Local\pip\Cache' || '~/Library/Caches/pip' }}
+          path: ${{ matrix.pip-cache }}
           key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-${{ runner.os }}-
 
       - name: Cache SentenceTransformer model
         uses: actions/cache@v4
         with:
-          path: ${{ runner.os == 'Windows' && '~\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2' || '~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2' }}
+          path: ${{ matrix.hf-cache }}
           key: model-all-MiniLM-L6-v2-${{ runner.os }}-v1
 
       - name: Install dependencies

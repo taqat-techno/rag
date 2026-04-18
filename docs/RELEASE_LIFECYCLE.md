@@ -51,11 +51,11 @@ These **must** survive upgrade and default uninstall:
 
 ## 3. Directory contract
 
-| Purpose | Windows | macOS |
-|---|---|---|
-| Install dir (replaceable) | `%LOCALAPPDATA%\Programs\RAGTools\` (user install) or `C:\Program Files\RAGTools\` (system install) | `/Applications/RAGTools.app/` |
-| Persistent data dir | `%LOCALAPPDATA%\RAGTools\` | `~/Library/Application Support/RAGTools/` |
-| Login auto-start | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\RAGTools.vbs` | `~/Library/LaunchAgents/com.taqatechno.ragtools.plist` (roadmap) |
+| Purpose | Windows | macOS | Linux |
+|---|---|---|---|
+| Install dir (replaceable) | `%LOCALAPPDATA%\Programs\RAGTools\` (user install) or `C:\Program Files\RAGTools\` (system install) | `/Applications/RAGTools.app/` | `/opt/rag/` (system) or `~/.local/opt/rag/` (user) — user chooses when extracting the tar.gz |
+| Persistent data dir | `%LOCALAPPDATA%\RAGTools\` | `~/Library/Application Support/RAGTools/` | `$XDG_DATA_HOME/RAGTools/` or `~/.local/share/RAGTools/` (XDG Base Directory) |
+| Login auto-start | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\RAGTools.vbs` | `~/Library/LaunchAgents/com.taqatechno.ragtools.plist` (roadmap) | systemd user unit / `.desktop` autostart (roadmap — deferred in v2.5.1) |
 
 **Resolution is enforced in code**, not by convention. The authoritative
 functions are in `src/ragtools/config.py`:
@@ -73,14 +73,27 @@ circumstance.**
 
 ## 4. Upgrade behavior
 
-On upgrade the installer MUST:
+On upgrade the **Windows installer** MUST:
 
 1. Stop the running service (`rag.exe service stop`).
 2. Remove the old startup task entry (`rag.exe service uninstall`).
-3. Replace all files in the install directory.
-4. Re-register the startup task against the new install dir.
-5. Restart the service.
-6. Leave the persistent data directory untouched.
+3. Close any surviving `rag.exe` processes (tray, supervisor, MCP workers) —
+   v2.5.1+ uses `CloseApplications=yes` + a `taskkill /F /IM rag.exe /T`
+   fallback so upgrade over a running install does not require manual
+   Task-Manager intervention.
+4. Replace all files in the install directory.
+5. Re-register the startup task against the new install dir.
+6. Restart the service.
+7. Leave the persistent data directory untouched.
+
+On **macOS** (no installer in v2.5.x), upgrade is: stop the service, replace
+the extracted bundle, restart the service. Persistent data dir untouched.
+
+On **Linux** (tar.gz in v2.5.1), upgrade is: the user extracts the new
+tar.gz over the old bundle, then runs `rag service start`. Persistent data
+dir untouched because data lives under `$XDG_DATA_HOME/RAGTools`, not
+inside the install dir. Auto-upgrade tooling (`.deb`, AppImage) is
+deferred.
 
 On upgrade the service MUST, on first start:
 

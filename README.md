@@ -74,6 +74,37 @@ Download `RAGTools-Setup-{version}.exe` from [Releases](https://github.com/taqat
 
 A portable `.zip` and macOS `tar.gz` are also available on the releases page.
 
+## Install from Release (Linux — Ubuntu)
+
+Primary validated target: **Ubuntu 22.04 / 24.04 on x86_64**. Also works on any XDG-compliant distro (Debian, Fedora, Arch) that can run a Python 3.12 PyInstaller bundle.
+
+```bash
+# Download the portable bundle
+VERSION=2.5.1
+curl -LO https://github.com/taqat-techno/rag/releases/download/v${VERSION}/RAGTools-${VERSION}-linux-x86_64.tar.gz
+
+# Extract to /opt (system-wide) or ~/.local/opt (user)
+sudo tar -xzf "RAGTools-${VERSION}-linux-x86_64.tar.gz" -C /opt
+sudo ln -sf /opt/rag/rag /usr/local/bin/rag
+
+# Optional — clipboard support for the "Copy URL" tray button
+sudo apt install wl-clipboard    # Wayland, recommended on Ubuntu 22.04+
+# or
+sudo apt install xclip           # X11
+
+# First run
+rag version
+rag service start                # launches the local service
+xdg-open http://localhost:21420  # opens the admin panel
+```
+
+Data and config live under `$XDG_DATA_HOME/RAGTools` (or `~/.local/share/RAGTools` if unset), following the XDG Base Directory spec.
+
+**Linux notes:**
+- No system tray on Linux — use the admin panel as the control surface.
+- No login-startup helper yet — add `rag service start` to your desktop session's autostart manually if desired.
+- The watchdog (`rag service watchdog`) is currently Windows-only.
+
 ## Add Your First Project
 
 ### From the Admin Panel

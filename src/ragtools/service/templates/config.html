@@ -145,6 +145,7 @@ var MCP_TOOL_DESCRIPTIONS = {
     // Project-scoped writes — marked with ✎ for clarity
     run_index:                   "✎ WRITE · Run incremental index for one project (idempotent)",
     reindex_project:             "✎ WRITE · Drop & rebuild one project's index (confirm_token required)",
+    add_project:                 "✎ WRITE · Onboard a new project folder (user-provided absolute path)",
     add_project_ignore_rule:     "✎ WRITE · Add an ignore pattern to a project",
     remove_project_ignore_rule: "✎ WRITE · Remove an ignore pattern from a project"
 };
@@ -167,7 +168,7 @@ var MCP_TOOL_GROUPS = [
             "project_status", "project_summary", "list_project_files",
             "get_project_ignore_rules", "preview_ignore_effect",
             // Writes — guarded per-tool
-            "run_index", "reindex_project",
+            "run_index", "reindex_project", "add_project",
             "add_project_ignore_rule", "remove_project_ignore_rule",
         ],
     },

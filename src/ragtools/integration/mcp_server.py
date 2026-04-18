@@ -18,8 +18,8 @@ A **single** MCP server with per-tool access control. Three tool tiers:
       - project_status, project_summary, list_project_files,
         get_project_ignore_rules, preview_ignore_effect
 
-  Optional project-scoped writes — default OFF, guarded (4):
-      - run_index, reindex_project, add_project_ignore_rule,
+  Optional project-scoped writes — default ON, guarded (5):
+      - run_index, reindex_project, add_project, add_project_ignore_rule,
         remove_project_ignore_rule
 
 Disabled tools are NEVER registered — invisible to the agent, zero token
@@ -49,8 +49,11 @@ Safety boundaries (release-critical)
   - ``reindex_project`` additionally requires ``confirm_token == project``
     to defeat blind prompt-injected invocations that don't know which
     project the user is actually working on.
-  - No MCP tool can add/delete projects, shut down the service, or restore
-    from backup — those stay CLI-only (arbitrary-path or destructive).
+  - ``add_project`` requires proxy mode (config writes need the service) and
+    delegates all validation — path existence, ID uniqueness, duplicate-path
+    detection — to the server. Auto-indexes after add, same as the admin UI.
+  - No MCP tool can **delete** projects, shut down the service, or restore
+    from backup — those stay CLI-only (destructive: wipes indexed data).
 """
 
 from __future__ import annotations
@@ -246,6 +249,7 @@ def _register_ops_tools() -> None:
         # Phase 3 — project-scoped writes (Family B)
         ("run_index",                   run_index),
         ("reindex_project",             reindex_project),
+        ("add_project",                 add_project),
         ("add_project_ignore_rule",     add_project_ignore_rule),
         ("remove_project_ignore_rule", remove_project_ignore_rule),
     ]
@@ -549,6 +553,77 @@ def system_health() -> dict:
                "system_health requires the service to be running.",
                code=_errcodes.SERVICE_DOWN,
                hint="Start the service with: rag service start")
+
+
+def add_project(
+    project_id: str,
+    path: str,
+    name: str | None = None,
+    enabled: bool = True,
+) -> dict:
+    """Onboard a new project folder. Persists to config and auto-indexes.
+
+    USE WHEN: the user explicitly asks to add / onboard / register a
+              specific folder as a project (e.g. "add C:/Work/docs as
+              project `docs`"). The ``path`` MUST be an absolute local
+              filesystem path the user provided — never guess it.
+    DO NOT USE: to rename / edit an existing project (no such tool by
+                design — edit via the admin panel), or to delete one.
+
+    Behaviour:
+      * Validates the path exists and is a directory (server-side).
+      * Rejects duplicate ``project_id`` and duplicate absolute paths.
+      * Writes the new entry to the TOML config.
+      * Triggers an auto-index 3 s after the response returns, so the
+        folder becomes searchable without a separate ``run_index`` call.
+
+    Args:
+        project_id: Short lowercase identifier, used in storage keys and as
+                    the ``project`` argument elsewhere (e.g. in
+                    ``search_knowledge_base``). Must be unique.
+        path:       Absolute filesystem path to the project's root folder.
+                    Must exist and be a directory. Provided by the user.
+        name:       Display name (defaults to ``project_id``).
+        enabled:    Whether the project is immediately active (default True).
+    """
+    if _ops_state is None or _ops_state.mode != "proxy":
+        return err(
+            _ops_state or _fallback_state(),
+            "add_project requires the service to be running — config writes "
+            "cannot be persisted in direct mode.",
+            code=_errcodes.SERVICE_DOWN,
+            hint="Start the service with: rag service start",
+        )
+    if not project_id or not project_id.strip():
+        return err(
+            _ops_state,
+            "project_id cannot be empty.",
+            code=_errcodes.INVALID_ARG,
+        )
+    if not path or not path.strip():
+        return err(
+            _ops_state,
+            "path cannot be empty. Pass the absolute folder path the user "
+            "specified.",
+            code=_errcodes.INVALID_ARG,
+        )
+    gate = _cooldown_guard("add_project")
+    if gate is not None:
+        return gate
+    result = proxy_post(
+        _ops_state,
+        "/api/projects",
+        json={
+            "id": project_id.strip(),
+            "name": (name or project_id).strip(),
+            "path": path.strip(),
+            "enabled": bool(enabled),
+            "ignore_patterns": [],
+        },
+    )
+    if result.get("ok"):
+        _write_cooldown.mark("add_project")
+    return result
 
 
 def run_index(project: str) -> dict:

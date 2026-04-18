@@ -60,6 +60,13 @@ def _get_app_dir() -> Path | None:
             return Path(local_app_data) / "RAGTools"
     elif sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "RAGTools"
+    elif sys.platform.startswith("linux"):
+        # XDG Base Directory spec: honour $XDG_DATA_HOME if set, else the
+        # conventional ~/.local/share. Ubuntu is the primary validated target
+        # but this covers any XDG-compliant distro (Debian, Fedora, Arch, ...).
+        xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+        base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+        return base / "RAGTools"
     return None
 
 
@@ -69,6 +76,7 @@ def get_data_dir() -> Path:
     Packaged/installed mode:
       Windows: %LOCALAPPDATA%/RAGTools
       macOS:   ~/Library/Application Support/RAGTools
+      Linux:   $XDG_DATA_HOME/RAGTools or ~/.local/share/RAGTools
     Dev mode (not frozen): ./data (relative to CWD)
 
     Dev mode NEVER returns the installed-app directory, even if it exists.
@@ -281,6 +289,7 @@ class Settings(BaseSettings):
         "preview_ignore_effect":    True,
         "run_index":                True,
         "reindex_project":          True,
+        "add_project":              True,
         "add_project_ignore_rule":  True,
         "remove_project_ignore_rule": True,
         # Debugging / diagnostics — disabled by default (opt-in for operators)
