@@ -89,7 +89,7 @@ rag doctor                        # Health check
 rag rebuild                       # Drop everything, re-index from scratch
 rag projects                      # List indexed projects with counts
 rag watch .                       # Auto-index on .md changes (Ctrl+C to stop)
-rag serve                         # Start MCP server (stdio transport)
+rag serve                         # Start the MCP server (core + user-enabled optional tools)
 rag version                       # Show version
 ```
 
@@ -120,14 +120,32 @@ python scripts/eval_retrieval.py --questions tests/fixtures/eval_questions.json 
 
 ## RAG Knowledge Base (MCP Tools)
 
-Before answering project-specific questions, use the `search_knowledge_base` tool
-to retrieve relevant context from the local knowledge base.
+One MCP server (`rag-mcp`) with per-tool access control. The agent's
+visible toolset depends on which tools the user enabled in the admin
+panel's "MCP Tool Access" card — disabled tools are never registered
+at startup.
 
-### Available Tools
+### Core tools — always available
 
 - **search_knowledge_base(query, project?, top_k?)** — Search indexed Markdown content
 - **list_projects()** — Discover available project IDs
 - **index_status()** — Check if the knowledge base is ready
+
+### Optional diagnostic tools — user-gated
+
+Only registered if the user checked the box for each on the Settings page:
+
+- **service_status()** — Live service state + watcher, scale, mode
+- **recent_activity(limit?, level?)** — Structured activity-log slice
+- **tail_logs(source, limit?)** — Whitelisted log tail
+- **crash_history()** — Unreviewed crash markers
+- **get_config()** / **get_ignore_rules()** / **get_paths()** — Config inspection
+- **system_health()** — JSON form of `rag doctor`
+- **list_indexed_paths(project?, limit?)** — State-DB file roster
+
+All optional tools return the envelope `{ok, mode, as_of, data|error, hint?}`.
+Their first-line docstrings include a WHEN / DO NOT USE guardrail so
+the agent doesn't call them for content queries.
 
 ### Usage Rules
 
@@ -138,6 +156,7 @@ to retrieve relevant context from the local knowledge base.
 5. If no results are found, say "no project-specific local content was available"
 6. If the user asks about a specific project, **pass the project parameter**
 7. Cite sources from retrieved chunks: `[Source: project/file | Section: heading]`
+8. **Only use `ragtools-ops` tools when diagnosing the RAG system itself** — not for content queries
 
 ### Constraint
 

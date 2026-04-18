@@ -1,5 +1,9 @@
 # Release Checklist
 
+> **Every release must comply with `docs/RELEASE_LIFECYCLE.md`.**
+> Read that document before cutting any new version. The rules in section 9
+> of that doc are the release gate for this repo.
+
 ## Prepare
 
 1. Ensure all tests pass: `pytest`
@@ -9,7 +13,19 @@
    - `src/ragtools/__init__.py` → `__version__ = "X.Y.Z"`
    - `installer.iss` → `#define MyAppVersion "X.Y.Z"`
 4. Update `winget/` manifests with new version and placeholder SHA256
-5. Commit: `git commit -m "Release vX.Y.Z"`
+5. **Lifecycle gate** — confirm each of these before committing:
+   - [ ] No new code path writes user data into the install directory
+   - [ ] Any schema change bumped its version AND ships a migration step
+         (`config.toml` `version`, SQLite `PRAGMA user_version`, or Qdrant
+         collection dim check)
+   - [ ] Dev-mode startup (`python -m ragtools.service.run` from source)
+         does not touch `%LOCALAPPDATA%\RAGTools\` or register a Startup task
+   - [ ] Installer manually tested on a machine that already has the
+         previous version installed — upgrade path preserves user data
+   - [ ] Uninstall manually tested with the opt-in prompt answered both
+         YES (full wipe) and NO (keep data) and both paths behave correctly
+   - [ ] `docs/RELEASE_LIFECYCLE.md` is still accurate for this version
+6. Commit: `git commit -m "Release vX.Y.Z"`
 
 ## Release
 
