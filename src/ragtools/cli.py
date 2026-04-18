@@ -20,6 +20,15 @@ service_app = typer.Typer(help="Manage the RAG service.")
 app.add_typer(service_app, name="service")
 project_app = typer.Typer(help="Manage configured projects.")
 app.add_typer(project_app, name="project")
+backup_app = typer.Typer(help="Manage state-DB backups (taken before destructive operations).")
+app.add_typer(backup_app, name="backup")
+tray_app = typer.Typer(
+    help="Manage the RAG Tools system-tray icon.",
+    invoke_without_command=True,
+)
+app.add_typer(tray_app, name="tray")
+wiki_app = typer.Typer(help="Wiki sync and maintenance.")
+app.add_typer(wiki_app, name="wiki")
 console = Console()
 
 
@@ -249,7 +258,26 @@ def doctor():
         try:
             client = settings.get_qdrant_client()
             info = client.get_collection(settings.collection_name)
-            checks.append(("Collection", "OK", f"{info.points_count} points"))
+            points_count = info.points_count
+            # Surface Qdrant local-mode scale warnings (field-report incident).
+            from ragtools.service.owner import compute_scale_warning
+            scale = compute_scale_warning(points_count)
+            if scale["level"] == "over":
+                status_label = "WARNING"
+                detail = (
+                    f"{points_count:,} points — OVER local-mode limit "
+                    f"({scale['hard_limit']:,}). Prune or migrate Qdrant."
+                )
+            elif scale["level"] == "approaching":
+                status_label = "OK"
+                detail = (
+                    f"{points_count:,} points — approaching local-mode limit "
+                    f"({scale['hard_limit']:,}). Review ignore_patterns."
+                )
+            else:
+                status_label = "OK"
+                detail = f"{points_count} points"
+            checks.append(("Collection", status_label, detail))
         except Exception:
             checks.append(("Collection", "NOT FOUND", f"'{settings.collection_name}' missing"))
 
@@ -257,6 +285,36 @@ def doctor():
     patterns = ignore_rules.get_all_patterns()
     config_count = len(patterns.get("config", []))
     checks.append(("Ignore rules", "OK", f"{len(patterns['built-in'])} built-in, {config_count} config"))
+
+    # Auto-recovery integrations (Windows only). If these silently fail to
+    # register during install, the user only finds out the next time a crash
+    # or reboot happens — and then too late. Surfacing both states in
+    # `rag doctor` closes that visibility gap (see field report: watchdog
+    # script existed on disk but Task Scheduler had no entry).
+    if sys.platform == "win32":
+        try:
+            from ragtools.service.startup import is_task_installed
+            if is_task_installed():
+                checks.append(("Login startup", "OK", "Registered in Startup folder"))
+            else:
+                checks.append((
+                    "Login startup", "MISSING",
+                    "Register with: rag service install",
+                ))
+        except Exception as e:
+            checks.append(("Login startup", "ERROR", str(e)))
+
+        try:
+            from ragtools.service.watchdog import is_watchdog_installed, TASK_NAME
+            if is_watchdog_installed():
+                checks.append(("Watchdog", "OK", f"Task: {TASK_NAME} (every 15 min)"))
+            else:
+                checks.append((
+                    "Watchdog", "MISSING",
+                    "Register with: rag service watchdog install",
+                ))
+        except Exception as e:
+            checks.append(("Watchdog", "ERROR", str(e)))
 
     table = Table(title="RAG System Health Check")
     table.add_column("Component", style="bold")
@@ -401,7 +459,12 @@ def version():
 
 @app.command()
 def serve():
-    """Start the MCP server for Claude CLI integration."""
+    """Start the MCP server for Claude CLI integration.
+
+    Exposes 3 core tools always (search_knowledge_base, list_projects,
+    index_status) plus any optional diagnostic tools the user has granted
+    access to in the admin panel's MCP Tool Access card.
+    """
     from ragtools.integration.mcp_server import main as mcp_main
     err_console = Console(stderr=True)
     err_console.print("[bold]Starting RAG MCP server (stdio transport)...[/bold]")
@@ -413,13 +476,24 @@ def serve():
 
 
 @service_app.command("start")
-def service_start():
+def service_start(
+    no_supervise: bool = typer.Option(
+        False,
+        "--no-supervise",
+        help="Launch the service directly without the auto-restart supervisor "
+             "(legacy pre-v2.4.3 behavior).",
+    ),
+):
     """Start the RAG service in the background."""
     from ragtools.service.process import start_service
     settings = _get_settings()
     try:
-        pid = start_service(settings)
-        console.print(f"[green]Service started[/green] (PID {pid})")
+        pid = start_service(settings, supervise=not no_supervise)
+        if no_supervise:
+            console.print(f"[green]Service started[/green] (PID {pid}, unsupervised)")
+        else:
+            console.print(f"[green]Service started under supervisor[/green] (PID {pid})")
+            console.print("  Supervisor will auto-restart the service on crash.")
         console.print(f"  Listening on http://{settings.service_host}:{settings.service_port}")
         console.print(f"  Logs: {Path(settings.qdrant_path).parent / 'logs' / 'service.log'}")
         console.print("  Note: encoder loading takes 5-10 seconds before service is ready.")
@@ -479,6 +553,48 @@ def service_run(
     run_main()
 
 
+@service_app.command("supervise")
+def service_supervise(
+    host: str = typer.Option(None, "--host", help="Bind host for the real service"),
+    port: int = typer.Option(None, "--port", help="Bind port for the real service"),
+    max_failures: int = typer.Option(
+        5, "--max-failures",
+        help="Give up after this many crashes within --window-seconds.",
+    ),
+    window_seconds: float = typer.Option(
+        300.0, "--window-seconds",
+        help="Rolling window (seconds) for counting failures.",
+    ),
+):
+    """Run the supervisor in the foreground. Spawns the real service and
+    respawns it on crash. This is what `rag service start` launches by
+    default; you normally don't call it directly."""
+    from ragtools.service.process import (
+        _build_service_run_cmd,
+        get_pid_file_path,
+    )
+    from ragtools.service.supervisor import run_supervisor
+
+    settings = _get_settings()
+    if host:
+        object.__setattr__(settings, "service_host", host)
+    if port:
+        object.__setattr__(settings, "service_port", port)
+
+    child_cmd = _build_service_run_cmd(settings)
+    data_dir = get_pid_file_path(settings).parent
+
+    exit_code = run_supervisor(
+        host=settings.service_host,
+        port=settings.service_port,
+        data_dir=data_dir,
+        child_command=child_cmd,
+        max_failures=max_failures,
+        window_seconds=window_seconds,
+    )
+    raise typer.Exit(code=exit_code)
+
+
 @service_app.command("install")
 def service_install(
     delay: int = typer.Option(30, "--delay", "-d", help="Startup delay in seconds"),
@@ -506,6 +622,97 @@ def service_uninstall():
         console.print("[green]Startup task removed.[/green]")
     else:
         console.print("[yellow]Failed to remove startup task.[/yellow]")
+
+
+# --- Watchdog (service sub-group) ---
+
+watchdog_app = typer.Typer(help="Scheduled Task watchdog (restarts the service if the supervisor dies).")
+service_app.add_typer(watchdog_app, name="watchdog")
+
+
+@watchdog_app.command("install")
+def watchdog_install(
+    interval: int = typer.Option(15, "--interval", help="Minutes between health checks. Minimum 1."),
+):
+    """Register the Windows Task Scheduler watchdog task."""
+    from ragtools.service.watchdog import DEFAULT_INTERVAL_MINUTES, install_watchdog_task, TASK_NAME
+
+    if sys.platform != "win32":
+        console.print("[yellow]Watchdog install is Windows-only.[/yellow]")
+        raise typer.Exit(0)
+
+    if interval < 1:
+        console.print("[red]--interval must be at least 1 minute.[/red]")
+        raise typer.Exit(2)
+
+    settings = _get_settings()
+    if install_watchdog_task(settings, interval_minutes=interval):
+        console.print(f"[green]Watchdog installed.[/green]")
+        console.print(f"  Task name: {TASK_NAME}")
+        console.print(f"  Interval: every {interval} min")
+        console.print(f"  Command: rag service watchdog check")
+    else:
+        console.print("[red]Watchdog install failed — see log.[/red]")
+        raise typer.Exit(1)
+
+
+@watchdog_app.command("uninstall")
+def watchdog_uninstall():
+    """Remove the watchdog task from Task Scheduler."""
+    from ragtools.service.watchdog import uninstall_watchdog_task
+
+    if uninstall_watchdog_task():
+        console.print("[green]Watchdog removed (or was not installed).[/green]")
+    else:
+        console.print("[red]Watchdog uninstall failed — see log.[/red]")
+        raise typer.Exit(1)
+
+
+@watchdog_app.command("status")
+def watchdog_status():
+    """Show the watchdog task's current state."""
+    from ragtools.service.watchdog import TASK_NAME, get_watchdog_info, is_watchdog_installed
+
+    if sys.platform != "win32":
+        console.print(f"[dim]Not on Windows — watchdog is a no-op.[/dim]")
+        return
+
+    if not is_watchdog_installed():
+        console.print(f"[yellow]Watchdog '{TASK_NAME}' is not installed.[/yellow]")
+        console.print("Install with: [bold]rag service watchdog install[/bold]")
+        return
+
+    info = get_watchdog_info() or {}
+    table = Table(title="Watchdog")
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+    for k in ("task_name", "status", "next_run", "last_run", "last_result"):
+        table.add_row(k.replace("_", " ").title(), str(info.get(k, "")))
+    console.print(table)
+
+
+@watchdog_app.command("check")
+def watchdog_check():
+    """Perform one health-check. Invoked by Task Scheduler.
+
+    Always exits 0 so Task Scheduler doesn't mark the task as failed —
+    that would suppress Windows's own retry logic and spam notifications.
+    """
+    from ragtools.service.watchdog import run_check, WatchdogAction
+
+    settings = _get_settings()
+    result = run_check(settings)
+
+    if result.action == WatchdogAction.NOTHING:
+        console.print("[green]Service is healthy.[/green]")
+    elif result.action == WatchdogAction.START:
+        pid_str = f" (PID {result.started_pid})" if result.started_pid else ""
+        console.print(f"[yellow]Service was dead; relaunched{pid_str}.[/yellow]")
+        if result.note:
+            console.print(f"[dim]{result.note}[/dim]")
+    elif result.action == WatchdogAction.ALREADY_STARTING:
+        console.print(f"[dim]Another process is already starting the service.[/dim]")
+    # Intentionally do not raise typer.Exit with a non-zero code.
 
 
 # --- Ignore Subcommands ---
@@ -704,6 +911,151 @@ def project_disable(
     _toggle_project(project_id, enable=False)
 
 
+@project_app.command("add-from-glob")
+def project_add_from_glob(
+    pattern: str = typer.Argument(
+        ...,
+        help='Glob pattern matching folders to add (e.g. "D:/Work/*/docs"). Quote it to prevent shell expansion.',
+    ),
+    exclude: list[str] = typer.Option(
+        [], "--exclude", "-x",
+        help="Glob pattern to exclude. Can be repeated.",
+    ),
+    name_prefix: str = typer.Option(
+        "", "--name-prefix",
+        help="Prefix prepended to every project display name (ids are unchanged).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Show the plan without adding anything.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Skip the interactive confirmation.",
+    ),
+):
+    """Bulk-add projects from a glob pattern.
+
+    Expands the pattern to matching directories, derives a project id from
+    each folder basename, skips paths that are already registered, and
+    submits the additions in a single pass. Individual failures do not
+    abort the run — a summary is printed at the end.
+    """
+    from ragtools.project_glob import (
+        PlanKind,
+        derive_plan,
+        expand_glob,
+        plan_summary,
+    )
+
+    settings = _get_settings()
+
+    # --- Phase 1: expand + plan ---
+    candidates = expand_glob(pattern, excludes=exclude)
+    if not candidates:
+        console.print(f"[yellow]No directories matched:[/yellow] {pattern}")
+        raise typer.Exit(0)
+
+    plan = derive_plan(candidates, existing=settings.projects, name_prefix=name_prefix)
+    summary = plan_summary(plan)
+    actionable = [row for row in plan if row.actionable]
+
+    table = Table(title=f"Plan for: {pattern}")
+    table.add_column("Status", style="bold")
+    table.add_column("ID")
+    table.add_column("Name")
+    table.add_column("Path")
+    table.add_column("Note", style="dim")
+    for row in plan:
+        status_style = {
+            PlanKind.NEW: "[green]NEW[/green]",
+            PlanKind.RENAMED: "[cyan]RENAMED[/cyan]",
+            PlanKind.DUPLICATE: "[dim]DUPLICATE[/dim]",
+            PlanKind.INVALID: "[red]INVALID[/red]",
+        }[row.kind]
+        table.add_row(
+            status_style,
+            row.project_id or "—",
+            row.name or "—",
+            str(row.path),
+            row.reason,
+        )
+    console.print(table)
+    console.print(
+        f"Summary: [green]{summary['NEW']} new[/green], "
+        f"[cyan]{summary['RENAMED']} renamed[/cyan], "
+        f"[dim]{summary['DUPLICATE']} duplicate[/dim], "
+        f"[red]{summary['INVALID']} invalid[/red]"
+    )
+
+    if dry_run:
+        console.print("[dim]--dry-run: no changes applied.[/dim]")
+        raise typer.Exit(0)
+
+    if not actionable:
+        console.print("[yellow]Nothing to add.[/yellow]")
+        raise typer.Exit(0)
+
+    # --- Phase 2: confirm ---
+    if not yes:
+        typer.confirm(f"Add {len(actionable)} project(s)?", abort=True)
+
+    # --- Phase 3: submit (service first, direct mode fallback) ---
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []  # (id, error)
+
+    if _probe_service(settings):
+        import httpx
+        url = f"{_service_url(settings)}/api/projects"
+        for row in actionable:
+            try:
+                r = httpx.post(
+                    url,
+                    json={"id": row.project_id, "name": row.name, "path": str(row.path)},
+                    timeout=10.0,
+                )
+                r.raise_for_status()
+                succeeded.append(row.project_id)
+            except httpx.HTTPStatusError as e:
+                try:
+                    detail = e.response.json().get("detail", str(e))
+                except Exception:
+                    detail = str(e)
+                failed.append((row.project_id, detail))
+            except Exception as e:
+                failed.append((row.project_id, str(e)))
+    else:
+        # Direct mode: one TOML write at the end to avoid N-way races.
+        from ragtools.config import ProjectConfig
+        from ragtools.service.pages import _save_projects_to_toml
+
+        updated = list(settings.projects)
+        for row in actionable:
+            try:
+                updated.append(ProjectConfig(
+                    id=row.project_id,
+                    name=row.name,
+                    path=str(row.path),
+                ))
+                succeeded.append(row.project_id)
+            except Exception as e:
+                failed.append((row.project_id, str(e)))
+        try:
+            _save_projects_to_toml(updated)
+        except Exception as e:
+            console.print(f"[red]Failed to write config:[/red] {e}")
+            raise typer.Exit(1)
+
+    # --- Phase 4: report ---
+    if succeeded:
+        console.print(f"[green]Added {len(succeeded)} project(s):[/green] " + ", ".join(succeeded))
+    if failed:
+        console.print(f"[red]Failed {len(failed)} project(s):[/red]")
+        for pid, err in failed:
+            console.print(f"  [red]{pid}[/red]: {err}")
+        raise typer.Exit(1)
+
+
 def _toggle_project(project_id: str, enable: bool):
     """Shared logic for enable/disable."""
     settings = _get_settings()
@@ -734,6 +1086,217 @@ def _toggle_project(project_id: str, enable: bool):
     console.print(f"[green]Project {state}:[/green] {project_id}")
 
 
+# --- Backup commands ---
+
+
+def _human_size(n: int) -> str:
+    """Short, readable byte count for the backup table."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+@backup_app.command("list")
+def backup_list():
+    """List state-DB backups, newest first."""
+    from ragtools.backup import list_backups
+
+    settings = _get_settings()
+    backups = list_backups(settings)
+    if not backups:
+        console.print("[dim]No backups yet.[/dim]")
+        return
+
+    table = Table(title="State DB Backups")
+    table.add_column("ID", style="bold")
+    table.add_column("Timestamp")
+    table.add_column("Trigger")
+    table.add_column("Size")
+    table.add_column("Projects", justify="right")
+    table.add_column("Note", style="dim")
+    for b in backups:
+        table.add_row(
+            b.backup_id, b.timestamp, b.trigger,
+            _human_size(b.state_db_size),
+            str(b.project_count),
+            b.note or "",
+        )
+    console.print(table)
+    console.print(f"[dim]{len(backups)} backup(s). "
+                  f"Root: {settings.state_db.rsplit('/', 1)[0] if '/' in settings.state_db else '.'}/backups[/dim]")
+
+
+@backup_app.command("create")
+def backup_create(
+    note: str = typer.Option("", "--note", "-n", help="Optional description to store in the manifest."),
+):
+    """Take a manual snapshot of the state DB right now."""
+    from ragtools.backup import backup_state_db, prune_backups
+
+    settings = _get_settings()
+    target = backup_state_db(settings, trigger="manual", note=note)
+    if target is None:
+        console.print("[yellow]No backup taken — state DB does not exist yet, or backup failed.[/yellow]")
+        raise typer.Exit(1)
+    prune_backups(settings)
+    console.print(f"[green]Backup created:[/green] {target.name}")
+
+
+@backup_app.command("prune")
+def backup_prune(
+    keep: int = typer.Option(None, "--keep", help="Retain this many most-recent backups. Defaults to settings.backup_keep."),
+):
+    """Delete older backups, keeping only the most recent ones."""
+    from ragtools.backup import prune_backups
+
+    settings = _get_settings()
+    deleted = prune_backups(settings, keep=keep)
+    if deleted:
+        console.print(f"[green]Pruned {deleted} old backup(s).[/green]")
+    else:
+        console.print("[dim]Nothing to prune.[/dim]")
+
+
+@backup_app.command("restore")
+def backup_restore(
+    backup_id: str = typer.Argument(..., help="Backup directory name (from `rag backup list`)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+):
+    """Restore the state DB from a previous backup.
+
+    A pre-restore safety snapshot is taken automatically so the restore
+    itself is reversible.
+    """
+    from ragtools.backup import restore_backup
+
+    settings = _get_settings()
+    if not yes:
+        typer.confirm(
+            f"Restore state DB from backup '{backup_id}'? "
+            "A safety snapshot of the current DB will be taken first.",
+            abort=True,
+        )
+    try:
+        safety = restore_backup(settings, backup_id)
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]Restored from:[/green] {backup_id}")
+    if safety:
+        console.print(f"[dim]Safety snapshot saved as:[/dim] {safety.name}")
+
+
+# --- Tray commands ---
+
+
+@tray_app.callback(invoke_without_command=True)
+def tray_default(ctx: typer.Context):
+    """When ``rag tray`` is called without a subcommand, run the tray."""
+    if ctx.invoked_subcommand is not None:
+        return
+    # Delegate to the run subcommand so the two paths share code.
+    tray_run()
+
+
+@tray_app.command("run")
+def tray_run():
+    """Start the system-tray icon in the foreground (blocks until quit)."""
+    settings = _get_settings()
+    try:
+        from ragtools.tray import TrayApp
+    except Exception as e:
+        console.print(f"[red]Failed to import tray module:[/red] {e}")
+        raise typer.Exit(2)
+    app_instance = TrayApp(settings=settings)
+    rc = app_instance.run()
+    raise typer.Exit(code=rc)
+
+
+@tray_app.command("install")
+def tray_install():
+    """Register the tray to start on Windows login."""
+    if sys.platform != "win32":
+        console.print("[yellow]Tray autostart is Windows-only for now.[/yellow]")
+        console.print("On macOS/Linux, run `rag tray` manually or use your DE's autostart.")
+        raise typer.Exit(0)
+
+    from ragtools.service.tray_startup import install_tray_task, TRAY_STARTUP_FILENAME
+
+    settings = _get_settings()
+    try:
+        if install_tray_task(settings):
+            console.print("[green]Tray autostart installed.[/green]")
+            console.print(f"  Script: {TRAY_STARTUP_FILENAME} in the Startup folder")
+            console.print("  Trigger: at user login (silent — no console window)")
+            console.print("\nStarts automatically on next login. "
+                          "Run [bold]rag tray[/bold] to launch it right now.")
+        else:
+            console.print("[red]Tray install failed.[/red]")
+            raise typer.Exit(1)
+    except RuntimeError as e:
+        console.print(f"[red]Install failed:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@tray_app.command("uninstall")
+def tray_uninstall():
+    """Remove the tray from Windows login autostart."""
+    from ragtools.service.tray_startup import uninstall_tray_task
+
+    if uninstall_tray_task():
+        console.print("[green]Tray autostart removed (or was not installed).[/green]")
+    else:
+        console.print("[red]Tray uninstall failed.[/red]")
+        raise typer.Exit(1)
+
+
+@tray_app.command("status")
+def tray_status():
+    """Show whether the tray autostart script is registered and if a tray is running."""
+    from ragtools.service.tray_startup import (
+        TRAY_STARTUP_FILENAME,
+        _startup_script_path,
+        is_tray_task_installed,
+    )
+
+    table = Table(title="Tray")
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+
+    if sys.platform != "win32":
+        table.add_row("Platform", "[yellow]non-Windows — autostart unsupported[/yellow]")
+        console.print(table)
+        return
+
+    if is_tray_task_installed():
+        table.add_row("Autostart", "[green]Installed[/green]")
+        table.add_row("Script", str(_startup_script_path()))
+    else:
+        table.add_row("Autostart", "[yellow]Not installed[/yellow]")
+        table.add_row("Fix", "rag tray install")
+
+    # Is a tray currently running?
+    settings = _get_settings()
+    from ragtools.tray import _tray_pid_path
+    from ragtools.service.process import _process_alive
+
+    pid_file = _tray_pid_path(settings)
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if _process_alive(pid):
+                table.add_row("Running", f"[green]PID {pid}[/green]")
+            else:
+                table.add_row("Running", "[dim]No (stale PID file)[/dim]")
+        except Exception:
+            table.add_row("Running", "[dim]No (unreadable PID file)[/dim]")
+    else:
+        table.add_row("Running", "[dim]No[/dim]")
+    console.print(table)
+
+
 # --- Helpers ---
 
 
@@ -758,5 +1321,98 @@ def _print_index_stats(stats: dict, full: bool, elapsed: float) -> None:
     console.print(table)
 
 
+@wiki_app.command("sync", help="Generate a wiki update plan covering changes since a release baseline.")
+def wiki_sync(
+    since_tag: str = typer.Option(None, "--since-tag", help="Explicit baseline tag (e.g. v2.4.2). Overrides auto-detection."),
+    until_ref: str = typer.Option("HEAD", "--until-ref", help="End of the range (default HEAD)."),
+    wiki_src: Path = typer.Option(Path("docs/wiki-src"), "--wiki-src", help="Path to the wiki source tree."),
+    output: Path = typer.Option(None, "--output", help="Write report to this file (overrides --create-report)."),
+    format_: str = typer.Option("markdown", "--format", help="markdown | json | both"),
+    create_report: bool = typer.Option(False, "--create-report", help="Write report under tasks/wiki-sync-reports/ with baseline-to-HEAD in the filename."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print summary to stdout only; no file writes."),
+):
+    """Post-release helper: enumerate everything that changed since the last documented
+    baseline and map it to a GitHub Wiki update plan."""
+    from ragtools.wiki_sync import run_sync
+    import json as _json
+
+    if format_ not in {"markdown", "json", "both"}:
+        console.print(f"[red]--format must be one of: markdown, json, both[/red] (got {format_!r})")
+        raise typer.Exit(2)
+
+    repo_root = Path.cwd()
+    wiki_src_abs = wiki_src if wiki_src.is_absolute() else (repo_root / wiki_src).resolve()
+
+    try:
+        baseline, commits, md, data = run_sync(repo_root, since_tag, until_ref, wiki_src_abs)
+    except RuntimeError as e:
+        console.print(f"[red]wiki sync failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(f"[bold]Baseline:[/bold] {baseline.ref} ([dim]{baseline.reason}[/dim])")
+    console.print(f"[bold]Commits analyzed:[/bold] {len(commits)}")
+    console.print(f"[bold]Wiki source:[/bold] {wiki_src_abs}")
+
+    if dry_run:
+        console.print("\n[yellow]--dry-run set; skipping file writes.[/yellow]")
+        if format_ in {"markdown", "both"}:
+            console.print("\n--- markdown report ---\n")
+            console.print(md)
+        if format_ in {"json", "both"}:
+            console.print("\n--- json report ---\n")
+            console.print(_json.dumps(data, indent=2))
+        return
+
+    target_dir: Path
+    if output:
+        out_path = output if output.is_absolute() else (repo_root / output).resolve()
+        md_path = out_path if format_ != "json" else None
+        json_path = out_path.with_suffix(".json") if format_ == "both" else (out_path if format_ == "json" else None)
+        target_dir = out_path.parent
+    elif create_report:
+        target_dir = repo_root / "tasks" / "wiki-sync-reports"
+        stem = f"{_slug(baseline.ref)}-to-{_slug(until_ref)}"
+        md_path = target_dir / f"{stem}.md"
+        json_path = target_dir / f"{stem}.json"
+    else:
+        if format_ in {"markdown", "both"}:
+            console.print("\n--- markdown report ---\n")
+            console.print(md)
+        if format_ in {"json", "both"}:
+            console.print("\n--- json report ---\n")
+            console.print(_json.dumps(data, indent=2))
+        return
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    if format_ in {"markdown", "both"} and md_path is not None:
+        md_path.write_text(md, encoding="utf-8")
+        written.append(md_path)
+    if format_ in {"json", "both"} and json_path is not None:
+        json_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+        written.append(json_path)
+
+    for p in written:
+        console.print(f"[green]Wrote:[/green] {p}")
+
+
+def _slug(ref: str) -> str:
+    return "".join(c if c.isalnum() else "-" for c in ref).strip("-") or "ref"
+
+
+def _main() -> None:
+    """Entry point that disables Click's Windows glob expansion.
+
+    Click 8+ auto-expands arguments containing *, ?, or [ on Windows because
+    cmd.exe historically did not glob. None of rag's commands expect
+    shell-expanded arg lists, and `rag project add-from-glob` specifically
+    needs the pattern to arrive intact. Disable the auto-expansion so the
+    pattern survives to our own glob.glob() call.
+    """
+    import typer.main as _tm
+    cmd = _tm.get_command(app)
+    cmd.main(windows_expand_args=False)
+
+
 if __name__ == "__main__":
-    app()
+    _main()
