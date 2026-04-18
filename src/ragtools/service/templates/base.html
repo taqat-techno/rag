@@ -30,6 +30,13 @@
     </aside>
 
     <div class="main-content">
+        <!-- Crash banner: populated on every page load from /api/crash-history.
+             Stays hidden if there are no unreviewed crash markers. -->
+        <div id="crash-banner-slot"
+             hx-get="/ui/crash-banner"
+             hx-trigger="load"
+             hx-swap="innerHTML"></div>
+
         <div class="content-header">
             {% block header %}{% endblock %}
         </div>

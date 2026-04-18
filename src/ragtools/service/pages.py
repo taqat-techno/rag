@@ -587,6 +587,75 @@ def ui_activity(after: int = Query(0)):
     return f'<div data-latest-id="{latest_id}">' + "".join(rows) + "</div>"
 
 
+# --- Crash banner fragment ---
+
+
+@page_router.get("/ui/crash-banner", response_class=HTMLResponse)
+def ui_crash_banner():
+    """HTML fragment for the crash banner. Empty string if no unreviewed
+    crashes are present, which leaves the banner slot collapsed.
+    """
+    from ragtools.service.crash_history import list_unreviewed_crashes
+    items = list_unreviewed_crashes(get_settings())
+    if not items:
+        return ""
+
+    blocks = []
+    for item in items:
+        kind = item.get("kind", "service_crash")
+        dismiss_key = item.get("dismiss_key", kind)
+        timestamp = item.get("timestamp", "unknown time")
+
+        if kind == "supervisor_gave_up":
+            title = "Supervisor stopped restarting the service"
+            short = item.get("reason", "Too many crashes in a short window.")
+            full_detail = item.get("reason", "")
+        elif kind == "watcher_gave_up":
+            title = "File watcher stopped — changes are no longer being indexed"
+            retries = item.get("retries", "?")
+            error = item.get("error", "")
+            short = (
+                f"Watcher exhausted {retries} restart attempts. "
+                f"Use Rebuild or restart the service to recover."
+            )
+            full_detail = error
+        else:
+            title = "The service crashed in the previous session"
+            exc_type = item.get("exception_type", "Exception")
+            message = item.get("message", "")
+            short = f"{exc_type}: {message}" if message else exc_type
+            full_detail = item.get("traceback") or ""
+
+        details_html = ""
+        if full_detail:
+            details_html = f"""
+            <details class="crash-banner-details">
+                <summary>Full details</summary>
+                <pre>{escape(full_detail)}</pre>
+            </details>
+            """
+
+        blocks.append(f"""
+        <div class="crash-banner" role="alert"
+             id="crash-banner-{escape(dismiss_key)}">
+            <div class="crash-banner-head">
+                <strong class="crash-banner-title">{escape(title)}</strong>
+                <span class="crash-banner-time">{escape(timestamp)}</span>
+                <button class="crash-banner-dismiss"
+                        title="Mark reviewed"
+                        hx-post="/api/crash-history/{escape(dismiss_key)}/dismiss"
+                        hx-target="#crash-banner-{escape(dismiss_key)}"
+                        hx-swap="outerHTML"
+                        hx-disabled-elt="this">&times;</button>
+            </div>
+            <div class="crash-banner-msg">{escape(short)}</div>
+            {details_html}
+        </div>
+        """)
+
+    return "\n".join(blocks)
+
+
 # --- Config save fragment ---
 
 
@@ -600,6 +669,7 @@ def ui_config_save(
     log_level: str = Form(None),
     startup_open_browser: str = Form(None),
     startup_delay: int = Form(None),
+    desktop_notifications: str = Form(None),
 ):
     """Save general settings via the UI."""
     try:
@@ -617,6 +687,10 @@ def ui_config_save(
             payload["service_port"] = service_port
         if log_level is not None and log_level.strip():
             payload["log_level"] = log_level.strip()
+        # Unchecked HTML checkboxes aren't sent at all, so a missing value
+        # means "off" — we must record False explicitly so the toggle can
+        # ever be disabled.
+        payload["desktop_notifications"] = (desktop_notifications == "true")
 
         # Startup settings — save to TOML [startup] section
         startup_changed = False

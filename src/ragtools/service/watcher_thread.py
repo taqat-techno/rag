@@ -7,9 +7,11 @@ Supports two modes:
 Uses the QdrantOwner's shared client instead of creating its own.
 """
 
+import json
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from watchfiles import watch, Change
@@ -58,12 +60,42 @@ class WatcherThread(threading.Thread):
                 if retries > self._MAX_RETRIES:
                     logger.error("Watcher giving up after %d failures: %s", retries, e)
                     log_activity("error", "watcher", f"Watcher stopped after {retries} failures: {e}")
+                    # Persist a marker + fire a toast so the user finds out
+                    # immediately instead of discovering stale search results
+                    # hours later. Both ops are best-effort.
+                    self._record_give_up(retries, e)
                     break
                 backoff = self._BASE_BACKOFF * (2 ** (retries - 1))
                 logger.warning("Watcher crashed (attempt %d/%d), restarting in %ds: %s",
                                retries, self._MAX_RETRIES, backoff, e)
                 log_activity("warning", "watcher", f"Watcher crashed, restarting in {backoff}s (attempt {retries})")
                 self._stop_event.wait(backoff)  # Sleep but respect stop signal
+
+    def _record_give_up(self, retries: int, exc: Exception) -> None:
+        """Persist a crash-banner marker and dispatch a desktop toast.
+
+        Symmetric with the supervisor's ``_write_gave_up_marker``. Both
+        operations are wrapped in try/except — this method runs from the
+        watcher's error path and must never raise.
+        """
+        try:
+            logs_dir = Path(self._settings.state_db).parent / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            marker = logs_dir / "watcher_gave_up.json"
+            marker.write_text(json.dumps({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "retries": retries,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }, indent=2))
+        except Exception as mark_err:
+            logger.warning("Could not write watcher_gave_up marker: %s", mark_err)
+
+        try:
+            from ragtools.service.notify import notify_watcher_gave_up
+            notify_watcher_gave_up(self._settings, error=str(exc), retries=retries)
+        except Exception as notify_err:
+            logger.warning("Could not send watcher toast: %s", notify_err)
 
     def _run_multi_root(self, log_activity):
         """Watch multiple explicit project directories (v2 mode)."""
