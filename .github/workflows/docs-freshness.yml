@@ -11,7 +11,7 @@ on:
         required: false
         default: '1'
   push:
-    branches: [main]
+    branches: [master, main]
     paths:
       - '.github/workflows/docs-freshness.yml'
 
