@@ -35,7 +35,69 @@ from ragtools.retrieval.searcher import Searcher
 # Batch size for windowed lock release during indexing
 _INDEX_BATCH_SIZE = 30
 
+# Qdrant local-mode scale thresholds. Qdrant's own guidance recommends
+# against local mode above 20,000 points. We warn earlier (at 15,000) so
+# users see the signal before it bites.
+_QDRANT_LOCAL_SOFT_WARN = 15_000
+_QDRANT_LOCAL_HARD_WARN = 20_000
+
 logger = logging.getLogger("ragtools.service")
+
+
+def compute_scale_warning(points_count: int) -> dict:
+    """Return a structured scale-warning record for a given collection size.
+
+    Levels:
+      - ok        (< 15,000 points): no action required
+      - approaching (15,000 - 19,999): user should start pruning or plan migration
+      - over      (>= 20,000): past Qdrant's own local-mode recommendation
+
+    The record is attached to /api/status so the admin panel and `rag doctor`
+    can surface the signal. Pure function — no side effects, easy to unit-test.
+    """
+    if points_count >= _QDRANT_LOCAL_HARD_WARN:
+        level = "over"
+        message = (
+            f"Collection has {points_count:,} points, which is above Qdrant's "
+            f"recommended local-mode limit of {_QDRANT_LOCAL_HARD_WARN:,}. "
+            "Search latency and memory use may degrade. Consider pruning the "
+            "index or migrating Qdrant to server mode."
+        )
+    elif points_count >= _QDRANT_LOCAL_SOFT_WARN:
+        level = "approaching"
+        message = (
+            f"Collection has {points_count:,} points, approaching the local-mode "
+            f"limit of {_QDRANT_LOCAL_HARD_WARN:,}. Review ignore_patterns "
+            "for large generated files and consider archiving completed projects."
+        )
+    else:
+        level = "ok"
+        message = ""
+
+    return {
+        "level": level,
+        "points_count": points_count,
+        "soft_limit": _QDRANT_LOCAL_SOFT_WARN,
+        "hard_limit": _QDRANT_LOCAL_HARD_WARN,
+        "message": message,
+    }
+
+
+def _log_scale_warning_once(points_count: int) -> None:
+    """Log the scale warning at service/index-complete time.
+
+    Kept separate from compute_scale_warning (pure) so the pure function
+    remains test-friendly and this logging side-effect stays isolated.
+    """
+    record = compute_scale_warning(points_count)
+    if record["level"] == "over":
+        logger.warning(
+            "[scale=over] %s", record["message"],
+        )
+    elif record["level"] == "approaching":
+        logger.info(
+            "[scale=approaching] %s", record["message"],
+        )
 
 
 class QdrantOwner:
@@ -91,6 +153,7 @@ class QdrantOwner:
         self,
         query: str,
         project_id: str | None = None,
+        project_ids: list[str] | None = None,
         top_k: int | None = None,
         score_threshold: float | None = None,
     ) -> list[SearchResult]:
@@ -104,6 +167,7 @@ class QdrantOwner:
             return searcher.search(
                 query=query,
                 project_id=project_id,
+                project_ids=project_ids,
                 top_k=top_k,
                 score_threshold=score_threshold,
             )
@@ -112,11 +176,12 @@ class QdrantOwner:
         self,
         query: str,
         project_id: str | None = None,
+        project_ids: list[str] | None = None,
         top_k: int | None = None,
         compact: bool = False,
     ) -> dict:
         """Search and return both raw results and formatted context."""
-        results = self.search(query, project_id, top_k)
+        results = self.search(query, project_id, project_ids=project_ids, top_k=top_k)
         if compact:
             from ragtools.retrieval.formatter import format_context_compact
             formatted = format_context_compact(results, query)
@@ -221,6 +286,8 @@ class QdrantOwner:
         logger.info("Full index: %d files, %d chunks", stats["files_indexed"], stats["chunks_indexed"])
         log_activity("success", "indexer",
                      f"Full index: {stats['files_indexed']} files, {stats['chunks_indexed']} chunks")
+        # Surface a scale warning into logs (and via /api/status) if applicable.
+        self._emit_scale_warning_after_index(log_activity)
         return stats
 
     def run_incremental_index(self, project_id: str | None = None) -> dict:
@@ -326,12 +393,22 @@ class QdrantOwner:
         from ragtools.service.activity import log_activity
         log_activity("success", "indexer",
                      f"Incremental: {stats['indexed']} indexed, {stats['skipped']} skipped, {stats['deleted']} deleted")
+        self._emit_scale_warning_after_index(log_activity)
         return stats
 
     def rebuild(self) -> dict:
         """Drop all data and rebuild from scratch. Thread-safe."""
         with self._lock:
             state_path = Path(self._settings.state_db)
+
+            # Snapshot the state DB before we drop it. Best-effort — failures
+            # here must not block the rebuild itself (disk full, etc.).
+            try:
+                from ragtools.backup import backup_state_db, prune_backups
+                backup_state_db(self._settings, trigger="rebuild")
+                prune_backups(self._settings)
+            except Exception as e:
+                logger.warning("Pre-rebuild backup failed (non-fatal): %s", e)
 
             # Force-drop and recreate collection (clean slate)
             recreate_collection(self._client, self._settings.collection_name, self._encoder.dimension)
@@ -398,8 +475,46 @@ class QdrantOwner:
             return {
                 "points_count": points_count,
                 "collection_name": self._settings.collection_name,
+                "scale": compute_scale_warning(points_count),
                 **summary,
             }
+
+    def _emit_scale_warning_after_index(self, log_activity) -> None:
+        """Check current collection size and surface a scale warning if needed.
+
+        Called at the end of run_full_index / run_incremental_index so the
+        signal appears in the activity log next to the index result, and
+        again through the normal logger at WARNING level for service.log.
+        Safe to call without the RLock held as callers already hold it.
+        """
+        try:
+            info = self._client.get_collection(self._settings.collection_name)
+            points_count = info.points_count
+        except Exception:
+            return
+
+        record = compute_scale_warning(points_count)
+        if record["level"] == "over":
+            logger.warning("[scale=over] %s", record["message"])
+            log_activity("warning", "indexer", record["message"])
+            self._notify_scale_warning("over", record["message"])
+        elif record["level"] == "approaching":
+            logger.info("[scale=approaching] %s", record["message"])
+            log_activity("info", "indexer", record["message"])
+            self._notify_scale_warning("approaching", record["message"])
+
+    def _notify_scale_warning(self, level: str, message: str) -> None:
+        """Fire a desktop toast for the scale warning. Best-effort; never raises.
+
+        Kept in a separate method so the shared notifier has a single
+        import point and the 1-hour cooldown (defined in notify.py) has a
+        deterministic call path to dedupe against.
+        """
+        try:
+            from ragtools.service.notify import notify_scale_warning
+            notify_scale_warning(self._settings, level=level, message=message)
+        except Exception as e:
+            logger.debug("scale-warning toast failed (non-fatal): %s", e)
 
     def get_projects(self) -> list[dict]:
         """Get indexed projects with counts. Thread-safe."""
@@ -440,10 +555,35 @@ class QdrantOwner:
             from ragtools.service.activity import log_activity
             log_activity("info", "config", f"Projects reloaded: {len(projects)} configured")
 
+    def reindex_project(self, project_id: str) -> dict:
+        """Drop a project's chunks + state rows and re-index from scratch.
+
+        Composes ``delete_project_data`` (which backs up the state DB first)
+        with ``run_full_index(project_id=X)``. The delete step is atomic per
+        project — other projects are untouched.
+        """
+        # The inner calls both grab ``self._lock``; we don't hold it here.
+        deleted = self.delete_project_data(project_id)
+        stats = self.run_full_index(project_id=project_id)
+        return {
+            "project_id": project_id,
+            "deleted_files": deleted.get("files_deleted", 0),
+            **stats,
+        }
+
     def delete_project_data(self, project_id: str) -> dict:
         """Delete all indexed data for a project from Qdrant and state DB. Thread-safe."""
         with self._lock:
             from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+            # Snapshot the state DB before wiping this project's rows.
+            try:
+                from ragtools.backup import backup_state_db, prune_backups
+                backup_state_db(self._settings, trigger="project_remove",
+                                note=f"project={project_id}")
+                prune_backups(self._settings)
+            except Exception as e:
+                logger.warning("Pre-remove backup failed (non-fatal): %s", e)
 
             # Delete from Qdrant (all chunks with this project_id)
             try:

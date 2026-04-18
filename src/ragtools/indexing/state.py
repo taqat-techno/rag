@@ -2,12 +2,28 @@
 
 Tracks which files have been indexed, their content hashes, and chunk counts.
 Used by the indexer to detect new, changed, unchanged, and deleted files.
+
+Schema is versioned via SQLite's built-in PRAGMA user_version so that future
+releases can detect incompatible state DBs and migrate or refuse them safely
+rather than silently corrupting user data.
 """
 
 import hashlib
+import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger("ragtools.indexing.state")
+
+# Current expected schema version for this codebase.
+# Bump this whenever the table structure changes and add a migration step
+# in _migrate_schema() below.
+SCHEMA_VERSION = 1
+
+
+class StateSchemaError(RuntimeError):
+    """Raised when the on-disk state DB has an incompatible schema version."""
 
 
 class IndexState:
@@ -33,7 +49,49 @@ class IndexState:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_file_state_project_id ON file_state(project_id)"
         )
+        self._migrate_schema()
         self.conn.commit()
+
+    def _migrate_schema(self) -> None:
+        """Check and migrate the SQLite schema version.
+
+        Behavior:
+          - Fresh DB (user_version=0): stamp it with SCHEMA_VERSION.
+          - DB at current SCHEMA_VERSION: no-op.
+          - DB at older SCHEMA_VERSION: run migrations up to SCHEMA_VERSION.
+          - DB at newer SCHEMA_VERSION (downgrade): raise StateSchemaError
+            so the installer/service can tell the user to either upgrade
+            the app back or rebuild via `rag rebuild`.
+        """
+        current = self.conn.execute("PRAGMA user_version").fetchone()[0]
+
+        if current == 0:
+            # Fresh DB or pre-versioning install: stamp current version.
+            self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            return
+
+        if current == SCHEMA_VERSION:
+            return
+
+        if current > SCHEMA_VERSION:
+            raise StateSchemaError(
+                f"Index state DB at {self.db_path} is schema version {current}, "
+                f"but this app only supports up to version {SCHEMA_VERSION}. "
+                f"You appear to have downgraded RAG Tools. "
+                f"Either upgrade the app back to the newer version, or run "
+                f"`rag rebuild` to recreate the state DB from scratch."
+            )
+
+        # Future: per-version upward migration steps go here.
+        # while current < SCHEMA_VERSION:
+        #     current += 1
+        #     _migrate_to_vN(self.conn, current)
+        logger.warning(
+            "Index state DB at %s is at schema version %d; migrating forward "
+            "to %d.",
+            self.db_path, current, SCHEMA_VERSION,
+        )
+        self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def get(self, file_path: str) -> dict | None:
         """Get the state record for a file, or None if not tracked."""
@@ -84,6 +142,28 @@ class IndexState:
             "SELECT * FROM file_state WHERE project_id = ?", (project_id,)
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_project_summary(self, project_id: str) -> dict:
+        """Return file-count, chunk-count, last-indexed for one project."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS files, COALESCE(SUM(chunk_count), 0) AS chunks, "
+            "MAX(last_indexed) AS last FROM file_state WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        return {
+            "files":        row["files"] if row else 0,
+            "chunks":       row["chunks"] if row else 0,
+            "last_indexed": row["last"] if row else None,
+        }
+
+    def get_top_files_by_chunks(self, project_id: str, limit: int = 10) -> list[dict]:
+        """Return the ``limit`` files with the highest chunk counts in a project."""
+        rows = self.conn.execute(
+            "SELECT file_path, chunk_count FROM file_state "
+            "WHERE project_id = ? ORDER BY chunk_count DESC LIMIT ?",
+            (project_id, int(limit)),
+        ).fetchall()
+        return [{"file_path": r["file_path"], "chunks": r["chunk_count"]} for r in rows]
 
     def get_summary(self) -> dict:
         """Get a summary of the index state.
