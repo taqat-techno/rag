@@ -69,22 +69,29 @@ def get_data_dir() -> Path:
     Packaged/installed mode:
       Windows: %LOCALAPPDATA%/RAGTools
       macOS:   ~/Library/Application Support/RAGTools
-    Dev mode: ./data (relative to CWD)
+    Dev mode (not frozen): ./data (relative to CWD)
+
+    Dev mode NEVER returns the installed-app directory, even if it exists.
+    This prevents the source checkout from silently mounting installed data.
     """
     explicit = os.environ.get("RAG_DATA_DIR")
     if explicit:
         return Path(explicit)
 
-    app_dir = _get_app_dir()
-    if app_dir and (is_packaged() or app_dir.exists()):
-        app_dir.mkdir(parents=True, exist_ok=True)
-        return app_dir
+    if is_packaged():
+        app_dir = _get_app_dir()
+        if app_dir:
+            app_dir.mkdir(parents=True, exist_ok=True)
+            return app_dir
 
     return Path("data").resolve()
 
 
 def _find_config_path() -> Path | None:
-    """Resolve TOML config file location. Returns None if no config file exists."""
+    """Resolve TOML config file location. Returns None if no config file exists.
+
+    Dev mode (not frozen) does NOT read the installed app's config.toml.
+    """
     explicit = os.environ.get("RAG_CONFIG_PATH")
     if explicit:
         p = Path(explicit)
@@ -92,11 +99,12 @@ def _find_config_path() -> Path | None:
             return p
         return None
 
-    app_dir = _get_app_dir()
-    if app_dir:
-        installed = app_dir / "config.toml"
-        if installed.is_file():
-            return installed
+    if is_packaged():
+        app_dir = _get_app_dir()
+        if app_dir:
+            installed = app_dir / "config.toml"
+            if installed.is_file():
+                return installed
 
     dev = Path("ragtools.toml")
     if dev.is_file():
@@ -194,6 +202,11 @@ def _default_state_db() -> str:
     return "data/index_state.db"
 
 
+def _default_service_port() -> int:
+    """Installed app uses 21420; dev/source mode uses 21421 to avoid port collision."""
+    return 21420 if is_packaged() else 21421
+
+
 # --- Settings ---
 
 
@@ -232,13 +245,55 @@ class Settings(BaseSettings):
 
     # Service
     service_host: str = "127.0.0.1"
-    service_port: int = 21420
+    service_port: int = Field(default_factory=_default_service_port)
     log_level: str = "INFO"
 
     # Startup
     startup_enabled: bool = False
     startup_delay: int = 30
     startup_open_browser: bool = False
+
+    # Notifications
+    desktop_notifications: bool = True
+    notification_cooldown_seconds: float = 30.0
+
+    # Backups of the SQLite state DB (taken before destructive operations).
+    backup_keep: int = 10
+
+    # Per-tool access control for the MCP server.
+    # Core tools (search_knowledge_base, list_projects, index_status) are always
+    # registered regardless of this dict — they define the product. Optional
+    # tools split by tier:
+    #   - Project tools (inspection + maintenance) default ON — this is the
+    #     main agent workflow tier for "I'm working on project X" workflows.
+    #     Writes have per-tool guards (confirm_token, cooldowns).
+    #   - Debugging / diagnostics default OFF — operator-facing tools that
+    #     would only distract an agent doing content work. User grants per-tool
+    #     when troubleshooting.
+    # Disabled tools are not registered, so they're invisible to the agent and
+    # cost zero tokens.
+    mcp_tools: dict[str, bool] = Field(default_factory=lambda: {
+        # Project tools — enabled by default (primary agent workflow tier)
+        "project_status":           True,
+        "project_summary":          True,
+        "list_project_files":       True,
+        "get_project_ignore_rules": True,
+        "preview_ignore_effect":    True,
+        "run_index":                True,
+        "reindex_project":          True,
+        "add_project_ignore_rule":  True,
+        "remove_project_ignore_rule": True,
+        # Debugging / diagnostics — disabled by default (opt-in for operators)
+        "service_status":           False,
+        "recent_activity":          False,
+        "tail_logs":                False,
+        "crash_history":            False,
+        "get_config":               False,
+        "get_ignore_rules":         False,
+        "get_paths":                False,
+        "system_health":            False,
+        "list_indexed_paths":       False,
+    })
 
     model_config = {"env_prefix": "RAG_", "env_file": ".env", "env_file_encoding": "utf-8"}
 

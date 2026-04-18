@@ -34,6 +34,55 @@
 </div>
 
 <div class="card">
+    <div class="card-header">MCP Tool Access</div>
+    <p style="font-size:13px; color:var(--color-text-secondary); margin:0 0 14px;">
+        Control which optional tools the RAG Tools MCP server exposes to Claude Code.
+        Disabled tools are not registered — the agent never sees them.
+        <strong>Core tools (search_knowledge_base, list_projects, index_status)</strong> are always available.
+    </p>
+    <div id="mcp-tools-grid">
+        <!-- populated by JS from /api/config.mcp_tools — grouped by purpose -->
+    </div>
+    <div style="margin-top:14px; padding:10px 14px; background:var(--color-warning-bg, #fff8e1); border-left:3px solid var(--color-warning, #f59e0b); border-radius:4px; font-size:13px;">
+        <strong>⚠ Restart Claude Code for changes to take effect.</strong>
+        The MCP server reads this setting once at startup — toggles here only apply to the next connection.
+    </div>
+    <div style="margin-top:14px; display:flex; gap:12px; align-items:center;">
+        <button type="button" id="mcp-tools-save" class="btn btn-primary btn-sm">Save MCP Tool Access</button>
+        <span id="mcp-tools-result" style="font-size:12px;"></span>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">Notifications</div>
+    <div class="grid-2">
+        <div>
+            <div class="form-group">
+                <label class="form-label">
+                    <input type="checkbox" name="desktop_notifications" id="cfg-desktop-notifications" value="true">
+                    Show desktop toast when the service crashes
+                </label>
+                <small style="color:var(--color-text-muted); display:block; margin-top:4px;">
+                    Alerts you immediately on Windows, even if the admin panel is closed.
+                </small>
+            </div>
+        </div>
+        <div>
+            <div class="form-group" style="margin-top:4px;">
+                <button type="button" class="btn btn-secondary btn-sm"
+                        hx-post="/api/notifications/test"
+                        hx-target="#notif-test-result"
+                        hx-swap="innerHTML"
+                        hx-disabled-elt="this">
+                    Send test notification
+                </button>
+                <span id="notif-test-result" style="margin-left:10px; font-size:12px;"></span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
     <div class="card-header">Service &amp; Startup</div>
     <div class="grid-2">
         <div>
@@ -75,6 +124,65 @@
 </form>
 
 <script>
+// Short human-facing descriptions for each optional MCP tool.
+var MCP_TOOL_DESCRIPTIONS = {
+    // Diagnostics
+    service_status:           "Live service state + watcher, scale, mode",
+    recent_activity:          "Structured activity-log slice",
+    tail_logs:                "Read last N lines of whitelisted logs",
+    crash_history:            "Unreviewed service / supervisor / watcher crash markers",
+    get_config:               "Current RAG Tools configuration",
+    get_ignore_rules:         "Built-in + config + .ragignore patterns",
+    get_paths:                "Absolute paths: data dir, logs, backups, PIDs",
+    system_health:            "JSON form of 'rag doctor'",
+    list_indexed_paths:       "All files currently recorded in the state DB",
+    // Project inspection
+    project_status:           "One-call overview of a specific project",
+    project_summary:          "Top files by chunk count for a project",
+    list_project_files:       "Files indexed for one project",
+    get_project_ignore_rules: "Ignore rules effective for a specific project",
+    preview_ignore_effect:    "Dry-run which files a pattern would exclude",
+    // Project-scoped writes — marked with ✎ for clarity
+    run_index:                   "✎ WRITE · Run incremental index for one project (idempotent)",
+    reindex_project:             "✎ WRITE · Drop & rebuild one project's index (confirm_token required)",
+    add_project_ignore_rule:     "✎ WRITE · Add an ignore pattern to a project",
+    remove_project_ignore_rule: "✎ WRITE · Remove an ignore pattern from a project"
+};
+
+// Grouped view. Order + default state matches Settings.mcp_tools:
+//   1. Project tools (reads + maintenance) — ENABLED by default
+//   2. Debugging / diagnostics — DISABLED by default
+// The ``defaultOn`` flag is informational only — actual state comes from the
+// saved config; we just use it to render the right helper text per group.
+var MCP_TOOL_GROUPS = [
+    {
+        id: "project",
+        title: "Project tools",
+        summary: "Inspection (read-only) plus maintenance (writes) for working on a specific project. " +
+                 "Enabled by default — this is the primary agent workflow tier. " +
+                 "Write tools are guarded (confirm_token, per-tool cooldowns).",
+        defaultOn: true,
+        tools: [
+            // Reads first — orientation / inspection
+            "project_status", "project_summary", "list_project_files",
+            "get_project_ignore_rules", "preview_ignore_effect",
+            // Writes — guarded per-tool
+            "run_index", "reindex_project",
+            "add_project_ignore_rule", "remove_project_ignore_rule",
+        ],
+    },
+    {
+        id: "debug",
+        title: "Debugging / diagnostics",
+        summary: "Disabled by default — enable individually when you're troubleshooting the RAG service itself. " +
+                 "These tools are operator-facing and would distract an agent doing content work.",
+        defaultOn: false,
+        tools: ["service_status", "recent_activity", "tail_logs", "crash_history",
+                "get_config", "get_ignore_rules", "get_paths", "system_health",
+                "list_indexed_paths"],
+    },
+];
+
 fetch('/api/config').then(r => r.json()).then(d => {
     document.getElementById('cfg-chunk-size').value = d.chunk_size;
     document.getElementById('cfg-chunk-overlap').value = d.chunk_overlap;
@@ -84,6 +192,173 @@ fetch('/api/config').then(r => r.json()).then(d => {
     document.getElementById('cfg-log-level').value = d.log_level;
     document.getElementById('cfg-open-browser').checked = d.startup_open_browser || false;
     document.getElementById('cfg-startup-delay').value = d.startup_delay || 30;
+    document.getElementById('cfg-desktop-notifications').checked = d.desktop_notifications !== false;
+
+    // Render MCP tool-access checkboxes, grouped by purpose so users can
+    // grant a whole category at a time and see clearly which tools are
+    // debugging-only vs project-maintenance.
+    var grid = document.getElementById('mcp-tools-grid');
+    var mcp = d.mcp_tools || {};
+    while (grid.firstChild) grid.removeChild(grid.firstChild);
+
+    function mkLabel(name, checked) {
+        var label = document.createElement('label');
+        label.className = 'form-label';
+        label.style.margin = '0';
+        label.style.display = 'flex';
+        label.style.alignItems = 'flex-start';
+        label.style.gap = '8px';
+
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.dataset.tool = name;
+        cb.checked = checked;
+        cb.style.marginTop = '3px';
+
+        var text = document.createElement('div');
+        var codeEl = document.createElement('code');
+        codeEl.textContent = name;
+        codeEl.style.fontSize = '12px';
+        var desc = document.createElement('small');
+        desc.style.display = 'block';
+        desc.style.color = 'var(--color-text-muted)';
+        desc.textContent = MCP_TOOL_DESCRIPTIONS[name] || '';
+        text.appendChild(codeEl);
+        text.appendChild(desc);
+
+        label.appendChild(cb);
+        label.appendChild(text);
+        return label;
+    }
+
+    MCP_TOOL_GROUPS.forEach(function(group) {
+        var section = document.createElement('div');
+        section.className = 'mcp-tool-group';
+        section.dataset.group = group.id;
+        section.style.gridColumn = '1 / -1';           // span full grid width
+        section.style.marginTop = '14px';
+        section.style.paddingTop = '10px';
+        section.style.borderTop = '1px solid var(--color-border, #e5e7eb)';
+
+        var head = document.createElement('div');
+        head.style.display = 'flex';
+        head.style.alignItems = 'center';
+        head.style.justifyContent = 'space-between';
+        head.style.gap = '12px';
+        head.style.marginBottom = '4px';
+
+        var title = document.createElement('strong');
+        title.textContent = group.title;
+        title.style.fontSize = '13px';
+        head.appendChild(title);
+
+        // Per-group "Enable all / Disable all" quick toggle — convenience
+        // for the common "turn on everything in this tier" flow.
+        var toggleAll = document.createElement('button');
+        toggleAll.type = 'button';
+        toggleAll.className = 'btn btn-secondary btn-sm';
+        toggleAll.style.fontSize = '11px';
+        toggleAll.style.padding = '2px 8px';
+        toggleAll.textContent = 'Toggle group';
+        toggleAll.addEventListener('click', function() {
+            var boxes = section.querySelectorAll('input[type=checkbox][data-tool]');
+            // If ALL boxes are checked, uncheck all. Otherwise check all.
+            var allOn = Array.prototype.every.call(boxes, function(b) { return b.checked; });
+            boxes.forEach(function(b) { b.checked = !allOn; });
+        });
+        head.appendChild(toggleAll);
+
+        section.appendChild(head);
+
+        var summary = document.createElement('small');
+        summary.style.display = 'block';
+        summary.style.color = 'var(--color-text-muted)';
+        summary.style.marginBottom = '10px';
+        summary.textContent = group.summary;
+        section.appendChild(summary);
+
+        var gridInner = document.createElement('div');
+        gridInner.style.display = 'grid';
+        gridInner.style.gridTemplateColumns = '1fr 1fr';
+        gridInner.style.gap = '8px 16px';
+        group.tools.forEach(function(name) {
+            // Forward-compat: if a tool is missing from the saved config
+            // (added upstream after last save), inherit the group's default
+            // state instead of silently defaulting to off.
+            var checked = (name in mcp) ? !!mcp[name] : !!group.defaultOn;
+            gridInner.appendChild(mkLabel(name, checked));
+        });
+        section.appendChild(gridInner);
+
+        grid.appendChild(section);
+    });
+});
+
+// Dedicated save handler for MCP tool access — avoids mixing nested dicts
+// into the main form-encoded save.
+document.getElementById('mcp-tools-save').addEventListener('click', function() {
+    var grid = document.getElementById('mcp-tools-grid');
+    var boxes = grid.querySelectorAll('input[type=checkbox][data-tool]');
+    var tools = {};
+    boxes.forEach(function(cb) { tools[cb.dataset.tool] = cb.checked; });
+
+    var out = document.getElementById('mcp-tools-result');
+    while (out.firstChild) out.removeChild(out.firstChild);
+
+    fetch('/api/config', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mcp_tools: tools}),
+    }).then(function(r) {
+        return r.json().then(function(body) { return {status: r.status, body: body}; });
+    }).then(function(result) {
+        var span = document.createElement('span');
+        if (result.status === 200) {
+            span.className = 'notif-test-ok';
+            span.textContent = 'Saved. Restart Claude Code to see the new tool list.';
+        } else {
+            span.className = 'notif-test-warn';
+            span.textContent = 'Save failed: ' + (result.body.detail || JSON.stringify(result.body));
+        }
+        out.appendChild(span);
+        setTimeout(function() {
+            while (out.firstChild) out.removeChild(out.firstChild);
+        }, 6000);
+    }).catch(function(e) {
+        var span = document.createElement('span');
+        span.className = 'notif-test-warn';
+        span.textContent = 'Save failed: ' + e;
+        out.appendChild(span);
+    });
+});
+
+// Render the test-notification response into #notif-test-result using DOM
+// methods (no innerHTML) to keep the XSS-safe-by-construction pattern.
+document.body.addEventListener('htmx:afterRequest', function(evt) {
+    if (!evt.detail.requestConfig || evt.detail.requestConfig.path !== '/api/notifications/test') return;
+    var box = document.getElementById('notif-test-result');
+    if (!box) return;
+    while (box.firstChild) box.removeChild(box.firstChild);
+    var span = document.createElement('span');
+    try {
+        var body = JSON.parse(evt.detail.xhr.responseText);
+        if (body.sent) {
+            span.className = 'notif-test-ok';
+            span.textContent = 'Sent — check your notification center.';
+        } else if (body.reason === 'disabled') {
+            span.className = 'notif-test-muted';
+            span.textContent = 'Notifications are disabled. Enable them above and save first.';
+        } else {
+            span.className = 'notif-test-warn';
+            span.textContent = 'Dispatched, but delivery failed. Check the log.';
+        }
+    } catch (e) {
+        span.textContent = 'Test sent.';
+    }
+    box.appendChild(span);
+    setTimeout(function() {
+        while (box.firstChild) box.removeChild(box.firstChild);
+    }, 6000);
 });
 </script>
 

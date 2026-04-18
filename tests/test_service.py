@@ -158,6 +158,90 @@ def test_config_update_restart_required(test_client, monkeypatch):
         # service_port is restart-only, not hot-reloaded, so no in-memory restore needed
 
 
+def test_config_exposes_desktop_notifications(test_client):
+    r = test_client.get("/api/config")
+    assert r.status_code == 200
+    data = r.json()
+    assert "desktop_notifications" in data
+    assert isinstance(data["desktop_notifications"], bool)
+    assert "notification_cooldown_seconds" in data
+
+
+def test_config_update_toggles_desktop_notifications(test_client, monkeypatch):
+    """The notifications flag must round-trip through PUT /api/config and be
+    visible on the next GET — this is the round-trip the admin-panel checkbox
+    relies on."""
+    import tempfile, os
+    from ragtools.service import app as app_module
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg_path = os.path.join(tmpdir, "test_config.toml")
+        monkeypatch.setenv("RAG_CONFIG_PATH", cfg_path)
+        original = app_module._settings.desktop_notifications
+        try:
+            # Flip the opposite way from the current default so we detect
+            # actual changes, not stale values.
+            target = not original
+            r = test_client.put("/api/config", json={"desktop_notifications": target})
+            assert r.status_code == 200
+            assert "desktop_notifications" in r.json()["updated"]
+
+            r2 = test_client.get("/api/config")
+            assert r2.json()["desktop_notifications"] is target
+        finally:
+            object.__setattr__(app_module._settings, "desktop_notifications", original)
+
+
+# --- Notifications ---
+
+
+def test_notifications_test_skipped_when_disabled(test_client):
+    """If the user has notifications off, the test button must say so and
+    not actually fire a toast — the error would be very confusing."""
+    from ragtools.service import app as app_module
+
+    original = app_module._settings.desktop_notifications
+    try:
+        object.__setattr__(app_module._settings, "desktop_notifications", False)
+        r = test_client.post("/api/notifications/test")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["sent"] is False
+        assert body["reason"] == "disabled"
+    finally:
+        object.__setattr__(app_module._settings, "desktop_notifications", original)
+
+
+def test_notifications_test_dispatches_when_enabled(test_client, monkeypatch):
+    """When enabled, the endpoint must actually invoke the notifier backend.
+
+    We patch default_backend so no OS toast fires during tests but we can
+    still assert the send() call happened with expected title/body.
+    """
+    from ragtools.service import app as app_module
+    from ragtools.service import notify as notify_module
+
+    captured = []
+
+    class CapturingBackend:
+        def send(self, title, message, deep_link=None):
+            captured.append({"title": title, "message": message, "deep_link": deep_link})
+
+    monkeypatch.setattr(notify_module, "default_backend", lambda: CapturingBackend())
+
+    original = app_module._settings.desktop_notifications
+    try:
+        object.__setattr__(app_module._settings, "desktop_notifications", True)
+        r = test_client.post("/api/notifications/test")
+        assert r.status_code == 200
+        assert r.json()["sent"] is True
+        assert len(captured) == 1
+        assert "test" in captured[0]["title"].lower()
+        assert captured[0]["deep_link"].startswith("http://")
+    finally:
+        object.__setattr__(app_module._settings, "desktop_notifications", original)
+
+
 # --- Watcher ---
 
 def test_watcher_status_not_running(test_client):

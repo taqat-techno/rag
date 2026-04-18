@@ -510,6 +510,97 @@ label {
 }
 
 
+/* --- Crash banner --- */
+
+#crash-banner-slot {
+  /* container for banners rendered by /ui/crash-banner; stays collapsed
+     when the endpoint returns an empty string */
+}
+
+.crash-banner {
+  margin: 12px 20px 4px;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-danger, #d93636);
+  background: color-mix(in srgb, var(--color-danger, #d93636) 10%, var(--color-surface, #1f1f1f));
+  color: var(--color-text);
+  box-shadow: var(--shadow-sm);
+}
+
+.crash-banner + .crash-banner {
+  margin-top: 8px;
+}
+
+.crash-banner-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.crash-banner-title {
+  color: var(--color-danger, #d93636);
+  font-size: 14px;
+  letter-spacing: 0.01em;
+}
+
+.crash-banner-time {
+  margin-left: auto;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.crash-banner-dismiss {
+  background: transparent;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: 20px;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.crash-banner-dismiss:hover {
+  color: var(--color-text);
+}
+
+.crash-banner-msg {
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--color-text);
+}
+
+.crash-banner-details {
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.crash-banner-details > summary {
+  cursor: pointer;
+  color: var(--color-text-muted);
+  user-select: none;
+}
+
+.crash-banner-details > summary:hover {
+  color: var(--color-text);
+}
+
+.crash-banner-details pre {
+  margin-top: 8px;
+  padding: 10px 12px;
+  max-height: 320px;
+  overflow: auto;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.4;
+  background: var(--color-bg, #000);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+}
+
+
 /* --- Status Badges --- */
 
 .badge {
@@ -1220,3 +1311,8 @@ details pre {
     left: 0;
   }
 }
+
+/* Notification test-button feedback */
+.notif-test-ok { color: var(--color-success); }
+.notif-test-muted { color: var(--color-text-muted); }
+.notif-test-warn { color: var(--color-warning); }

@@ -34,6 +34,7 @@ class Searcher:
         self,
         query: str,
         project_id: str | None = None,
+        project_ids: list[str] | None = None,
         top_k: int | None = None,
         score_threshold: float | None = None,
     ) -> list[SearchResult]:
@@ -41,7 +42,10 @@ class Searcher:
 
         Args:
             query: Natural language search query.
-            project_id: Optional project filter.
+            project_id: Optional single-project filter.
+            project_ids: Optional multi-project filter (union). Takes precedence
+                when both are provided. Use this for "search across projects
+                A, B, C" without making N separate calls.
             top_k: Number of results (default from config).
             score_threshold: Minimum score (default from config).
 
@@ -53,9 +57,18 @@ class Searcher:
 
         query_vector = self.encoder.encode_query(query)
 
-        # Build filter
+        # Build filter — multi-project takes precedence over single-project.
         query_filter = None
-        if project_id:
+        if project_ids:
+            # Qdrant treats repeated ``should`` clauses as OR. One FieldCondition
+            # per project, all in ``should`` with must-match-one semantics.
+            query_filter = Filter(
+                should=[
+                    FieldCondition(key="project_id", match=MatchValue(value=pid))
+                    for pid in project_ids if pid
+                ]
+            )
+        elif project_id:
             query_filter = Filter(
                 must=[FieldCondition(key="project_id", match=MatchValue(value=project_id))]
             )
