@@ -9,7 +9,7 @@
 ;   iscc installer.iss
 
 #define MyAppName "RAG Tools"
-#define MyAppVersion "2.4.2"
+#define MyAppVersion "2.5.0"
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
 #define MyAppExeName "rag.exe"
@@ -116,18 +116,38 @@ begin
   end;
 end;
 
-// Uninstall: ask about keeping user data
+// Uninstall: ask about deleting user data. Default is KEEP (safe).
+// The user must explicitly choose "Yes" to delete their indexed content,
+// configuration, logs and caches. "No" (default), pressing Enter or closing
+// the dialog all preserve user data.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Response: Integer;
+  DataDir: string;
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    if MsgBox('Do you want to keep your RAG Tools data?' + #13#10 +
-              '(indexed content, config, logs, model cache)' + #13#10 + #13#10 +
-              'Click "No" to delete everything.',
-              mbConfirmation, MB_YESNO) = IDNO then
+    DataDir := ExpandConstant('{localappdata}\RAGTools');
+
+    // Skip prompt entirely if there is no data dir to worry about
+    if not DirExists(DataDir) then
+      Exit;
+
+    Response := MsgBox(
+      'RAG Tools has been uninstalled.' + #13#10 + #13#10 +
+      'Do you ALSO want to DELETE your user data?' + #13#10 + #13#10 +
+      'This includes:' + #13#10 +
+      '  - Indexed content (vector database)' + #13#10 +
+      '  - Configuration (ragtools.toml / config.toml)' + #13#10 +
+      '  - Logs' + #13#10 +
+      '  - Model cache' + #13#10 + #13#10 +
+      'Location: ' + DataDir + #13#10 + #13#10 +
+      'Default is NO (keep your data). Choose YES only if you want a full wipe.',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2);
+
+    if Response = IDYES then
     begin
-      // Delete user data directory (Qdrant DB, logs, config)
-      DelTree(ExpandConstant('{localappdata}\RAGTools'), True, True, True);
+      DelTree(DataDir, True, True, True);
     end;
   end;
 end;

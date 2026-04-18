@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ragtools"
-version = "2.4.2"
+version = "2.5.0"
 description = "Local Markdown RAG system for Claude CLI"
 requires-python = ">=3.10"
 dependencies = [
@@ -30,9 +30,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0", "pytest-cov>=5.0.0", "pytest-asyncio>=0.23.0"]
 build = ["pyinstaller>=6.0.0"]
+notifications = ["winotify>=1.1.0; sys_platform == 'win32'"]
+tray = [
+    "pystray>=0.19.5",
+    "Pillow>=10.0.0",
+]
 
 [project.scripts]
-rag = "ragtools.cli:app"
+rag = "ragtools.cli:_main"
 rag-mcp = "ragtools.integration.mcp_server:main"
 
 [tool.setuptools.packages.find]
