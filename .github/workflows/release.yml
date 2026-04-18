@@ -137,14 +137,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
-          restore-keys: pip-${{ runner.os }}-
+          key: pip-${{ runner.os }}-cpu-${{ hashFiles('pyproject.toml') }}
+          restore-keys: pip-${{ runner.os }}-cpu-
 
       - name: Cache SentenceTransformer model
         uses: actions/cache@v4
         with:
           path: build/model_cache
           key: model-build-cache-all-MiniLM-L6-v2-linux-v1
+
+      - name: Install CPU-only torch
+        # PyTorch's default Linux x86_64 wheel pulls in ~2 GB of CUDA runtime
+        # (nvidia-cublas, cudnn, cusparse, nccl, etc.) as transitive deps.
+        # RAG Tools runs on CPU only, so we install the CPU-only build first
+        # — the subsequent ``pip install -e .`` sees torch already satisfies
+        # the ``torch>=1.11.0`` constraint and doesn't re-resolve from PyPI.
+        # Without this the Linux tar.gz exceeds GitHub's 2 GiB asset limit.
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install dependencies
         run: pip install -e ".[dev,build]"

@@ -47,6 +47,13 @@ jobs:
           path: ${{ matrix.hf-cache }}
           key: model-all-MiniLM-L6-v2-${{ runner.os }}-v1
 
+      - name: Install CPU-only torch (Linux)
+        # See release.yml build-linux for rationale. Keeps the test runner
+        # fast and avoids the 2 GB NVIDIA CUDA dep chain. Windows/macOS
+        # torch wheels don't have CUDA so no equivalent step needed.
+        if: runner.os == 'Linux'
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
