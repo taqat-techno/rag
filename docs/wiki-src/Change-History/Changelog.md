@@ -3,11 +3,13 @@
 | | |
 |---|---|
 | **Owner** | TBD (proposed: docs lead) |
-| **Last validated against version** | 2.4.2 |
-| **Last reviewed** | 2026-04-18 |
+| **Last validated against version** | 2.5.1 |
+| **Last reviewed** | 2026-04-19 |
 | **Format** | Loosely follows [Keep a Changelog](https://keepachangelog.com). Semantic versioning. |
 
 > This page is the human-facing summary. The authoritative record is git tags plus `RELEASING.md` commit messages. Earlier versions (<v2.4.1) can be enumerated via `git tag --sort=-version:refname` once the repo's `safe.directory` issue is resolved — the entries below are what is known from code and existing documentation; older versions are placeholders until git history can be mined.
+>
+> **Wiki-vs-repo gap:** v2.5.0 shipped a substantial release (supervisor process, Windows Task Scheduler watchdog, desktop-toast notifications, system-tray icon, 22-tool MCP surface with per-tool access control, auto-backups, crash history) but the full diff has not yet been back-filled into this wiki. The v2.5.1 entry below documents only the changes made on top of v2.5.0. For the full v2.5.0 delta see [`CHANGELOG.md`](https://github.com/taqat-techno/rag/blob/main/CHANGELOG.md) in the repo.
 
 ## [Unreleased]
 
@@ -22,6 +24,23 @@ Changes on `main` not yet tagged.
 
 ### Outstanding
 - Open questions Q-1..Q-8 — see [Open Questions](Development-SOPs-Documentation-Open-Questions).
+
+---
+
+## [2.5.1] — 2026-04-19
+
+Patch release on top of v2.5.0. Three things shipped:
+
+### Added
+- **Linux (Ubuntu) packaging.** First-class release artifact `RAGTools-{version}-linux-x86_64.tar.gz` produced by a new `build-linux` CI job on `ubuntu-22.04`. CPU-only torch (no CUDA dead weight), XDG-compliant data directory (`$XDG_DATA_HOME/RAGTools` or `~/.local/share/RAGTools`), tray-clipboard fallback chain (`wl-copy` → `xclip` → `xsel`). Linux is now **READY** in the portability gate (was `SOURCE_ONLY`).
+- **MCP `add_project` tool.** Project-tier, default-ON, proxy-only write tool with 2-second cooldown. Agents can onboard a user-provided folder end-to-end without leaving chat. Deletion remains CLI-only by design. See [Reference: MCP Tools](Reference-MCP-Tools).
+- **Plugin system documented.** Resolves Q-5. ragtools adopts the **Claude Code plugin** model via the [taqat-techno marketplace](https://github.com/taqat-techno/plugins); [`rag-plugin` v0.6.0](https://github.com/taqat-techno/plugins/tree/main/rag-plugin) is the operational-console reference implementation. See [Add a New Plugin](Development-SOPs-Plugins-Add-a-New-Plugin).
+
+### Fixed
+- **Installer upgrade-over-running-app.** Pre-v2.5.1 upgrades required manual Task Manager intervention because the tray / supervisor / MCP workers held file handles on `rag.exe`. Installer now sets `CloseApplications=yes` + `SetupMutex` + `taskkill /F /IM rag.exe /T` as a belt-and-suspenders fallback, on both install and uninstall paths.
+
+### Notes
+- Wiki was still validated against 2.4.2 before this release; only the plugin and v2.5.1 deltas above are back-filled here. The full v2.5.0 feature set (supervisor, watchdog, tray, 22-tool MCP, notifications, backups, crash history) remains to be documented — tracked as a future sweep.
 
 ---
 

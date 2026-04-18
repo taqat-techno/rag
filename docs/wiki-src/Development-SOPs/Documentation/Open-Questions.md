@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | **Owner** | TBD (proposed: docs lead) |
-| **Last validated against version** | 2.4.2 |
-| **Last reviewed** | 2026-04-18 |
+| **Last validated against version** | 2.5.1 |
+| **Last reviewed** | 2026-04-19 |
 | **Status** | Live — updated as items resolve |
 
 Questions the repo alone cannot answer. Each one blocks a specific wiki page or section. Stub pages link here by ID.
@@ -17,7 +17,7 @@ Questions the repo alone cannot answer. Each one blocks a specific wiki page or 
 | **Q-2** | What are F-001..F-012? Referenced in `rag-log-monitor` agent and the `/rag-doctor` skill but not defined in the repo. | `Reference/Known-Failure-Codes.md`, full runbook coverage | Maintainer of `rag-log-monitor` | Open |
 | **Q-3** | What do P-RULE and P-DEDUPE classify? Referenced alongside F-001..F-012. | `Reference/Known-Failure-Codes.md`, doctor-skill documentation | Same as Q-2 | Open |
 | **Q-4** | `UserPromptSubmit` hook — implementation status, scope, data written, opt-in flow. | `Development-SOPs/Hooks/Hook-Safety-Rules.md` | Eng lead | Open |
-| **Q-5** | Plugin system scope — document intended design (roadmap Phase 7) or defer entirely until implemented? | `Development-SOPs/Plugins/Add-a-New-Plugin.md`, `Architecture/Plugin-Load-Flow.md` | Eng lead / product | Open |
+| **Q-5** | Plugin system scope — document intended design (roadmap Phase 7) or defer entirely until implemented? | `Development-SOPs/Plugins/Add-a-New-Plugin.md`, `Architecture/Plugin-Load-Flow.md` | Eng lead / product | **Resolved 2026-04-19** — see § Resolutions below |
 | **Q-6** | Confirmed publish target — GitHub Wiki (`.wiki.git`) or GitHub Pages? | `publish_wiki.ps1`, `.github/workflows/publish-wiki.yml` | Docs lead | Proposed: GitHub Wiki |
 | **Q-7** | Pre-v2.4.1 collection/state schema change — what changed, which releases, migration path. | `Change-History/Migration-Guides/Pre-v2-4-1-to-Current.md`, `Runbooks/Pre-v2-4-1-Reset-Blocked.md` | Eng lead | Open |
 | **Q-8** | Ownership assignments per domain — named individuals, not roles. | `Owner:` field in every page's metadata table | Project lead | Open |
@@ -30,7 +30,23 @@ Questions the repo alone cannot answer. Each one blocks a specific wiki page or 
 
 ## Resolutions
 
-*(none yet)*
+### Q-5 — Plugin system (resolved 2026-04-19)
+
+**Decision:** ragtools adopts **Claude Code plugins** — external, marketplace-distributed — as its plugin model. No in-process ragtools Python plugin loader will be built. The ragtools codebase itself remains extensible only through the three documented in-repo surfaces (CLI, HTTP route, slash command shipped in `.claude/skills/`).
+
+**Shipped artifact:** [taqat-techno plugin marketplace](https://github.com/taqat-techno/plugins) with 7 plugins. The one that exercises this pattern against ragtools is [`rag-plugin` v0.6.0](https://github.com/taqat-techno/plugins/tree/main/rag-plugin) — an operational console that auto-wires the ragtools MCP server via `.mcp.json`, installs a CLAUDE.md retrieval rule, ships a `UserPromptSubmit` retrieval-reminder hook, and provides six state-aware slash commands (`/rag-doctor`, `/rag-setup`, `/rag-projects`, `/rag-reset`, `/rag-config`) plus a maintainer command `/rag-sync-docs`.
+
+**Why external, not in-process:**
+- ragtools is a local-first, single-process product (see [Single-Process Invariant](Core-Concepts-Single-Process-Invariant)). A dynamic in-process plugin loader would compound the trust and lifecycle surface without a corresponding user need — users extend their *Claude Code* experience around ragtools, not the ragtools binary itself.
+- Claude Code's plugin system already provides discovery (marketplaces), manifest contract (`.claude-plugin/plugin.json`), validation (`validate_plugin.py`), and MCP auto-wiring. Reinventing any of that inside ragtools would duplicate load-bearing infrastructure for no gain.
+- Existing in-repo surfaces (new CLI subcommand, new HTTP endpoint, new skill shipped inside `ragtools/`) already cover the "extend the product itself" case.
+
+**Pages updated as part of this resolution:**
+- [Development-SOPs/Plugins/Add-a-New-Plugin](Development-SOPs-Plugins-Add-a-New-Plugin) — full rewrite. Status moved from STUB → Active.
+- [Change-History/Changelog](Change-History-Changelog) — v2.5.1 entry notes plugin system documented.
+
+**Pages NOT created** (and intentionally so):
+- `Architecture/Plugin-Load-Flow.md` — would describe an in-process loader that will not be built. If a future plugin architecture is ever considered, file a new Open Question rather than reviving Q-5.
 
 ## How to resolve Q-8 (ownership backfill)
 
