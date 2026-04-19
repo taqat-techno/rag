@@ -26,6 +26,7 @@ from ragtools.service.notify import (
     notify_rebuild_complete,
     notify_scale_warning,
     notify_service_crashed,
+    notify_service_started,
     notify_supervisor_gave_up,
     notify_watcher_gave_up,
     reset_shared_notifier,
@@ -400,6 +401,109 @@ def test_cooldown_override_per_call():
     assert ok1 is True
     assert ok2 is True
     assert len(backend.calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Service-started toast — one toast per OS boot, dedup via psutil.boot_time()
+# ---------------------------------------------------------------------------
+
+
+def _service_started_settings(tmp_path):
+    """Settings whose data dir points at an isolated tmp_path so the
+    boot_marker.json file doesn't leak between tests."""
+    return _settings(
+        qdrant_path=str(tmp_path / "qdrant"),
+        state_db=str(tmp_path / "state.db"),
+    )
+
+
+def test_notify_service_started_fires_on_first_boot(tmp_path, monkeypatch):
+    from ragtools.service import notify as notify_module
+    backend = FakeBackend()
+    s = _service_started_settings(tmp_path)
+    notifier = DesktopNotifier(settings=s, backend=backend, clock=FakeClock())
+    monkeypatch.setattr(notify_module, "_current_boot_time", lambda: 100_000.0)
+
+    result = notify_service_started(s, notifier=notifier)
+
+    assert result is True
+    assert len(backend.calls) == 1
+    call = backend.calls[0]
+    assert call["title"] == "RAG Tools is running"
+    assert "admin panel" in call["message"].lower()
+    assert call["deep_link"] == f"http://{s.service_host}:{s.service_port}/"
+    # Marker was persisted
+    marker = tmp_path / "boot_marker.json"
+    assert marker.is_file()
+    assert "100000" in marker.read_text(encoding="utf-8")
+
+
+def test_notify_service_started_skips_on_same_boot(tmp_path, monkeypatch):
+    """Routine service restarts within the same boot must not re-fire the toast."""
+    from ragtools.service import notify as notify_module
+    backend = FakeBackend()
+    s = _service_started_settings(tmp_path)
+    notifier = DesktopNotifier(settings=s, backend=backend, clock=FakeClock())
+    monkeypatch.setattr(notify_module, "_current_boot_time", lambda: 100_000.0)
+
+    # First call fires
+    assert notify_service_started(s, notifier=notifier) is True
+    # Second call (same boot_time) suppressed
+    assert notify_service_started(s, notifier=notifier) is False
+    assert len(backend.calls) == 1
+
+
+def test_notify_service_started_refires_on_new_boot(tmp_path, monkeypatch):
+    """A genuine reboot (new boot_time) must re-fire even if the marker
+    was written by a prior boot session. Use a fresh notifier on the
+    second call to simulate a fresh process (the service restarts across
+    reboots, so this is realistic)."""
+    from ragtools.service import notify as notify_module
+    backend = FakeBackend()
+    s = _service_started_settings(tmp_path)
+
+    # Simulate previous boot
+    notifier1 = DesktopNotifier(settings=s, backend=backend, clock=FakeClock())
+    monkeypatch.setattr(notify_module, "_current_boot_time", lambda: 100_000.0)
+    assert notify_service_started(s, notifier=notifier1) is True
+
+    # Simulate reboot — boot_time advances, new process, new notifier
+    notifier2 = DesktopNotifier(settings=s, backend=backend, clock=FakeClock())
+    monkeypatch.setattr(notify_module, "_current_boot_time", lambda: 200_000.0)
+    assert notify_service_started(s, notifier=notifier2) is True
+    assert len(backend.calls) == 2
+
+
+def test_notify_service_started_respects_desktop_notifications_toggle(tmp_path, monkeypatch):
+    from ragtools.service import notify as notify_module
+    backend = FakeBackend()
+    s = _service_started_settings(tmp_path)
+    s.desktop_notifications = False
+    notifier = DesktopNotifier(settings=s, backend=backend, clock=FakeClock())
+    monkeypatch.setattr(notify_module, "_current_boot_time", lambda: 100_000.0)
+
+    result = notify_service_started(s, notifier=notifier)
+
+    assert result is False
+    assert backend.calls == []
+    # No marker written — we never actually notified
+    assert not (tmp_path / "boot_marker.json").is_file()
+
+
+def test_notify_service_started_skips_when_psutil_unavailable(tmp_path, monkeypatch):
+    """If psutil can't report the boot time we suppress the toast rather
+    than fire on every restart (a broken dedup signal would be worse than
+    no notification)."""
+    from ragtools.service import notify as notify_module
+    backend = FakeBackend()
+    s = _service_started_settings(tmp_path)
+    notifier = DesktopNotifier(settings=s, backend=backend, clock=FakeClock())
+    monkeypatch.setattr(notify_module, "_current_boot_time", lambda: None)
+
+    result = notify_service_started(s, notifier=notifier)
+
+    assert result is False
+    assert backend.calls == []
 
 
 # ---------------------------------------------------------------------------

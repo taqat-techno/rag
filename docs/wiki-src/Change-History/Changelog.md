@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Owner** | TBD (proposed: docs lead) |
-| **Last validated against version** | 2.5.1 |
+| **Last validated against version** | 2.5.2 |
 | **Last reviewed** | 2026-04-19 |
 | **Format** | Loosely follows [Keep a Changelog](https://keepachangelog.com). Semantic versioning. |
 
@@ -24,6 +24,21 @@ Changes on `main` not yet tagged.
 
 ### Outstanding
 - Open questions Q-1..Q-8 — see [Open Questions](Development-SOPs-Documentation-Open-Questions).
+
+---
+
+## [2.5.2] — 2026-04-19
+
+Two small UX fixes reported after the v2.5.1 stable install:
+
+### Added
+- **Service-started desktop toast.** Fires once per OS boot after the service is fully up. Dedup via `psutil.boot_time()` + a persistent `boot_marker.json` so routine restarts (crash respawn, supervisor bounce, user-initiated) don't re-fire inside the same boot. Respects the existing `desktop_notifications` toggle.
+
+### Fixed
+- **Tray icon missing after reboot.** The installer now invokes `rag.exe tray install` during install and `rag.exe tray uninstall` on removal — previously only the *service* login-startup VBScript was registered, so after reboot the service came up but the tray did not. The underlying `tray_startup.install_tray_task()` code path was correct since v2.5.0; the installer just wasn't calling it.
+
+### Tests
+- 5 new tests in `test_notify.py` covering the boot-dedup branches (540 passed, 1 skipped).
 
 ---
 

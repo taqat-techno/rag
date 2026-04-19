@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
 PackageIdentifier: RAGTools.RAGTools
-PackageVersion: 2.5.1
+PackageVersion: 2.5.2
 PackageLocale: en-US
 Publisher: RAG Tools
 PackageName: RAG Tools

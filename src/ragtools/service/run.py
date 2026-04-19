@@ -95,6 +95,16 @@ def _post_startup(settings: Settings, from_scheduler: bool) -> None:
     except Exception as e:
         logger.warning("Failed to auto-register watchdog (non-fatal): %s", e)
 
+    # Fire a "service is running" desktop toast — once per OS boot, so
+    # routine restarts inside the same session don't spam the user.
+    # Dedup via psutil.boot_time() + a persistent boot_marker.json in data
+    # dir. Any failure is strictly non-fatal.
+    try:
+        from ragtools.service.notify import notify_service_started
+        notify_service_started(settings)
+    except Exception as e:
+        logger.warning("Failed to send service-started toast (non-fatal): %s", e)
+
     # Startup sync: check all projects for offline changes (non-blocking)
     import threading
     def _startup_sync():

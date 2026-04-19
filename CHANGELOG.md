@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.5.2] — 2026-04-19
+
+Small, focused patch on top of v2.5.1 covering two issues reported
+immediately after the v2.5.1 install:
+
+### Added — Service-started desktop notification
+
+- **New `notify_service_started` helper** in `service/notify.py`. Fires a
+  desktop toast ("RAG Tools is running — Click to open the admin panel")
+  once the service is fully up and serving `/health` after login.
+- **Dedup is boot-scoped.** Uses `psutil.boot_time()` plus a
+  `boot_marker.json` file in the data dir so routine restarts inside the
+  same boot session (crash respawn, supervisor bounce, user-initiated
+  restart) do not re-fire the toast. A genuine reboot advances the boot
+  timestamp and the toast fires again.
+- **Respects the existing `desktop_notifications` toggle** and the shared
+  `DesktopNotifier` cooldown machinery — no new user-visible settings.
+- Wired into `service/run.py:_post_startup()` so it runs for both direct
+  and supervised modes.
+
+### Fixed — Tray icon missing after reboot
+
+- **Installer now registers the tray's login-startup VBScript.** Before
+  v2.5.2 the installer only called `rag.exe service install`; the
+  equivalent `rag.exe tray install` step was missing, so
+  `RAGTools-Tray.vbs` was never written to the Startup folder. After
+  reboot the service came up but the tray did not. v2.5.2 adds the
+  matching `[Run]` entry (gated on the same "Start on login" checkbox
+  as the service registration) and the symmetric `[UninstallRun]`
+  cleanup so uninstall removes the tray VBScript too.
+- No code change to `tray_startup.py` — the CLI command
+  (`rag tray install` / `rag tray uninstall`) and the underlying
+  `install_tray_task()` function were already correct. The fix is
+  purely that the installer now invokes them.
+
+### Tests
+
+- 5 new tests in `test_notify.py` for the service-started helper: first-
+  boot fires, same-boot dedup, new-boot re-fires, `desktop_notifications=
+  False` suppresses, psutil-unavailable suppresses.
+- Full suite: 540 passed, 1 skipped (+5 new).
+
+### Notes
+
+- Manual validation path for the tray fix: install v2.5.2 over v2.5.1,
+  reboot, verify both `RAGTools.vbs` and `RAGTools-Tray.vbs` exist under
+  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`, and confirm
+  the tray icon appears after login.
+
+---
+
 ## [2.5.1] — 2026-04-18
 
 Adds **first-class Linux (Ubuntu) packaging** to the release pipeline,

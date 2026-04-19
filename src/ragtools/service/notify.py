@@ -414,6 +414,96 @@ def notify_watcher_gave_up(
     )
 
 
+def _boot_marker_path(settings: Settings) -> Path:
+    """Location of the persistent ``last boot seen`` timestamp file.
+
+    Lives under the data dir so it survives service restarts but is wiped
+    by ``rag reset --data`` and by full uninstall.
+    """
+    return Path(settings.qdrant_path).parent / "boot_marker.json"
+
+
+def _read_last_boot(settings: Settings) -> float:
+    """Return the boot timestamp of the last fired notification, or 0.0."""
+    try:
+        import json
+        p = _boot_marker_path(settings)
+        if not p.is_file():
+            return 0.0
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return float(data.get("last_boot_notified", 0.0))
+    except Exception as e:
+        logger.debug("boot marker read failed: %s", e)
+        return 0.0
+
+
+def _write_last_boot(settings: Settings, boot_time: float) -> None:
+    """Persist the boot timestamp for dedup across service restarts."""
+    try:
+        import json
+        p = _boot_marker_path(settings)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps({"last_boot_notified": boot_time}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.debug("boot marker write failed: %s", e)
+
+
+def _current_boot_time() -> Optional[float]:
+    """Return the OS boot timestamp, or None if psutil is unavailable.
+
+    Returning None suppresses the toast — we'd rather miss a notification
+    than spam the user on every service restart if the dedup signal is
+    broken.
+    """
+    try:
+        import psutil  # type: ignore[import-untyped]
+        return float(psutil.boot_time())
+    except Exception as e:
+        logger.debug("psutil.boot_time unavailable: %s", e)
+        return None
+
+
+def notify_service_started(
+    settings: Settings,
+    notifier: Optional[DesktopNotifier] = None,
+) -> bool:
+    """Fire a toast once per OS boot confirming the service is running.
+
+    Called from ``run.py:_post_startup`` after the service is fully up and
+    serving `/health`. Deduplicated against ``psutil.boot_time()`` so that
+    routine restarts (crash respawn, supervisor bounce, user-initiated
+    restart) inside the same boot don't re-fire the toast.
+
+    Returns True if a toast was dispatched, False if skipped (already
+    fired this boot, or dedup signal unavailable, or cooldown active, or
+    notifications disabled).
+    """
+    boot_time = _current_boot_time()
+    if boot_time is None:
+        return False
+    last_boot = _read_last_boot(settings)
+    if boot_time <= last_boot:
+        logger.debug(
+            "service_started toast suppressed (already fired this boot: "
+            "boot=%.0f last=%.0f)", boot_time, last_boot,
+        )
+        return False
+
+    n = notifier or get_shared_notifier(settings)
+    dispatched = n.notify(
+        kind="service_started",
+        title="RAG Tools is running",
+        message="Service started. Click to open the admin panel.",
+        deep_link=_admin_url(settings),
+    )
+    if dispatched:
+        _write_last_boot(settings, boot_time)
+    return dispatched
+
+
 def notify_scale_warning(
     settings: Settings,
     level: str,
