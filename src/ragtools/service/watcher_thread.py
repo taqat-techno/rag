@@ -42,8 +42,67 @@ class WatcherThread(threading.Thread):
         self._debounce_ms = debounce_ms
         self._stop_event = threading.Event()
 
+        # Observability state read by /api/watcher/status. Guarded by a
+        # dedicated lock so the request thread can read snapshots without
+        # waiting on the watcher's main loop. State is intentionally
+        # tiny (4 immutable string/int values) so lock hold time is nil.
+        self._state_lock = threading.Lock()
+        self._last_started_at: str | None = None
+        self._last_error: str | None = None
+        self._last_error_at: str | None = None
+        self._consecutive_failures: int = 0
+
     _MAX_RETRIES = 5
     _BASE_BACKOFF = 5  # seconds
+
+    # ----------------------------------------------------------------------
+    # Observability — small, side-effect-free helpers that the route reads.
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _now_iso() -> str:
+        """UTC ISO-8601 timestamp for the observability fields."""
+        return datetime.now(timezone.utc).isoformat()
+
+    def _record_started(self) -> None:
+        """Mark a successful watch-loop entry. Resets the failure run.
+
+        Called from inside ``_run_multi_root`` once the underlying
+        ``watch()`` iterator is about to begin yielding changes. At that
+        point the daemon has resolved every project path, built ignore
+        rules, and is awaiting events — i.e. it is meaningfully 'up'.
+        """
+        with self._state_lock:
+            self._last_started_at = self._now_iso()
+            self._last_error = None
+            self._last_error_at = None
+            self._consecutive_failures = 0
+
+    def _record_error(self, exc: BaseException) -> None:
+        """Capture an exception from the retry/give-up path.
+
+        ``BaseException`` (not ``Exception``) so that propagated control
+        signals would also be traced if they ever reach this codepath —
+        defensive only; the watcher's main loop catches plain Exceptions.
+        """
+        with self._state_lock:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._last_error_at = self._now_iso()
+            self._consecutive_failures += 1
+
+    def get_state_snapshot(self) -> dict:
+        """Return a JSON-safe copy of the four observability fields.
+
+        Cheap (one lock acquisition; copies four primitive values) so
+        the HTTP route can call it on every request without contention.
+        """
+        with self._state_lock:
+            return {
+                "last_started_at": self._last_started_at,
+                "last_error": self._last_error,
+                "last_error_at": self._last_error_at,
+                "consecutive_failures": self._consecutive_failures,
+            }
 
     def run(self):
         """Main watch loop with automatic restart on failure."""
@@ -54,6 +113,10 @@ class WatcherThread(threading.Thread):
                 self._run_multi_root(log_activity)
                 break  # Clean exit (stop_event set or no projects)
             except Exception as e:
+                # Capture for /api/watcher/status before any other work so a
+                # crash inside log_activity / _record_give_up does not
+                # swallow the error trail.
+                self._record_error(e)
                 retries += 1
                 if self._stop_event.is_set():
                     break
@@ -150,6 +213,9 @@ class WatcherThread(threading.Thread):
 
         logger.info("Watcher started: %d projects (debounce=%dms)", len(watch_paths), self._debounce_ms)
         log_activity("info", "watcher", f"Watcher started: {len(watch_paths)} projects")
+        # /api/watcher/status snapshot: a successful start clears any
+        # prior error and resets consecutive_failures to zero.
+        self._record_started()
 
         try:
             for changes in watch(
