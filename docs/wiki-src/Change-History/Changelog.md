@@ -15,25 +15,29 @@
 
 Changes on `main` not yet tagged.
 
+---
+
+## [2.5.3] — 2026-05-08
+
+Bundle release: a high-priority Windows UX bugfix (silent watchdog + reliable tray autostart) plus the Phase A API/contract pass that pins `/health`, `/api/watcher/status`, and `scale.level` as stable contracts for downstream consumers (`rag-plugin`, admin panel, external monitors). One CLI behavior change with a loud note below.
+
 ### Added
-- `docs/wiki-src/` two-layer documentation source + publish script + CI dry-run workflow (Phase 1).
-- Full wiki content across Start Here, Core Concepts, Architecture, Operational SOPs, Development SOPs, Runbooks, Reference, Standards & Governance, Templates, Change History (Phases 1-9).
+- **`/health` 200 — `version` + `watcher_running`.** Both fields are additive (Decision 16). `version` lets clients detect mismatched RAG Tools versions without a second round trip; `watcher_running` is the cheap one-bit summary of the watcher daemon thread.
+- **`/api/watcher/status` — `last_started_at`, `last_error`, `last_error_at`, `consecutive_failures`.** Promotes watcher retry/error state from local-variable scope to thread-instance attributes guarded by a dedicated `_state_lock`. Older clients reading only `running` / `paths` / `project_count` continue to work unchanged.
 - **Tray runtime log file.** A rotating `tray.log` is now written under `…\RAGTools\data\logs\` whenever the tray runs. Since the autostart VBS launches the tray with stdout/stderr going nowhere, this is the first time a silent tray failure is recoverable from disk. Captures startup begin/end, pystray import errors, icon-registration milestones, and any uncaught exception.
+- **Decision 16 — API contracts are additive-only.** New ADR in `docs/decisions.md` pinning `scale.level` to `{ok, approaching, over}` as a stable enum, the `/health` 200 key set, and the `rag service status` exit codes.
+- **Reference: HTTP API** — full response-shape documentation for `/health` (200 / 503 / 5xx), `/api/watcher/status` (with the new observability fields), and the `scale.level` thresholds with recommended consumer treatment per level.
+- **`docs/wiki-src/`** two-layer documentation source + publish script + CI dry-run workflow (Phase 1). Full wiki content across Start Here, Core Concepts, Architecture, Operational SOPs, Development SOPs, Runbooks, Reference, Standards & Governance, Templates, Change History (Phases 1-9). First wiki release.
 
 ### Changed
-- Documentation ownership model codified in [Documentation Standards](Standards-and-Governance-Documentation-Standards).
+- **`rag service status` exit codes — 0 / 1 / 2.** Was always-0 in every state (running, starting, AND down) — CI scripts polling the command had no machine-readable signal. Now: `0` running or transiently starting, `1` down, `2` internal command error. **Behavior change**: any CI that relied on `rag service status` always returning 0 will start failing. Treat this as a correctness fix; the always-0 contract was broken.
 
 ### Fixed
 - **Watchdog Scheduled Task no longer flashes a console window every 15 minutes.** The `RAGTools Watchdog` task now runs `wscript.exe RAGTools-Watchdog.vbs` (a silent VBS launcher generated alongside the PID files at `…\RAGTools\data\RAGTools-Watchdog.vbs`) instead of invoking the console-subsystem `rag.exe` directly. Re-running `rag service watchdog install` (or upgrading and letting the installer re-register) heals existing affected machines — `schtasks /create /f` overwrites the old visible task in place. The watchdog's actual health logic is unchanged; only the launch wrapper is new.
 - **Tray icon now reliably appears after Windows login.** `RAGTools-Tray.vbs` now sleeps 15 s before invoking `rag tray`, outwaiting `explorer.exe`'s systray initialisation. Before the fix, `Shell_NotifyIcon(NIM_ADD)` could lose the early-login race and the tray would exit silently, leaving the user with no icon despite a correctly registered autostart entry.
 
-### Outstanding
-- Open questions Q-1..Q-8 — see [Open Questions](Development-SOPs-Documentation-Open-Questions).
-
-### Added (post-2.5.2)
-- New page: [Markdown for RAG](Standards-and-Governance-Markdown-for-RAG) — authoring standard reverse-engineered from `src/ragtools/chunking/markdown.py`. 8 hard rules, 5 templates, anti-patterns, and a pre-commit checklist.
-- [Documentation Standards](Standards-and-Governance-Documentation-Standards) now links to the new authoring page from its Style + Related sections.
-- [Add a New Plugin](Development-SOPs-Plugins-Add-a-New-Plugin) updated for `rag-plugin` v0.7.0 — adds the `markdown-authoring` skill and `/rag:md-rag-enhance` command.
+### Tests
+- 12 new tests for the Windows UX bugfix (silent-watchdog VBS contract, tray VBS startup-delay contract, tray-logger setup) plus 15 new Phase A tests (`/health` shape, `/api/watcher/status` observability fields, `scale.level` enum closure, `rag service status` exit codes for all 4 states, watcher state-snapshot helpers under concurrent-writer stress). Full suite: 567 passed, 1 skipped.
 
 ---
 
