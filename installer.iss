@@ -9,7 +9,7 @@
 ;   iscc installer.iss
 
 #define MyAppName "RAG Tools"
-#define MyAppVersion "2.5.4"
+#define MyAppVersion "2.5.5"
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
 #define MyAppExeName "rag.exe"
@@ -74,10 +74,22 @@ Filename: "cmd.exe"; Parameters: "/c mkdir ""{localappdata}\RAGTools\data"" 2>nu
 Filename: "{app}\rag.exe"; Parameters: "service install"; StatusMsg: "Registering startup task..."; Tasks: startup; Flags: runhidden
 ; Register tray autostart (same login-startup checkbox, mirrors service install)
 Filename: "{app}\rag.exe"; Parameters: "tray install"; StatusMsg: "Registering tray autostart..."; Tasks: startup; Flags: runhidden
+; Repair the watchdog Scheduled Task ONLY if the user already opted into it on a
+; prior install. Pre-v2.5.3 the task action was the bare console exe, so every
+; firing flashed a conhost window. Re-running `service watchdog install` writes
+; the silent VBS launcher and overwrites the task action via `schtasks /create /f`.
+; Never installs the watchdog for users who never opted in — see HasRAGToolsWatchdogTask().
+Filename: "{app}\rag.exe"; Parameters: "service watchdog install"; StatusMsg: "Repairing watchdog task..."; Flags: runhidden; Check: HasRAGToolsWatchdogTask
 ; Start service now (ON by default)
 Filename: "{app}\rag.exe"; Parameters: "service start"; StatusMsg: "Starting service..."; Tasks: startnow; Flags: runhidden nowait
 ; Open admin panel in browser after a delay (let service start)
 Filename: "cmd.exe"; Parameters: "/c timeout /t 15 /nobreak >nul & start http://localhost:21420"; StatusMsg: "Opening admin panel..."; Tasks: startnow; Flags: runhidden nowait
+; Launch the tray once after install/upgrade so the icon appears WITHOUT requiring
+; logout or restart. Runs the same Startup-folder VBS Windows would invoke at next
+; login (15 s WScript.Sleep + hidden shell.Run rag.exe tray). Hidden + nowait so
+; the installer never blocks on it. Gated on `Tasks: startup` so we never run a
+; non-existent VBS for users who declined autostart registration.
+Filename: "{sys}\wscript.exe"; Parameters: """{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\RAGTools-Tray.vbs"""; StatusMsg: "Starting tray icon..."; Tasks: startup; Flags: runhidden nowait
 
 [UninstallRun]
 ; Stop service before uninstall
@@ -111,6 +123,27 @@ begin
     exit;
   end;
   Result := Pos(';' + Param + ';', ';' + OrigPath + ';') = 0;
+end;
+
+// Detect whether the user already opted into the optional watchdog Scheduled
+// Task on a prior install. Returns True when `schtasks /query` succeeds for
+// "RAGTools Watchdog" (exit code 0). Used as a [Run] Check so we ONLY repair
+// the task for users who already had it — never auto-install for users who
+// declined. Pre-v2.5.3 the task action was the bare console exe and flashed a
+// conhost window every 15 minutes; v2.5.3 introduced a silent VBS launcher
+// but the installer never re-registered the existing task, leaving affected
+// users stuck with the popup. This Check fixes that gap on upgrade.
+function HasRAGToolsWatchdogTask(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := False;
+  if Exec(ExpandConstant('{sys}\schtasks.exe'),
+          '/query /tn "RAGTools Watchdog"',
+          '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := (ResultCode = 0);
+  end;
 end;
 
 // Force-kill every rag.exe process tree on the machine. Belt-and-suspenders

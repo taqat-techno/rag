@@ -17,7 +17,25 @@ Changes on `main` not yet tagged.
 
 ---
 
-## [2.5.4] — 2026-05-08
+## [2.5.5] — 2026-05-08
+
+Packaging-only hotfix on top of v2.5.4. Closes the two install-flow gaps surfaced by live testing right after v2.5.4 shipped: the watchdog Scheduled Task wasn't healed on upgrade, and the tray icon didn't appear without a logout/restart.
+
+### Fixed
+- **Existing watchdog Scheduled Task is now repaired on upgrade.** v2.5.3 introduced the silent-VBS launcher (`RAGTools-Watchdog.vbs` + `wscript.exe` action) but the Inno Setup `[Run]` block never invoked `rag service watchdog install` post-install, so users who had opted into the watchdog on a pre-v2.5.3 install kept seeing a console window flash every 15 minutes. The installer now runs `rag.exe service watchdog install` *only when an existing `RAGTools Watchdog` Scheduled Task is detected* (new `HasRAGToolsWatchdogTask()` Inno Setup `Code` Check function — uses `schtasks /query` exit code). This re-registers the task with the silent launcher via `schtasks /create /f`. **Users who never opted into the watchdog do not get a new task installed** — current product policy preserved.
+- **Tray icon now appears immediately after install/upgrade — no logout/restart required.** Previously the installer wrote `RAGTools-Tray.vbs` to the Startup folder but never launched it; the tray would only appear at next Windows login. The installer now invokes `wscript.exe` on the freshly-written Startup VBS once post-install (hidden + nowait via Inno Setup `Flags: runhidden nowait`). The VBS's built-in 15-second `WScript.Sleep` lets explorer.exe settle before `Shell_NotifyIcon` runs, and the launch is gated on `Tasks: startup` so we never invoke a non-existent VBS for users who declined autostart registration.
+
+### Why these were not caught earlier
+v2.5.3's changelog claimed "upgrading and letting the installer re-register" healed the watchdog, but the installer didn't actually do that — the line was missing. The tray-after-install gap was already present in v2.5.0+ but was masked first by the broken pystray bundle (v2.5.0..v2.5.3) and then only became visible once v2.5.4 fixed the bundle. Both gaps are install-flow issues; no `rag.exe` code changes are needed in this release.
+
+### Unchanged from v2.5.4
+- All Phase A API contracts (`/health` 200 fields, `/api/watcher/status` observability fields, `scale.level` enum, `rag service status` exit codes 0/1/2).
+- The silent-watchdog VBS launcher code path itself (`service/watchdog.py`).
+- The 15-second tray autostart delay and `tray.log` rotating file handler.
+- The `pystray` + `PIL` bundle inclusion via `[dev,build,tray]` install + `rag.spec` `hiddenimports`.
+
+### Tests
+- Full suite: 567 passed, 1 skipped. No new tests — the change is Inno Setup `[Run]` and `[Code]` only, exercised by manual install validation post-CI.
 
 Hotfix on top of v2.5.3. The new `tray.log` introduced this morning surfaced a latent build-pipeline bug that had been silently breaking the system-tray icon on every release since v2.5.0.
 
