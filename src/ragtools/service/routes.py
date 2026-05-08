@@ -44,12 +44,40 @@ class IndexRequest(BaseModel):
 
 @router.get("/health")
 def health():
-    """Readiness probe. Returns 200 when encoder loaded + Qdrant open."""
+    """Readiness probe. Returns 200 when encoder loaded + Qdrant open.
+
+    The 200 body is a stable contract — see ``docs/decisions.md``
+    Decision 16. Patch releases may add keys (this is one of those
+    additions: ``version`` + ``watcher_running``) but never remove or
+    rename existing ones. The 503 body remains FastAPI's default
+    ``{"detail": "..."}`` shape.
+    """
     try:
         owner = get_owner()
-        return {"status": "ready", "collection": owner.settings.collection_name}
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Service not ready")
+
+    from ragtools import __version__
+
+    # Cheap, non-blocking probe of the watcher daemon thread. Watcher
+    # details (last_error, paths, ...) live at /api/watcher/status; this
+    # field is the one-bit summary so callers can short-circuit without
+    # a second request.
+    watcher_running = False
+    try:
+        thread = _watcher_thread  # module-level singleton owned by routes
+        watcher_running = thread is not None and thread.is_alive()
+    except Exception:
+        # Defensive: a failure to introspect the watcher must never make
+        # /health return non-200. Fall through with watcher_running=False.
+        watcher_running = False
+
+    return {
+        "status": "ready",
+        "collection": owner.settings.collection_name,
+        "version": __version__,
+        "watcher_running": watcher_running,
+    }
 
 
 # --- Search ---
