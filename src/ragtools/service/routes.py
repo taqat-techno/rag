@@ -597,18 +597,53 @@ def watcher_stop():
         return {"status": "stopped"}
 
 
+def _watcher_observability_snapshot() -> dict:
+    """Pull the four /api/watcher/status observability fields off the
+    daemon thread, with safe defaults when no thread instance exists.
+
+    Lives inside the route module (not the watcher) so the response shape
+    is owned by the same file that defines the contract.
+    """
+    snap = {
+        "last_started_at": None,
+        "last_error": None,
+        "last_error_at": None,
+        "consecutive_failures": 0,
+    }
+    if _watcher_thread is not None:
+        try:
+            snap.update(_watcher_thread.get_state_snapshot())
+        except Exception:
+            # A flaky introspection must never make the route 5xx.
+            pass
+    return snap
+
+
 @router.get("/api/watcher/status")
 def watcher_status():
-    """Check watcher state."""
+    """Check watcher state.
+
+    The four observability fields (last_started_at, last_error,
+    last_error_at, consecutive_failures) are additive — see
+    docs/decisions.md Decision 16 and docs/wiki-src/Reference/HTTP-API.md.
+    Older clients that only look at running/paths/project_count continue
+    to work unchanged.
+    """
     settings = get_settings()
+    obs = _watcher_observability_snapshot()
     with _watcher_lock:
         if _watcher_thread is not None and _watcher_thread.is_alive():
             if settings.has_explicit_projects:
                 paths = [p.path for p in settings.enabled_projects]
-                return {"running": True, "paths": paths, "project_count": len(paths)}
+                return {
+                    "running": True,
+                    "paths": paths,
+                    "project_count": len(paths),
+                    **obs,
+                }
             else:
-                return {"running": True, "project_count": 0}
-        return {"running": False}
+                return {"running": True, "project_count": 0, **obs}
+        return {"running": False, **obs}
 
 
 def _restart_watcher_if_running():
