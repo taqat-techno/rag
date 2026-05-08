@@ -234,3 +234,66 @@ def test_stop_service_returns_true_on_fast_graceful_exit(tmp_path, monkeypatch):
 
     assert proc_mod.stop_service(settings) is True
     assert force_kill_called["n"] == 0, "force_kill must not fire for a clean graceful exit"
+
+
+# ---------------------------------------------------------------------------
+# `rag service status` exit-code contract (Phase A — Decision 16)
+# ---------------------------------------------------------------------------
+
+
+def test_service_status_cmd_exits_1_when_service_down(monkeypatch):
+    """Down state must produce exit code 1 so CI scripts can detect it
+    via `$?` / `$LASTEXITCODE` without parsing the rich-table output."""
+    from typer.testing import CliRunner
+    from ragtools.cli import app as cli_app
+
+    monkeypatch.setattr(
+        proc_mod, "service_status", lambda settings: {"running": False}
+    )
+    result = CliRunner().invoke(cli_app, ["service", "status"])
+    assert result.exit_code == 1
+
+
+def test_service_status_cmd_exits_0_when_running(monkeypatch):
+    from typer.testing import CliRunner
+    from ragtools.cli import app as cli_app
+
+    monkeypatch.setattr(
+        proc_mod, "service_status",
+        lambda settings: {
+            "running": True, "status": "ready", "pid": 1234,
+            "port": 21420, "host": "127.0.0.1",
+        },
+    )
+    result = CliRunner().invoke(cli_app, ["service", "status"])
+    assert result.exit_code == 0
+
+
+def test_service_status_cmd_exits_0_when_starting(monkeypatch):
+    """Transient `starting` (PID alive but /health not yet 200) is
+    intentionally exit 0 — polling scripts run right after `service
+    start` should not see a transient non-zero blip."""
+    from typer.testing import CliRunner
+    from ragtools.cli import app as cli_app
+
+    monkeypatch.setattr(
+        proc_mod, "service_status",
+        lambda settings: {"running": True, "status": "starting", "pid": 1234},
+    )
+    result = CliRunner().invoke(cli_app, ["service", "status"])
+    assert result.exit_code == 0
+
+
+def test_service_status_cmd_exits_2_on_internal_error(monkeypatch):
+    """An internal command failure (e.g. settings load raised) must exit
+    2 so CI can distinguish 'service is down' from 'this CLI invocation
+    broke'."""
+    from typer.testing import CliRunner
+    from ragtools.cli import app as cli_app
+
+    def boom(_settings):
+        raise RuntimeError("internal failure during status probe")
+
+    monkeypatch.setattr(proc_mod, "service_status", boom)
+    result = CliRunner().invoke(cli_app, ["service", "status"])
+    assert result.exit_code == 2

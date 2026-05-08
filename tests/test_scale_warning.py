@@ -77,6 +77,27 @@ def test_record_has_stable_shape():
     assert keys == {"level", "points_count", "soft_limit", "hard_limit", "message"}
 
 
+def test_scale_level_enum_is_closed_set():
+    """Phase A — Decision 16 pins scale.level to exactly three values.
+
+    A fourth level slipping in by accident must trip this test so the
+    contract change goes through review, the docs in
+    docs/wiki-src/Reference/HTTP-API.md, and the ADR before shipping.
+    """
+    levels = {
+        compute_scale_warning(n)["level"]
+        for n in (
+            0,
+            _QDRANT_LOCAL_SOFT_WARN - 1,
+            _QDRANT_LOCAL_SOFT_WARN,
+            _QDRANT_LOCAL_HARD_WARN - 1,
+            _QDRANT_LOCAL_HARD_WARN,
+            50_000,
+        )
+    }
+    assert levels == {"ok", "approaching", "over"}
+
+
 def test_status_endpoint_includes_scale_field(tmp_path):
     """/api/status must include the scale record so admin UI can surface it."""
     from unittest.mock import MagicMock

@@ -53,6 +53,68 @@ def test_health(test_client):
     assert r.json()["status"] == "ready"
 
 
+def test_health_includes_version_and_watcher(test_client):
+    """Phase A — additive contract on /health 200 (Decision 16)."""
+    r = test_client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ready"
+    assert body["collection"] == "markdown_kb"
+    assert "version" in body
+    assert isinstance(body["version"], str) and body["version"]
+    assert "watcher_running" in body
+    assert isinstance(body["watcher_running"], bool)
+
+
+def test_health_503_returns_documented_json_shape(monkeypatch):
+    """503 returns FastAPI's default {'detail': '...'} JSON body. Pin the
+    shape so future refactors that drop the get_owner() RuntimeError path
+    can't silently change the contract.
+
+    The owner-unavailable path is normally exercised at lifespan startup
+    failure; we simulate it here by forcing the route's get_owner() to
+    raise RuntimeError and calling the route function directly. No
+    TestClient app is required because the function is plain Python.
+    """
+    from fastapi import HTTPException
+
+    from ragtools.service import routes as routes_mod
+
+    def boom():
+        raise RuntimeError("owner not initialized")
+
+    monkeypatch.setattr(routes_mod, "get_owner", boom)
+
+    with pytest.raises(HTTPException) as ei:
+        routes_mod.health()
+    assert ei.value.status_code == 503
+    assert ei.value.detail == "Service not ready"
+
+
+# --- Watcher status (Phase A observability fields) ---
+
+
+def test_watcher_status_includes_observability_fields(test_client):
+    """Even without a running watcher thread, the four observability
+    fields must be present so older clients reading only running/paths/
+    project_count don't accidentally see undefined keys, and newer
+    clients reading the new keys never get KeyError."""
+    r = test_client.get("/api/watcher/status")
+    assert r.status_code == 200
+    body = r.json()
+    # Existing contract:
+    assert "running" in body
+    # New additive fields (default null/0 when no thread is registered):
+    for key in (
+        "last_started_at",
+        "last_error",
+        "last_error_at",
+        "consecutive_failures",
+    ):
+        assert key in body, f"missing {key} on /api/watcher/status"
+    assert isinstance(body["consecutive_failures"], int)
+
+
 # --- Search ---
 
 def test_search(test_client):
