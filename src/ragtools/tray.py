@@ -192,6 +192,55 @@ def _admin_url(settings) -> str:
     return f"http://{settings.service_host}:{settings.service_port}/"
 
 
+# Sentinel attribute used to recognise a previously-attached tray file
+# handler so ``_configure_tray_logging`` is idempotent across re-runs and
+# tests. Prefixed to avoid colliding with logging.Handler internals.
+_TRAY_FILE_HANDLER_FLAG = "_ragtools_tray_handler"
+
+
+def _configure_tray_logging(settings) -> None:
+    """Attach a RotatingFileHandler to the ``ragtools.tray`` logger.
+
+    When the tray is launched silently from ``RAGTools-Tray.vbs`` (the
+    autostart-folder entry), stdout and stderr go nowhere — wscript
+    discards them. Without a file sink, every silent failure (pystray
+    import, ``Shell_NotifyIcon`` registration race, missing icon assets)
+    is invisible to the user and the maintainer.
+
+    The handler is attached to the ``ragtools.tray`` logger only — the
+    rest of the app's logging configuration is untouched. The function
+    is idempotent: a second call inside the same process is a no-op.
+    Any failure to set up logging is swallowed so a flaky disk does not
+    crash the tray.
+    """
+    tray_logger = logging.getLogger("ragtools.tray")
+    if any(getattr(h, _TRAY_FILE_HANDLER_FLAG, False) for h in tray_logger.handlers):
+        return
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        logs_dir = Path(settings.qdrant_path).parent / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            logs_dir / "tray.log",
+            maxBytes=1_000_000,
+            backupCount=2,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s — %(message)s"
+        ))
+        setattr(handler, _TRAY_FILE_HANDLER_FLAG, True)
+        tray_logger.addHandler(handler)
+        # Lift the level so INFO breadcrumbs reach the file even when the
+        # root logger is at WARNING.
+        if tray_logger.level == logging.NOTSET or tray_logger.level > logging.INFO:
+            tray_logger.setLevel(logging.INFO)
+    except Exception:
+        # Logging setup must never crash the tray.
+        pass
+
+
 class TrayApp:
     """The full tray runtime. Construct once; call ``run()`` to block."""
 
@@ -420,7 +469,15 @@ class TrayApp:
 
     def run(self) -> int:
         """Block until the user quits the tray. Returns process exit code."""
+        # Attach the file logger BEFORE anything that can fail silently —
+        # ``_acquire_single_instance`` and the pystray import path are both
+        # invisible when the tray is launched headlessly from the autostart
+        # VBS, so we want their outcomes recorded.
+        _configure_tray_logging(self.settings)
+        logger.info("Tray startup begins (pid=%d)", os.getpid())
+
         if not self._acquire_single_instance():
+            logger.warning("Tray exiting: another instance is already running")
             return 1
 
         try:
@@ -436,6 +493,7 @@ class TrayApp:
                 )
                 return 2
 
+            logger.info("Tray icon initialization begins")
             self._icon = pystray.Icon(
                 name="ragtools",
                 icon=generate_icon("unknown"),
@@ -456,9 +514,15 @@ class TrayApp:
             )
             poll_thread.start()
 
+            logger.info("Tray icon registered; entering pystray run loop")
             # Blocks until _icon.stop() is called from _on_quit.
             self._icon.run()
+            logger.info("Tray pystray run loop returned cleanly")
             return 0
+        except Exception as e:
+            logger.exception("Tray crashed: %s", e)
+            raise
         finally:
             self._stop_event.set()
             self._release_single_instance()
+            logger.info("Tray shutdown complete")

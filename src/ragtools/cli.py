@@ -661,7 +661,8 @@ def watchdog_uninstall():
     """Remove the watchdog task from Task Scheduler."""
     from ragtools.service.watchdog import uninstall_watchdog_task
 
-    if uninstall_watchdog_task():
+    settings = _get_settings()
+    if uninstall_watchdog_task(settings=settings):
         console.print("[green]Watchdog removed (or was not installed).[/green]")
     else:
         console.print("[red]Watchdog uninstall failed — see log.[/red]")

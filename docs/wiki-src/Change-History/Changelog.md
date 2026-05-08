@@ -18,12 +18,22 @@ Changes on `main` not yet tagged.
 ### Added
 - `docs/wiki-src/` two-layer documentation source + publish script + CI dry-run workflow (Phase 1).
 - Full wiki content across Start Here, Core Concepts, Architecture, Operational SOPs, Development SOPs, Runbooks, Reference, Standards & Governance, Templates, Change History (Phases 1-9).
+- **Tray runtime log file.** A rotating `tray.log` is now written under `…\RAGTools\data\logs\` whenever the tray runs. Since the autostart VBS launches the tray with stdout/stderr going nowhere, this is the first time a silent tray failure is recoverable from disk. Captures startup begin/end, pystray import errors, icon-registration milestones, and any uncaught exception.
 
 ### Changed
 - Documentation ownership model codified in [Documentation Standards](Standards-and-Governance-Documentation-Standards).
 
+### Fixed
+- **Watchdog Scheduled Task no longer flashes a console window every 15 minutes.** The `RAGTools Watchdog` task now runs `wscript.exe RAGTools-Watchdog.vbs` (a silent VBS launcher generated alongside the PID files at `…\RAGTools\data\RAGTools-Watchdog.vbs`) instead of invoking the console-subsystem `rag.exe` directly. Re-running `rag service watchdog install` (or upgrading and letting the installer re-register) heals existing affected machines — `schtasks /create /f` overwrites the old visible task in place. The watchdog's actual health logic is unchanged; only the launch wrapper is new.
+- **Tray icon now reliably appears after Windows login.** `RAGTools-Tray.vbs` now sleeps 15 s before invoking `rag tray`, outwaiting `explorer.exe`'s systray initialisation. Before the fix, `Shell_NotifyIcon(NIM_ADD)` could lose the early-login race and the tray would exit silently, leaving the user with no icon despite a correctly registered autostart entry.
+
 ### Outstanding
 - Open questions Q-1..Q-8 — see [Open Questions](Development-SOPs-Documentation-Open-Questions).
+
+### Added (post-2.5.2)
+- New page: [Markdown for RAG](Standards-and-Governance-Markdown-for-RAG) — authoring standard reverse-engineered from `src/ragtools/chunking/markdown.py`. 8 hard rules, 5 templates, anti-patterns, and a pre-commit checklist.
+- [Documentation Standards](Standards-and-Governance-Documentation-Standards) now links to the new authoring page from its Style + Related sections.
+- [Add a New Plugin](Development-SOPs-Plugins-Add-a-New-Plugin) updated for `rag-plugin` v0.7.0 — adds the `markdown-authoring` skill and `/rag:md-rag-enhance` command.
 
 ---
 

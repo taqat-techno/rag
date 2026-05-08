@@ -519,6 +519,122 @@ def test_tray_startup_script_includes_tray_command(tmp_path):
     assert "tray" in script  # invokes ``rag tray``
 
 
+def test_tray_startup_script_waits_before_launch(tmp_path):
+    """Without a sleep before shell.Run, the tray VBS races explorer.exe's
+    systray initialisation and ``Shell_NotifyIcon`` can fail silently. The
+    delay must be expressed in milliseconds and must precede shell.Run."""
+    from ragtools.service.tray_startup import (
+        TRAY_STARTUP_DELAY_SECONDS,
+        _build_tray_script,
+    )
+    settings = _settings(tmp_path)
+    script = _build_tray_script(settings)
+
+    expected_ms = TRAY_STARTUP_DELAY_SECONDS * 1000
+    assert f"WScript.Sleep {expected_ms}" in script
+    # Order matters — sleep MUST come before shell.Run, otherwise the delay
+    # only affects subsequent calls and the launch race is unfixed.
+    assert script.index("WScript.Sleep") < script.index("shell.Run")
+
+
+def test_tray_startup_delay_is_at_least_ten_seconds(tmp_path):
+    """Pin the policy: too short and the race returns; too long and the
+    icon's appearance feels broken to the user."""
+    from ragtools.service.tray_startup import TRAY_STARTUP_DELAY_SECONDS
+    assert 10 <= TRAY_STARTUP_DELAY_SECONDS <= 60
+
+
+# ---------------------------------------------------------------------------
+# Tray file-logging — invisible runtime needs a sink
+# ---------------------------------------------------------------------------
+
+
+def test_configure_tray_logging_creates_log_file(tmp_path):
+    """When the tray is launched silently from the autostart VBS, stdout/
+    stderr go nowhere. ``_configure_tray_logging`` must attach a rotating
+    file handler so any failure reaches disk."""
+    import logging
+    from ragtools.tray import _configure_tray_logging
+
+    settings = _settings(tmp_path)
+    _configure_tray_logging(settings)
+
+    tray_logger = logging.getLogger("ragtools.tray")
+    tray_logger.info("hello from the test")
+    # Force flush — RotatingFileHandler writes synchronously per record but
+    # closing+reopening guarantees the bytes are on disk for the assertion.
+    for h in tray_logger.handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+
+    log_path = tmp_path / "logs" / "tray.log"
+    assert log_path.exists(), f"tray.log should exist at {log_path}"
+    body = log_path.read_text(encoding="utf-8")
+    assert "hello from the test" in body
+    assert "ragtools.tray" in body
+
+    # Cleanup so other tests aren't polluted by our handler.
+    for h in list(tray_logger.handlers):
+        if getattr(h, "_ragtools_tray_handler", False):
+            tray_logger.removeHandler(h)
+            h.close()
+
+
+def test_configure_tray_logging_is_idempotent(tmp_path):
+    """Calling twice in the same process must not stack handlers — otherwise
+    every log line gets written N times after a tray re-init."""
+    import logging
+    from ragtools.tray import _configure_tray_logging
+
+    settings = _settings(tmp_path)
+    _configure_tray_logging(settings)
+    _configure_tray_logging(settings)
+    _configure_tray_logging(settings)
+
+    tray_logger = logging.getLogger("ragtools.tray")
+    flagged = [
+        h for h in tray_logger.handlers
+        if getattr(h, "_ragtools_tray_handler", False)
+    ]
+    assert len(flagged) == 1
+
+    # Cleanup
+    for h in flagged:
+        tray_logger.removeHandler(h)
+        h.close()
+
+
+def test_configure_tray_logging_swallows_unwritable_dir(tmp_path, monkeypatch):
+    """If the data dir is unwritable for any reason, the tray must still
+    boot — logging setup must never crash the tray."""
+    import logging
+    from ragtools.tray import _configure_tray_logging
+
+    # Make `mkdir` raise to simulate a permissions failure.
+    from pathlib import Path as _P
+    real_mkdir = _P.mkdir
+
+    def boom(self, *args, **kwargs):
+        if "logs" in str(self):
+            raise PermissionError("simulated")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(_P, "mkdir", boom)
+
+    settings = _settings(tmp_path)
+    _configure_tray_logging(settings)  # must not raise
+
+    # No flagged handler should have been attached.
+    tray_logger = logging.getLogger("ragtools.tray")
+    flagged = [
+        h for h in tray_logger.handlers
+        if getattr(h, "_ragtools_tray_handler", False)
+    ]
+    assert flagged == []
+
+
 # ---------------------------------------------------------------------------
 # Linux clipboard fallback chain (v2.5.1 — was the xclip hardcode)
 # ---------------------------------------------------------------------------

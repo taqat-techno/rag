@@ -21,6 +21,13 @@ logger = logging.getLogger("ragtools.service")
 
 TRAY_STARTUP_FILENAME = "RAGTools-Tray.vbs"
 
+# Seconds the autostart VBS waits before launching the tray. The sibling
+# service VBS (``RAGTools.vbs``) waits 30 s; the tray only needs to outwait
+# explorer.exe's systray initialisation, which is reliably done within
+# ~10 s on modern Windows. 15 s gives a margin without making the icon's
+# appearance feel sluggish to the user.
+TRAY_STARTUP_DELAY_SECONDS = 15
+
 
 def _check_windows() -> bool:
     if sys.platform != "win32":
@@ -41,11 +48,16 @@ def _startup_script_path() -> Path:
 
 
 def _build_tray_script(settings: Settings) -> str:
-    """VBS that silently launches ``rag tray``.
+    """VBS that silently launches ``rag tray`` after a startup delay.
 
     Uses ``shell.Run cmd, 0, False`` — the 0 hides the console window so
     the tray doesn't flash an empty terminal on login; False returns
     immediately instead of waiting for the tray to exit.
+
+    The ``WScript.Sleep`` before the launch outwaits explorer.exe's
+    systray initialisation. Without it, ``Shell_NotifyIcon`` can fail
+    silently during the early-login race and leave the user with no
+    visible icon despite the autostart entry firing correctly.
     """
     from ragtools.config import is_packaged
 
@@ -67,6 +79,12 @@ def _build_tray_script(settings: Settings) -> str:
 
 Dim shell
 Set shell = CreateObject("WScript.Shell")
+
+' Wait for explorer.exe and the systray to finish initializing.
+' Without this delay, Shell_NotifyIcon can fail silently in the
+' early-login race and the icon never appears.
+WScript.Sleep {TRAY_STARTUP_DELAY_SECONDS * 1000}
+
 shell.Run {vbs_cmd}, 0, False
 """
 
