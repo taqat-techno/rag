@@ -83,6 +83,17 @@ hiddenimports = (
         "sklearn",
         "sklearn.decomposition",
         "sklearn.decomposition._pca",
+        # Tray (optional [tray] extra — pystray/Pillow). Listing them here
+        # forces PyInstaller to bundle them even though tray.py imports
+        # them lazily inside TrayApp.run(). Missing in v2.5.0..v2.5.3 →
+        # bundled rag.exe always failed `import pystray` and the icon
+        # never appeared. Don't remove without verifying tray.log on a
+        # post-install Windows machine.
+        "pystray",
+        "pystray._win32",
+        "PIL",
+        "PIL.Image",
+        "PIL.ImageDraw",
     ]
 )
 

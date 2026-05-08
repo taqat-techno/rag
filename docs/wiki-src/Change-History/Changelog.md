@@ -17,7 +17,15 @@ Changes on `main` not yet tagged.
 
 ---
 
-## [2.5.3] — 2026-05-08
+## [2.5.4] — 2026-05-08
+
+Hotfix on top of v2.5.3. The new `tray.log` introduced this morning surfaced a latent build-pipeline bug that had been silently breaking the system-tray icon on every release since v2.5.0.
+
+### Fixed
+- **System-tray icon now actually appears in the bundled installer.** v2.5.0 through v2.5.3 shipped with `pystray` and `Pillow` missing from the PyInstaller bundle, because `release.yml` installed `[dev,build]` only — the `[tray]` extra (which carries `pystray>=0.19.5` + `Pillow>=10.0.0`) was never present in the CI build environment. Running `rag tray` from a packaged install therefore always failed with `ModuleNotFoundError: No module named 'pystray'`, returned exit code 2, and exited silently. The icon never appeared in the system tray for any user who didn't have `pystray` already installed in a separate dev environment. Two-part fix: (a) `release.yml` now installs `[dev,build,tray]` on all three platforms; (b) `rag.spec` lists `pystray`, `pystray._win32`, `PIL`, `PIL.Image`, `PIL.ImageDraw` in `hiddenimports` so PyInstaller bundles them even though `tray.py` imports them lazily.
+
+### Why this wasn't caught earlier
+The Phase A `tray.log` rotating file handler shipped in v2.5.3 wrote the import-error trail straight to `…\RAGTools\data\logs\tray.log` on first attempt — the entire diagnostic chain that would normally have flagged this in v2.5.0 didn't exist before this morning. The portability audit catches code patterns, not "shipped extra missing from bundle"; that gap is now documented as a follow-up (CI smoke test on the built artifact, e.g. `rag tray --help` on the post-build executable).
 
 Bundle release: a high-priority Windows UX bugfix (silent watchdog + reliable tray autostart) plus the Phase A API/contract pass that pins `/health`, `/api/watcher/status`, and `scale.level` as stable contracts for downstream consumers (`rag-plugin`, admin panel, external monitors). One CLI behavior change with a loud note below.
 
