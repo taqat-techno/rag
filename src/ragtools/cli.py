@@ -518,10 +518,26 @@ def service_stop():
 
 @service_app.command("status")
 def service_status_cmd():
-    """Check if the RAG service is running."""
+    """Check if the RAG service is running.
+
+    Exit codes (stable contract — see docs/decisions.md Decision 16):
+      0 — service is running, or transiently starting (PID alive but
+          /health not yet 200). Both states are operationally 'fine,
+          give it a moment'.
+      1 — service is down (no PID and no /health response).
+      2 — internal error inside the command itself (e.g. settings
+          load raised). Distinct from 1 so CI scripts can tell
+          'service is down' from 'this CLI invocation broke'.
+    """
     from ragtools.service.process import service_status
-    settings = _get_settings()
-    info = service_status(settings)
+
+    try:
+        settings = _get_settings()
+        info = service_status(settings)
+    except Exception as e:
+        console.print(f"[red]rag service status failed:[/red] {e}")
+        raise typer.Exit(2)
+
     if info["running"]:
         table = Table(title="RAG Service")
         table.add_column("Metric", style="bold")
@@ -531,9 +547,11 @@ def service_status_cmd():
         table.add_row("Port", str(info.get("port", "")))
         table.add_row("Host", str(info.get("host", "")))
         console.print(table)
-    else:
-        console.print("[yellow]Service is not running.[/yellow]")
-        console.print("Start with: rag service start")
+        return  # exit code 0
+
+    console.print("[yellow]Service is not running.[/yellow]")
+    console.print("Start with: rag service start")
+    raise typer.Exit(1)
 
 
 @service_app.command("run")
