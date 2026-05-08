@@ -381,6 +381,25 @@ Single encoder instance, single lock. The lock protects both the encoder and the
 
 ---
 
+## Decision 16 — API Contracts Are Additive
+
+**Decision:** Public HTTP endpoints (`/health`, `/api/status`, `/api/projects`, `/api/watcher/status`, `/api/system-health`) and the `scale.level` enum are **stable contracts**. Patch and minor releases may **add** keys/fields/levels but must not remove or rename existing ones, nor change the type of an existing key. Breaking changes require a major-version bump and a release note.
+
+**Specifically pinned (Phase A):**
+- `scale.level` ⊆ `{"ok", "approaching", "over"}`. The set is closed; a fourth level is a breaking change.
+- `/health` 200 keys: `status`, `collection`, `version`, `watcher_running`. Future additive fields are allowed.
+- `/health` non-200 responses always carry FastAPI's default `{"detail": "..."}` JSON body.
+- `/api/watcher/status` keys: `running`, `paths`, `project_count`, `last_started_at`, `last_error`, `last_error_at`, `consecutive_failures`. Older clients that only inspect the first three continue to work.
+- `rag service status` exit code: `0` running or starting, `1` down, `2` internal error. CI scripts may rely on these.
+
+**Test enforcement:** `tests/test_scale_warning.py` includes `test_scale_level_enum_is_closed_set` so any silent fourth level fails CI. Route tests assert the documented field set is present.
+
+**Rationale:** The plugin layer, admin panel, and external monitors all read these endpoints today. Stable contracts mean each side can ship independently — covered by the cross-repo decision report (May 2026).
+
+**Tradeoff:** Some legitimate refactors become more expensive. Acceptable: the cost of a contract break (downstream consumers stop working) is far higher than the cost of an extra field.
+
+---
+
 ## Summary Table
 
 | # | Decision | Default | Locked |
@@ -400,3 +419,4 @@ Single encoder instance, single lock. The lock protects both the encoder and the
 | 13 | Dependencies | `pathspec`, `tomli`, `tomli-w`, later `fastapi`, `uvicorn`, `httpx` | Yes |
 | 14 | CLI dual-mode | Transparent HTTP/direct based on health probe | Yes |
 | 15 | Watcher unavailable paths | Skip, warn, retry 60s | Yes |
+| 16 | API contracts additive-only | `scale.level` enum closed; route fields stable | Yes |

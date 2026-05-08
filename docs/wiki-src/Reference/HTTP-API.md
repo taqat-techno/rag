@@ -28,15 +28,33 @@ The Reg service exposes a FastAPI app at `127.0.0.1:<service_port>` (21420 insta
 ### `GET /health`
 Readiness probe.
 
-**Response 200**
+**Stable contract.** Both the success and error paths are JSON. Consumers (`rag-plugin`, the admin panel, external monitors, `rag service status`) may rely on the keys documented below — they will only ever be added to, never removed or renamed.
+
+**Response 200** (service is up and the QdrantOwner is wired)
 ```json
-{"status": "ready", "collection": "markdown_kb"}
+{
+  "status": "ready",
+  "collection": "markdown_kb",
+  "version": "2.5.3",
+  "watcher_running": true
+}
 ```
+
+| Field | Type | Notes |
+|---|---|---|
+| `status` | string | Always `"ready"` on a 200. Reserved for future expansion (e.g. `"degraded"`). |
+| `collection` | string | Qdrant collection name in use. |
+| `version` | string | Server-side `__version__`. Lets clients detect mismatched versions without an extra round trip. |
+| `watcher_running` | boolean | Whether the watcher daemon thread is currently alive inside the service process. Watcher details live at `GET /api/watcher/status`; this field is the cheap one-bit summary. |
 
 **Response 503** (service not ready — encoder still loading, or not yet wired)
 ```json
 {"detail": "Service not ready"}
 ```
+This is FastAPI's default `HTTPException` body shape. Callers should look for the `detail` key on any non-200 response from this endpoint and treat its absence as a hard error rather than retrying blindly.
+
+**Response 5xx** (uncaught error)
+FastAPI's default `{"detail": "Internal Server Error"}` JSON body. Same parsing strategy as 503.
 
 ## Search
 
@@ -78,7 +96,32 @@ Drop the collection and re-index everything from scratch. No body.
 ## Status
 
 ### `GET /api/status`
-Collection and index statistics.
+Collection and index statistics. Includes the scale-warning record described below.
+
+**`scale` field — stable enum contract**
+
+Every response includes a `scale` object computed by `service.owner.compute_scale_warning`. The `level` is one of exactly three values; this set is **stable** — patch releases will not add a fourth level without a major-version bump.
+
+| `level` | Range (`points_count`) | Meaning | Recommended consumer treatment |
+|---|---|---|---|
+| `ok` | `< 15_000` | Below local-mode soft warning. | Info / no action. |
+| `approaching` | `15_000 – 19_999` | Past soft warning, below Qdrant's recommended hard limit. | Surface a moderate warning; suggest pruning ignore patterns or archiving completed projects. |
+| `over` | `>= 20_000` | Past Qdrant's local-mode recommendation (search latency and memory may degrade). | Surface at least medium severity; suggest pruning the index or migrating Qdrant to server mode. |
+
+```json
+{
+  "points_count": 23000,
+  "scale": {
+    "level": "approaching",
+    "points_count": 23000,
+    "soft_limit": 15000,
+    "hard_limit": 20000,
+    "message": "Collection has 23,000 points, approaching the local-mode limit of 20,000…"
+  }
+}
+```
+
+The same shape is exposed on `/api/system-health.checks[*].scale_level` for the doctor view.
 
 ### `GET /api/projects`
 List **indexed** projects derived from the collection (file + chunk counts by project id).
@@ -175,9 +218,57 @@ Stop the watcher. Blocks up to 5 s waiting for the thread to join.
 or `{"status": "not_running"}`.
 
 ### `GET /api/watcher/status`
+
+**Response (running, no recent failures)**
 ```json
-{"running": true, "paths": ["/abs/a", "/abs/b"], "project_count": 2}
+{
+  "running": true,
+  "paths": ["/abs/a", "/abs/b"],
+  "project_count": 2,
+  "last_started_at": "2026-05-08T19:31:48.901Z",
+  "last_error": null,
+  "last_error_at": null,
+  "consecutive_failures": 0
+}
 ```
+
+**Response (running, recovered after retries)**
+```json
+{
+  "running": true,
+  "paths": ["/abs/a"],
+  "project_count": 1,
+  "last_started_at": "2026-05-08T19:32:11.000Z",
+  "last_error": "OSError: [Errno 13] Permission denied: 'D:\\\\…'",
+  "last_error_at": "2026-05-08T19:31:55.121Z",
+  "consecutive_failures": 2
+}
+```
+
+**Response (gave up — watcher dead)**
+```json
+{
+  "running": false,
+  "last_started_at": "2026-05-08T19:30:00.000Z",
+  "last_error": "RuntimeError: …",
+  "last_error_at": "2026-05-08T19:32:25.000Z",
+  "consecutive_failures": 5
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `running` | boolean | Daemon thread is alive. |
+| `paths` | string[] | Watched project paths (only present when `running`). |
+| `project_count` | int | Watched-project count (only present when `running`). |
+| `last_started_at` | ISO-8601 string \| null | UTC timestamp the most recent watch loop entered. `null` until first start. |
+| `last_error` | string \| null | Most recent error captured by the retry/give-up path. `"<ExceptionType>: <message>"`. Cleared on successful (re)start. |
+| `last_error_at` | ISO-8601 string \| null | UTC timestamp of the most recent error. Cleared with `last_error`. |
+| `consecutive_failures` | int | Number of consecutive failures since the last successful start. `0` while healthy. Reaches `_MAX_RETRIES + 1` on terminal give-up. |
+
+`last_error` may include absolute filesystem paths from the underlying exception (e.g. `Permission denied: 'D:\\…'`). The endpoint is localhost-only by design (Decision 5 — Localhost Auth) so paths are not redacted; operators need them to debug.
+
+The four observability fields are **additive** — older clients that only looked at `running` / `paths` / `project_count` continue to work.
 
 ## Semantic map
 
