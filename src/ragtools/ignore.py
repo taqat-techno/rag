@@ -38,6 +38,24 @@ BUILTIN_PATTERNS = [
     # File patterns
     "*.pyc",
     "*.pyo",
+    # Generated / minified / vendored code artifacts — supported extensions but
+    # noise for retrieval. Excluded by default; override with a negated
+    # .ragignore rule if a project genuinely needs them indexed.
+    "*.min.js",
+    "*.min.css",
+    "*.bundle.js",
+    "*.map",
+    "package-lock.json",
+    "yarn.lock",
+    "poetry.lock",
+    "pnpm-lock.yaml",
+    "*.lock",
+    "vendor/",
+    ".next/",
+    ".nuxt/",
+    "target/",
+    "bin/",
+    "obj/",
     # Files already read by Claude directly (no need to index)
     "CLAUDE.md",
 ]
