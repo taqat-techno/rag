@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Identity
 
-Local-first, Markdown-only RAG system. Claude CLI searches a local Qdrant knowledge base first, then completes answers using its own reasoning.
+Local-first RAG system over **documentation AND source code**. Claude CLI searches a local Qdrant knowledge base first, then completes answers using its own reasoning. Indexes Markdown plus source files (`.py .js .ts .tsx .jsx .java .go .cs .php .html .css .scss .sql .sh`), config/data (`.json .yaml .yml .xml .toml .ini`, `Dockerfile`, `requirements.txt`, `pyproject.toml`, `package.json`), and README files.
 
 **Stack:** Python 3.12 / Qdrant local mode / Sentence Transformers / Claude CLI (MCP)
 **No Docker. No cloud. No containers.**
@@ -25,12 +25,14 @@ Local-first, Markdown-only RAG system. Claude CLI searches a local Qdrant knowle
 - **Batch encode** at 64-128 batch size
 
 ### Chunking
-- **Heading-based chunking** — split at `##`, `###`, `####` boundaries
-- **Fallback to paragraph splitting** if a section exceeds chunk_size, then sentence splitting as last resort
+- **`chunk_file` dispatcher** (`chunking/dispatch.py`) routes each file by classification (`chunking/languages.py`) → markdown / code / config chunker. Always call `chunk_file`, never a specific chunker directly, from the pipeline.
+- **Documentation (md/README/text)** — heading-based chunking: split at `##`/`###`/`####`, fallback paragraph → sentence.
+- **Source code** (`chunking/code.py`) — code-aware: Python via stdlib `ast` (classes, methods, functions, decorators, imports, constants, docstrings); brace languages (js/ts/java/go/cs/php/css/scss) via a brace-depth scanner; SQL by statement; shell/html generic. **Whole functions/classes are kept in one chunk** — only a single unit larger than `chunk_size` is split, signature-prefixed.
+- **Config/data** (`chunking/config_files.py`) — structure-aware: JSON/package.json by top-level key, YAML by top-level key, TOML/INI by `[section]`, others by line packing.
 - **chunk_size=400 tokens, chunk_overlap=100 tokens**
-- **Prepend heading hierarchy** to chunk text before embedding (e.g., "Architecture > Backend\n\n...")
-- **Store raw text** (without headings) in payload for display
-- **Deterministic chunk IDs** — `sha256(project_id::file_path::chunk_index)` formatted as UUID (Qdrant requires valid UUID strings)
+- **Prepend context header** (`language file_name > symbol/heading path`) to chunk text before embedding; **store raw text** in payload for display.
+- **Per-chunk metadata** stored in the Qdrant payload: `file_name`, `extension`, `language`, `chunk_type` (code|comment|config|documentation), `module` (project name), `class_name`, `function_name`, `symbols`.
+- **Deterministic chunk IDs** — `sha256(project_id::file_path::chunk_index)` formatted as UUID (shared helper `chunking/common.make_chunk_id`).
 
 ### Retrieval
 - **Score threshold: 0.3** — below this, results are excluded
@@ -114,7 +116,7 @@ python scripts/eval_retrieval.py --questions tests/fixtures/eval_questions.json 
 - Do NOT create multiple Qdrant collections — one collection, payload filtering
 - Do NOT change the embedding model without planning a full rebuild
 - Do NOT suggest Docker, containers, server-mode Qdrant, cloud services, or hosted solutions
-- Do NOT add cross-encoder reranking, hybrid search, or SPLADE — these are post-MVP
+- Do NOT add cross-encoder reranking, hybrid search, or SPLADE — these are post-MVP. (The lightweight **priority reranker** in `retrieval/rerank.py` is allowed — it only adds a small additive bonus by `chunk_type`; it does not re-embed or call a second model.)
 - Do NOT open the Qdrant data directory from multiple processes — the service is the sole owner (see `docs/decisions.md` Decision 1)
 - Do NOT use React, npm, or any JS build step for the admin panel — htmx + Jinja2 only (see `docs/decisions.md` Decision 6)
 
@@ -127,9 +129,56 @@ at startup.
 
 ### Core tools — always available
 
-- **search_knowledge_base(query, project?, top_k?)** — Search indexed Markdown content
+- **search_knowledge_base(query, project?, top_k?)** — Search indexed content (docs + code)
+- **search_project_context(query, project?, top_k?)** — Codebase-first layered retrieval for development requests (Project Context Mode)
 - **list_projects()** — Discover available project IDs
 - **index_status()** — Check if the knowledge base is ready
+
+### Project Context Mode (development requests)
+
+Before answering any **development request** — implementing a feature, fixing a
+bug, changing an architecture, modifying an API, refactoring, or enhancing a
+workflow — you MUST search the project knowledge base first, then ground the
+answer in what exists.
+
+**Feature-aware trigger** — if the request contains any of: *add feature,
+implement, create endpoint, add API, modify workflow, extend module, enhance
+system, architecture review, refactor, bug fix, API modification* — call
+`search_project_context` (or `search_knowledge_base`) BEFORE generating an
+answer. Detection logic lives in `retrieval/feature_intent.py`
+(`detect_dev_intent`).
+
+**Search strategy** (implemented in `retrieval/dev_pipeline.py`):
+1. Search project **codebase** embeddings (`chunk_type=code`).
+2. Search project **documentation** embeddings.
+3. Search **config / architecture / BRD** embeddings.
+4. Combine + **rerank** by context priority.
+5. Generate the answer from the retrieved project context.
+
+**Context prioritization** (`retrieval/rerank.py`) — prefer, in order:
+1. existing project source code → 2. existing APIs → 3. existing workflows →
+4. architecture documents → 5. Markdown docs → 6. general LLM knowledge.
+**Prefer existing implementation patterns over inventing new designs.**
+
+**Response format for feature requests:**
+
+```
+Relevant Files:
+* path/file1
+* path/file2
+
+Existing Implementation:
+* summary of what those files already do
+
+Recommended Changes:
+* change 1
+* change 2
+
+Sample Code:
+* implementation example consistent with existing patterns
+```
+
+Cite actual repository file paths from the retrieved chunks whenever possible.
 
 ### Optional diagnostic tools — user-gated
 
