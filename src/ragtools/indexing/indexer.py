@@ -20,7 +20,7 @@ from qdrant_client.models import (
     VectorParams,
 )
 
-from ragtools.chunking.markdown import chunk_markdown_file
+from ragtools.chunking.dispatch import chunk_file
 from ragtools.config import Settings
 from ragtools.embedding.encoder import Encoder
 from ragtools.indexing.scanner import (
@@ -101,6 +101,15 @@ def chunks_to_points(chunks: list[Chunk], embeddings, file_hash: str) -> list[Po
                 "headings": chunk.headings,
                 "token_count": chunk.token_count,
                 "file_hash": file_hash,
+                # Code/document metadata (defaults keep older points compatible)
+                "file_name": chunk.file_name,
+                "extension": chunk.extension,
+                "language": chunk.language,
+                "chunk_type": chunk.chunk_type,
+                "module": chunk.module,
+                "class_name": chunk.class_name,
+                "function_name": chunk.function_name,
+                "symbols": chunk.symbols,
             },
         )
         points.append(point)
@@ -160,7 +169,7 @@ def index_file(
     """
     file_hash = hash_file(file_path)
 
-    chunks = chunk_markdown_file(
+    chunks = chunk_file(
         file_path=file_path,
         project_id=project_id,
         relative_path=relative_path,
@@ -203,7 +212,8 @@ def run_full_index(
 
     ensure_collection(client, settings.collection_name, encoder.dimension)
 
-    files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules)
+    files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules,
+                         include_code=getattr(settings, "index_source_code", True))
 
     stats = {
         "files_indexed": 0,
@@ -262,7 +272,8 @@ def run_incremental_index(
     ensure_collection(client, settings.collection_name, encoder.dimension)
 
     # Discover current files on disk
-    files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules)
+    files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules,
+                         include_code=getattr(settings, "index_source_code", True))
     current_paths = {get_relative_path(fp, settings.content_root) for _, fp in files}
 
     # Detect deleted files (in state but not on disk)
