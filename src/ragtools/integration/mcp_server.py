@@ -289,10 +289,16 @@ def search_knowledge_base(
     top_k: int = 10,
     structured: bool = False,
 ) -> str | dict:
-    """Search the local Markdown knowledge base for information relevant to a query.
+    """Search the local knowledge base (code + docs) for information relevant to a query.
 
-    USE FIRST for any project-specific knowledge question. Returns
-    formatted context with source attribution and confidence scores.
+    USE FIRST for any project-specific knowledge question. The knowledge base
+    indexes BOTH documentation and source code (functions, classes, configs).
+    Returns formatted context with source attribution and confidence scores.
+
+    For development requests — implementing a feature, fixing a bug, changing
+    an API, refactoring, or a workflow/architecture change — prefer
+    ``search_project_context``, which searches the codebase first and returns a
+    Relevant Files / Existing Implementation breakdown grounded in the repo.
 
     Scope:
       - Pass neither ``project`` nor ``projects`` → search ALL indexed content.
@@ -334,6 +340,44 @@ def search_knowledge_base(
     if _mode == "proxy":
         return _proxy_search(query.strip(), project, projects, top_k, structured)
     return _direct_search(query.strip(), project, projects, top_k, structured)
+
+
+@mcp_app.tool()
+def search_project_context(
+    query: str,
+    project: str | None = None,
+    projects: list[str] | None = None,
+    top_k: int = 10,
+) -> str:
+    """Codebase-first retrieval for development requests (Project Context Mode).
+
+    USE WHEN the user wants to implement a feature, fix a bug, add/modify an
+    API or endpoint, refactor, change a workflow, or review architecture —
+    i.e. any request that should be grounded in the EXISTING implementation.
+
+    Runs a layered search (project source code → documentation → config),
+    reranks by context priority (source code > APIs > workflows > architecture
+    > markdown docs), and returns a structured block:
+
+        Relevant Files:        — actual repository files to look at
+        Existing Implementation: — what each file already does
+        Recommended Changes:    — (you complete this from the request)
+        Sample Code:            — (you complete this, matching existing patterns)
+
+    Always prefer extending the existing patterns it surfaces over inventing a
+    new design. Cite the returned file paths in your answer.
+
+    Args:
+        query:    The development request, in natural language.
+        project:  Optional single project ID to scope the search.
+        projects: Optional list of project IDs (union search).
+        top_k:    Max combined results to return (default 10).
+    """
+    if not query or not query.strip():
+        return "[RAG ERROR] Query cannot be empty."
+    if _mode == "proxy":
+        return _proxy_dev_search(query.strip(), project, projects, top_k)
+    return _direct_dev_search(query.strip(), project, projects, top_k)
 
 
 @mcp_app.tool()
@@ -913,6 +957,57 @@ def _proxy_search(
                           "error_code": _errcodes.PROXY_CONNECT_FAILED},
             }
         return _proxy_error(e)
+
+
+def _proxy_dev_search(
+    query: str,
+    project: str | None,
+    projects: list[str] | None,
+    top_k: int,
+) -> str:
+    try:
+        params: dict = {"query": query, "top_k": top_k}
+        if projects:
+            params["projects"] = ",".join(p for p in projects if p)
+        elif project:
+            params["project"] = project
+        r = _http_client.get("/api/dev-search", params=params)
+        if r.status_code == 200:
+            return r.json().get("formatted", "[RAG ERROR] Empty dev-search response.")
+        return f"[RAG ERROR] Service returned {r.status_code}: {r.text}"
+    except Exception as e:
+        return _proxy_error(e)
+
+
+def _direct_dev_search(
+    query: str,
+    project: str | None,
+    projects: list[str] | None,
+    top_k: int,
+) -> str:
+    error = _check_ready()
+    if error:
+        return f"[RAG ERROR] {error}"
+
+    client = None
+    try:
+        from ragtools.retrieval.dev_pipeline import dev_search
+        from ragtools.retrieval.formatter import format_dev_context
+        from ragtools.retrieval.searcher import Searcher
+
+        client = _get_direct_client()
+        searcher = Searcher(client=client, encoder=_encoder, settings=_settings)
+        outcome = dev_search(
+            searcher, query,
+            project_id=project, project_ids=projects, top_k=top_k,
+        )
+        return format_dev_context(outcome.results, query, outcome.triggers)
+    except Exception as e:
+        logger.exception("dev-search failed")
+        return f"[RAG ERROR] dev-search failed: {e}"
+    finally:
+        if client:
+            del client
 
 
 def _proxy_list_projects() -> str:
