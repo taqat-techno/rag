@@ -27,13 +27,16 @@ console = Console()
 def _make_md_filter(ignore_rules: IgnoreRules, content_root: Path):
     """Create a watchfiles filter using ignore rules.
 
-    Returns a closure that watchfiles can use as watch_filter.
+    Accepts any supported indexable file (Markdown, source code, config) plus
+    ``.ragignore`` changes. Returns a closure watchfiles can use as watch_filter.
     """
+    from ragtools.chunking.languages import is_supported
+
     def md_filter(change: Change, path: str) -> bool:
         # Accept .ragignore file changes (to trigger rule reload)
         if Path(path).name == RAGIGNORE_FILENAME:
             return True
-        if not path.endswith(".md"):
+        if not is_supported(path):
             return False
         return not ignore_rules.is_ignored(Path(path), content_root)
 
@@ -90,8 +93,9 @@ def run_watch(
                 ignore_rules.clear_cache()
                 console.print("  [dim].ragignore changed — ignore rules reloaded[/dim]")
 
-            # Filter to only actual .md changes (not .ragignore changes)
-            md_changes = [(c, p) for c, p in changes if p.endswith(".md")]
+            # Filter to only actual indexable-file changes (not .ragignore changes)
+            from ragtools.chunking.languages import is_supported
+            md_changes = [(c, p) for c, p in changes if is_supported(p)]
             if not md_changes:
                 continue
 
