@@ -56,3 +56,5 @@ class SearchResult(BaseModel):
     class_name: str | None = Field(default=None)
     function_name: str | None = Field(default=None)
     symbols: list[str] = Field(default_factory=list)
+    # Rerank-adjusted score (set by the dev pipeline; None for plain search).
+    adjusted_score: float | None = Field(default=None)

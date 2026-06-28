@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from ragtools.models import SearchResult
 from ragtools.retrieval.feature_intent import detect_dev_intent, matched_triggers
-from ragtools.retrieval.rerank import merge_and_rerank
+from ragtools.retrieval.rerank import adjusted_score, merge_and_rerank
 from ragtools.retrieval.searcher import Searcher
 
 
@@ -50,12 +50,16 @@ def dev_search(
     top_k = top_k or searcher.settings.top_k
 
     def _layer(chunk_types: list[str]) -> list[SearchResult]:
+        # score_threshold=0.0 disables per-layer filtering so the rerank bonus
+        # (applied below) decides survival — borderline code is not dropped
+        # before it can be boosted. Final thresholding is on the adjusted score.
         return searcher.search(
             query=query,
             project_id=project_id,
             project_ids=project_ids,
             top_k=per_layer_k,
             chunk_types=chunk_types,
+            score_threshold=0.0,
         )
 
     # Step 1-3: code, documentation, config (architecture docs ride within docs
@@ -64,8 +68,15 @@ def dev_search(
     doc_hits = _layer(["documentation", "comment"])
     config_hits = _layer(["config"])
 
-    # Step 4: combine + rerank by context priority.
-    combined = merge_and_rerank(code_hits, doc_hits, config_hits)[:top_k]
+    # Step 4: combine + rerank by context priority, then threshold on the
+    # *adjusted* score and record it so the caller/formatter can show the rerank.
+    threshold = searcher.settings.score_threshold
+    combined: list[SearchResult] = []
+    for r in merge_and_rerank(code_hits, doc_hits, config_hits):
+        r.adjusted_score = adjusted_score(r)
+        if r.adjusted_score >= threshold:
+            combined.append(r)
+    combined = combined[:top_k]
 
     return DevSearchResult(
         query=query,

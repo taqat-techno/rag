@@ -56,7 +56,9 @@ class Searcher:
             List of SearchResult objects, sorted by score descending.
         """
         top_k = top_k or self.settings.top_k
-        threshold = score_threshold or self.settings.score_threshold
+        # Use a None sentinel so an explicit 0.0 disables thresholding (the dev
+        # pipeline relies on this to threshold *after* reranking instead of before).
+        threshold = self.settings.score_threshold if score_threshold is None else score_threshold
 
         query_vector = self.encoder.encode_query(query)
 

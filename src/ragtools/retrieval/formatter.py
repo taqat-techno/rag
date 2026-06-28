@@ -164,14 +164,14 @@ def format_dev_context(results: list[SearchResult], query: str, triggers: list[s
         elif r.headings:
             bits.append(" > ".join(r.headings))
         descriptor = " | ".join(bits) if bits else "see retrieved chunk"
-        lines.append(f"* {f} — {descriptor} ({r.confidence}, {r.score:.2f})")
+        lines.append(f"* {f} — {descriptor} ({r.confidence}, {_score_label(r)})")
 
     lines.append("")
     lines.append("--- Retrieved chunks ---")
     for i, r in enumerate(results, 1):
         source = f"{r.project_id}/{r.file_path}" if r.project_id else r.file_path
         sym = f" | {' > '.join(r.headings)}" if r.headings else ""
-        lines.append(f"[{i}] {source}{sym} ({r.chunk_type}, {r.score:.2f}):")
+        lines.append(f"[{i}] {source}{sym} ({r.chunk_type}, {_score_label(r)}):")
         lines.append(_truncate(r.text, 800))
         lines.append("")
 
@@ -182,6 +182,18 @@ def format_dev_context(results: list[SearchResult], query: str, triggers: list[s
     lines.append("* (Assistant: provide an implementation example consistent with the existing patterns.)")
 
     return "\n".join(lines).rstrip()
+
+
+def _score_label(r: SearchResult) -> str:
+    """Show the rerank when the adjusted score differs from the raw score.
+
+    Keeps the displayed number consistent with the (adjusted) ranking order so
+    the agent isn't shown a LOW raw score ranked above a MODERATE one with no
+    explanation.
+    """
+    if r.adjusted_score is not None and abs(r.adjusted_score - r.score) > 1e-9:
+        return f"{r.score:.2f}→{r.adjusted_score:.2f} reranked"
+    return f"{r.score:.2f}"
 
 
 def _truncate(text: str, max_chars: int = 600) -> str:
