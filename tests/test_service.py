@@ -86,6 +86,36 @@ def test_system_health_includes_watcher_and_freshness(test_client):
     assert "index_freshness" in comps
 
 
+def test_uncaught_error_returns_json_500(monkeypatch):
+    """Contract: non-200 bodies are JSON even on an UNCAUGHT 5xx (report L2).
+
+    Without the global exception handler, Starlette returns plain-text
+    'Internal Server Error'. Force /health to raise an unexpected error and
+    assert the response is JSON {'detail': ...}.
+    """
+    from starlette.testclient import TestClient
+    from ragtools.service.app import create_app
+    from ragtools.service import app as app_module
+
+    class _BadOwner:
+        @property
+        def settings(self):
+            raise ValueError("boom")  # uncaught, non-HTTPException
+
+    _prev_owner, _prev_settings = app_module._owner, app_module._settings
+    app_module._owner = _BadOwner()
+    app_module._settings = object()
+    try:
+        app = create_app()
+        with TestClient(app, raise_server_exceptions=False) as tc:
+            r = tc.get("/health")
+        assert r.status_code == 500
+        assert r.headers["content-type"].startswith("application/json")
+        assert r.json()["detail"] == "Internal Server Error"
+    finally:
+        app_module._owner, app_module._settings = _prev_owner, _prev_settings
+
+
 def test_health_503_returns_documented_json_shape(monkeypatch):
     """503 returns FastAPI's default {'detail': '...'} JSON body. Pin the
     shape so future refactors that drop the get_owner() RuntimeError path

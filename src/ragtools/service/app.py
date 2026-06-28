@@ -81,6 +81,18 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Guarantee JSON on an uncaught error. The HTTP-API contract documents
+    # non-200 bodies as JSON; without this, Starlette returns plain-text
+    # "Internal Server Error" on an unhandled 500. Explicit HTTPException
+    # responses already render JSON via FastAPI's default handler.
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
+
+    @app.exception_handler(Exception)
+    async def _json_error_handler(request: Request, exc: Exception):
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
     from ragtools.service.routes import router
     app.include_router(router)
 
