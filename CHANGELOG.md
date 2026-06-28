@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added — Diagnostics & observability
+
+- **Index-freshness detection (A-008).** `compute_index_freshness()` classifies
+  `last_indexed` as never/fresh/stale/unknown against `stale_index_hours`
+  (default 24); surfaced on `/api/status`, `/api/system-health`, and `rag doctor`.
+- **Watcher health is no longer invisible.** `rag doctor` and `/api/system-health`
+  now report watcher running/`last_error`; `/health` adds an additive
+  `degraded` + `issues` signal (e.g. `watcher_not_running`) without changing the
+  `status` liveness contract.
+- **`rag doctor --json`** — stable machine-readable report (install_mode, service,
+  index, freshness, watcher, projects, checks, recommended_actions) so tooling no
+  longer parses the human table. New Watcher / Index-freshness / Project-path rows.
+
+### Fixed
+
+- **`/health` (and all routes) now return JSON on an uncaught 5xx** via a global
+  exception handler, matching the documented contract (previously Starlette
+  returned plain text).
+- **Docs:** corrected the service-log path to `{data_dir}/data/logs/service.log`
+  (was inconsistently `{data_dir}/logs/...`) in `CLAUDE.md` and `docs/decisions.md`.
+
+---
+
 ## [2.5.2] — 2026-04-19
 
 Small, focused patch on top of v2.5.1 covering two issues reported

@@ -230,7 +230,7 @@ Defaults: `patterns = []`, `use_ragignore_files = true`.
 
 **Service mode:**
 - Python `logging` with `RotatingFileHandler`
-- Path: `{data_dir}/logs/service.log`
+- Path: `{data_dir}/data/logs/service.log` (under the `data/` subdir alongside Qdrant — derived as `qdrant_path.parent/logs/`; packaged: `%LOCALAPPDATA%\RAGTools\data\logs\service.log`)
 - Rotation: 10 MB per file, keep 3 backups
 - Format: `%(asctime)s %(levelname)-8s %(name)s %(message)s` (human-readable)
 - Named loggers: `ragtools.service`, `ragtools.indexing`, `ragtools.watcher`, `ragtools.mcp`
