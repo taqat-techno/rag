@@ -186,6 +186,7 @@ class WatcherThread(threading.Thread):
                 content_root=project.path,
                 global_patterns=combined,
                 use_ragignore=self._settings.use_ragignore_files,
+                secret_allowlist=self._settings.secret_allowlist,
             )
             project_map[resolved] = project.id
             watch_paths.append(project.path)
@@ -195,21 +196,25 @@ class WatcherThread(threading.Thread):
             log_activity("warning", "watcher", "No valid project paths to watch")
             return
 
-        def md_filter(change: Change, path: str) -> bool:
-            fp = Path(path)
-            if fp.name == RAGIGNORE_FILENAME:
-                return True
-            if not path.endswith(".md"):
-                return False
-            # Find which project this file belongs to and apply its rules
-            resolved = fp.resolve()
+        from ragtools.watcher.observer import is_indexable_change
+
+        include_code = self._settings.index_source_code
+
+        def _accept(path: str) -> bool:
+            # Honor index_source_code + secret exclusion + per-project ignore rules.
+            resolved = Path(path).resolve()
             for root, rules in project_rules.items():
                 try:
                     resolved.relative_to(root)
-                    return not rules.is_ignored(fp, root)
+                    return is_indexable_change(path, rules, root, include_code)
                 except ValueError:
                     continue
             return False
+
+        def md_filter(change: Change, path: str) -> bool:
+            if Path(path).name == RAGIGNORE_FILENAME:
+                return True
+            return _accept(path)
 
         logger.info("Watcher started: %d projects (debounce=%dms)", len(watch_paths), self._debounce_ms)
         log_activity("info", "watcher", f"Watcher started: {len(watch_paths)} projects")
@@ -238,7 +243,7 @@ class WatcherThread(threading.Thread):
                         rules.clear_cache()
                     logger.debug(".ragignore changed — ignore rules reloaded")
 
-                md_changes = [(c, p) for c, p in changes if p.endswith(".md")]
+                md_changes = [(c, p) for c, p in changes if _accept(p)]
                 if not md_changes:
                     continue
 

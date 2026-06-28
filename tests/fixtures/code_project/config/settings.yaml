@@ -1,0 +1,8 @@
+app_name: demo
+version: 2
+database:
+  host: localhost
+  port: 5432
+auth:
+  token_ttl: 3600
+  max_attempts: 5

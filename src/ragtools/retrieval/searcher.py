@@ -37,6 +37,7 @@ class Searcher:
         project_ids: list[str] | None = None,
         top_k: int | None = None,
         score_threshold: float | None = None,
+        chunk_types: list[str] | None = None,
     ) -> list[SearchResult]:
         """Search for chunks relevant to the query.
 
@@ -48,30 +49,46 @@ class Searcher:
                 A, B, C" without making N separate calls.
             top_k: Number of results (default from config).
             score_threshold: Minimum score (default from config).
+            chunk_types: Optional filter on chunk_type (e.g. ["code"],
+                ["documentation"]). Used by the layered dev-search pipeline.
 
         Returns:
             List of SearchResult objects, sorted by score descending.
         """
         top_k = top_k or self.settings.top_k
-        threshold = score_threshold or self.settings.score_threshold
+        # Use a None sentinel so an explicit 0.0 disables thresholding (the dev
+        # pipeline relies on this to threshold *after* reranking instead of before).
+        threshold = self.settings.score_threshold if score_threshold is None else score_threshold
 
         query_vector = self.encoder.encode_query(query)
 
         # Build filter — multi-project takes precedence over single-project.
-        query_filter = None
+        must = []
+        should = []
         if project_ids:
             # Qdrant treats repeated ``should`` clauses as OR. One FieldCondition
             # per project, all in ``should`` with must-match-one semantics.
-            query_filter = Filter(
-                should=[
-                    FieldCondition(key="project_id", match=MatchValue(value=pid))
-                    for pid in project_ids if pid
-                ]
-            )
+            should = [
+                FieldCondition(key="project_id", match=MatchValue(value=pid))
+                for pid in project_ids if pid
+            ]
         elif project_id:
-            query_filter = Filter(
-                must=[FieldCondition(key="project_id", match=MatchValue(value=project_id))]
+            must.append(
+                FieldCondition(key="project_id", match=MatchValue(value=project_id))
             )
+
+        if chunk_types:
+            # chunk_type is an OR within itself; combine with project via must.
+            must.append(
+                Filter(should=[
+                    FieldCondition(key="chunk_type", match=MatchValue(value=ct))
+                    for ct in chunk_types if ct
+                ])
+            )
+
+        query_filter = None
+        if must or should:
+            query_filter = Filter(must=must or None, should=should or None)
 
         points = self.client.query_points(
             collection_name=self.settings.collection_name,
@@ -95,6 +112,14 @@ class Searcher:
                     project_id=payload.get("project_id", ""),
                     headings=payload.get("headings", []),
                     confidence=_score_to_confidence(point.score),
+                    language=payload.get("language", "") or "",
+                    chunk_type=payload.get("chunk_type", "documentation") or "documentation",
+                    class_name=payload.get("class_name"),
+                    function_name=payload.get("function_name"),
+                    symbols=payload.get("symbols", []) or [],
+                    imports=payload.get("imports", []) or [],
+                    exports=payload.get("exports", []) or [],
+                    signature=payload.get("signature", "") or "",
                 )
             )
 

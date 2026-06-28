@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Identity
 
-Local-first, Markdown-only RAG system. Claude CLI searches a local Qdrant knowledge base first, then completes answers using its own reasoning.
+Local-first RAG system over documentation, with **opt-in** source-code and config indexing. Claude CLI searches a local Qdrant knowledge base first, then completes answers using its own reasoning. **By default only Markdown / README / text is indexed** (preserving the pre-2.6 documentation-only behavior so upgrades don't balloon the index). Set `index_source_code=True` (`RAG_INDEX_SOURCE_CODE=1`) to also index source files (`.py .js .ts .tsx .jsx .java .go .cs .php .html .css .scss .sql .sh`) and config/data (`.json .yaml .yml .xml .toml .ini`, `Dockerfile`, `requirements.txt`, `pyproject.toml`, `package.json`). **Secret-bearing files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `.aws/`, ...) are never indexed**, regardless of the setting.
 
 **Stack:** Python 3.12 / Qdrant local mode / Sentence Transformers / Claude CLI (MCP)
 **No Docker. No cloud. No containers.**
@@ -25,12 +25,15 @@ Local-first, Markdown-only RAG system. Claude CLI searches a local Qdrant knowle
 - **Batch encode** at 64-128 batch size
 
 ### Chunking
-- **Heading-based chunking** — split at `##`, `###`, `####` boundaries
-- **Fallback to paragraph splitting** if a section exceeds chunk_size, then sentence splitting as last resort
+- **`chunk_file` dispatcher** (`chunking/dispatch.py`) routes each file by classification (`chunking/languages.py`) → markdown / code / config chunker. Always call `chunk_file`, never a specific chunker directly, from the pipeline.
+- **Documentation (md/README/text)** — heading-based chunking: split at `##`/`###`/`####`, fallback paragraph → sentence.
+- **Source code** (`chunking/code.py`) — code-aware: Python via stdlib `ast` (classes, methods, functions, decorators, imports, constants, docstrings); brace languages (js/ts/java/go/cs/php/css/scss) via a brace-depth scanner; SQL by statement; shell/html generic. **Whole functions/classes are kept in one chunk** — only a single unit larger than `chunk_size` is split, signature-prefixed.
+- **Config/data** (`chunking/config_files.py`) — structure-aware: JSON/package.json by top-level key, YAML by top-level key, TOML/INI by `[section]`, others by line packing.
 - **chunk_size=400 tokens, chunk_overlap=100 tokens**
-- **Prepend heading hierarchy** to chunk text before embedding (e.g., "Architecture > Backend\n\n...")
-- **Store raw text** (without headings) in payload for display
-- **Deterministic chunk IDs** — `sha256(project_id::file_path::chunk_index)` formatted as UUID (Qdrant requires valid UUID strings)
+- **Prepend context header** (`language file_name > symbol/heading path`) to chunk text before embedding; **store raw text** in payload for display.
+- **Per-chunk metadata** stored in the Qdrant payload: `file_name`, `extension`, `language`, `chunk_type` (code|comment|config|documentation), `module` (project name), `class_name`, `function_name`, `symbols`, `imports`, `exports` (public symbols the chunk defines), `signature` (declaration line of the primary function/class).
+- **Language parsers are pluggable** — `chunking/code.register_language(language, extractor)` adds a language without editing `chunk_code_file`. Built-ins: Python (`ast`), brace scanner (js/ts/java/go/cs/php/css/scss/rust/kotlin/scala/swift/c/cpp), SQL; unregistered → generic.
+- **Deterministic chunk IDs** — `sha256(project_id::file_path::chunk_index)` formatted as UUID (shared helper `chunking/common.make_chunk_id`).
 
 ### Retrieval
 - **Score threshold: 0.3** — below this, results are excluded
@@ -114,7 +117,7 @@ python scripts/eval_retrieval.py --questions tests/fixtures/eval_questions.json 
 - Do NOT create multiple Qdrant collections — one collection, payload filtering
 - Do NOT change the embedding model without planning a full rebuild
 - Do NOT suggest Docker, containers, server-mode Qdrant, cloud services, or hosted solutions
-- Do NOT add cross-encoder reranking, hybrid search, or SPLADE — these are post-MVP
+- Do NOT add cross-encoder reranking, hybrid search, or SPLADE — these are post-MVP. (The lightweight **priority reranker** in `retrieval/rerank.py` is allowed — it only adds a small additive bonus by `chunk_type`; it does not re-embed or call a second model.)
 - Do NOT open the Qdrant data directory from multiple processes — the service is the sole owner (see `docs/decisions.md` Decision 1)
 - Do NOT use React, npm, or any JS build step for the admin panel — htmx + Jinja2 only (see `docs/decisions.md` Decision 6)
 
@@ -127,9 +130,65 @@ at startup.
 
 ### Core tools — always available
 
-- **search_knowledge_base(query, project?, top_k?)** — Search indexed Markdown content
+- **search_knowledge_base(query, project?, top_k?)** — Search indexed content (docs + code)
+- **search_project_context(query, project?, top_k?)** — Codebase-first layered retrieval for development requests (Project Context Mode)
 - **list_projects()** — Discover available project IDs
 - **index_status()** — Check if the knowledge base is ready
+
+### Project Context Mode (development requests)
+
+Before answering any **development request** — implementing a feature, fixing a
+bug, changing an architecture, modifying an API, refactoring, or enhancing a
+workflow — you MUST search the project knowledge base first, then ground the
+answer in what exists.
+
+**Feature-aware trigger** — if the request contains any of: *add feature,
+implement, create endpoint, add API, modify workflow, extend module, enhance
+system, architecture review, refactor, bug fix, API modification* — call
+`search_project_context` (or `search_knowledge_base`) BEFORE generating an
+answer. Detection logic lives in `retrieval/feature_intent.py`
+(`detect_dev_intent`). The detector is **load-bearing**: when the query is a dev
+request it selects the codebase-first strategy; otherwise the tool falls back to
+a flat semantic search (no code-first bias).
+
+**Discovery, not navigation:** `search_project_context` is **semantic
+discovery** — it finds *where* relevant code/docs likely live and *what
+patterns* exist. It is **complementary to, not a replacement for, an LSP /
+language server**. For precise definitions, references, call sites, rename
+safety, and diagnostics, use language tooling and read the cited files; treat
+retrieved symbols as leads, not an authoritative index.
+
+**Search strategy** (implemented in `retrieval/dev_pipeline.py`):
+1. Search project **codebase** embeddings (`chunk_type=code`).
+2. Search project **documentation** embeddings.
+3. Search **config / architecture / BRD** embeddings.
+4. Combine + **rerank** by context priority.
+5. Generate the answer from the retrieved project context.
+
+**Context prioritization** (`retrieval/rerank.py`) — prefer, in order:
+1. existing project source code → 2. existing APIs → 3. existing workflows →
+4. architecture documents → 5. Markdown docs → 6. general LLM knowledge.
+**Prefer existing implementation patterns over inventing new designs.**
+
+**Response format for feature requests:**
+
+```
+Relevant Files:
+* path/file1
+* path/file2
+
+Existing Implementation:
+* summary of what those files already do
+
+Recommended Changes:
+* change 1
+* change 2
+
+Sample Code:
+* implementation example consistent with existing patterns
+```
+
+Cite actual repository file paths from the retrieved chunks whenever possible.
 
 ### Optional diagnostic tools — user-gated
 
@@ -178,6 +237,14 @@ All settings in `config.py` via Pydantic Settings. Override with env vars prefix
 | `RAG_SCORE_THRESHOLD` | `0.3` | Minimum similarity score |
 | `RAG_CONTENT_ROOT` | `.` | Root for project discovery |
 | `RAG_STATE_DB` | `data/index_state.db` | SQLite state path |
+| `RAG_INDEX_SOURCE_CODE` | `false` | Opt-in: also index source code + config/data, not just docs |
+| `RAG_SECRET_ALLOWLIST` | `[]` | Globs to re-include specific secret-bearing files (default: none) |
+
+## Upgrade notes (2.6)
+
+- **Code/config indexing is now opt-in** (`index_source_code` default `False`). If you indexed source on a prior `master` build, the first incremental run after upgrade treats those code files as deletions and purges them from Qdrant + the state DB. Set `RAG_INDEX_SOURCE_CODE=1` to keep indexing code, or run `rag rebuild` for a clean docs-only index.
+- **Global `[ignore].patterns` now apply on the direct-API indexing path** (previously dropped when no `ignore_rules` was passed). A file that newly matches a configured ignore pattern is removed on the next incremental run.
+- **Secret-bearing files are never indexed** (`.env*`, keys, `credentials*`, `secrets/`, …); use `secret_allowlist` / `RAG_SECRET_ALLOWLIST` to re-include specific paths.
 
 ## Entry Points
 

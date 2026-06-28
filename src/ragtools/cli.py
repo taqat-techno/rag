@@ -45,6 +45,7 @@ def _get_ignore_rules(settings, content_root=None):
         content_root=content_root or settings.content_root,
         global_patterns=settings.ignore_patterns,
         use_ragignore=settings.use_ragignore_files,
+        secret_allowlist=settings.secret_allowlist,
     )
 
 

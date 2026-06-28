@@ -226,6 +226,50 @@ class TestIncrementalIndexing:
         state.close()
 
 
+class TestIncrementalCodeIndexing:
+    """Incremental indexing must hash-skip unchanged CODE files (no re-embed)."""
+
+    @pytest.fixture
+    def code_dir(self, tmp_path):
+        proj = tmp_path / "svc"
+        proj.mkdir()
+        (proj / "auth.py").write_text(
+            "def login(user, pw):\n    return user == 'admin'\n"
+        )
+        (proj / "guide.md").write_text("# Service\n\nDocs.\n")
+        return tmp_path
+
+    @pytest.fixture
+    def code_settings(self, code_dir, tmp_path):
+        return Settings(
+            content_root=str(code_dir),
+            qdrant_path=":memory:",
+            state_db=str(tmp_path / "code_state.db"),
+            index_source_code=True,
+        )
+
+    def test_first_run_indexes_code_and_docs(self, code_settings):
+        stats = _run_incremental_memory(code_settings)
+        assert stats["indexed"] == 2            # auth.py + guide.md
+        assert stats["chunks_indexed"] > 0
+
+    def test_unchanged_code_is_skipped(self, code_settings):
+        _run_incremental_memory(code_settings)
+        stats = _run_incremental_memory(code_settings)
+        assert stats["indexed"] == 0
+        assert stats["skipped"] == 2            # code hash-skip works -> no re-embed
+
+    def test_changed_code_is_reindexed(self, code_settings):
+        _run_incremental_memory(code_settings)
+        proj = Path(code_settings.content_root) / "svc"
+        (proj / "auth.py").write_text(
+            "def login(user, pw):\n    return False  # changed\n"
+        )
+        stats = _run_incremental_memory(code_settings)
+        assert stats["indexed"] == 1            # only the changed .py
+        assert stats["skipped"] == 1            # guide.md unchanged
+
+
 def _run_incremental_memory(settings: Settings) -> dict:
     """Run incremental indexing with in-memory Qdrant for testing.
 
@@ -248,7 +292,7 @@ def _run_incremental_memory(settings: Settings) -> dict:
         delete_file_points,
     )
 
-    files = scan_project(settings.content_root)
+    files = scan_project(settings.content_root, include_code=settings.index_source_code)
     current_paths = {get_relative_path(fp, settings.content_root) for _, fp in files}
 
     tracked_paths = state.get_all_paths()

@@ -233,6 +233,12 @@ class Settings(BaseSettings):
     chunk_size: int = 400
     chunk_overlap: int = 100
 
+    # File support — OPT-IN. When False (default), only documentation
+    # (md/README/text) is indexed, preserving the pre-2.6 documentation-only
+    # behavior so upgrades don't silently balloon the index. Set True
+    # (RAG_INDEX_SOURCE_CODE=1) to also index source code and config/data files.
+    index_source_code: bool = False
+
     # Content (legacy — kept for backward compatibility with v1 config)
     content_root: str = "."
 
@@ -250,6 +256,10 @@ class Settings(BaseSettings):
     # Ignore rules (global — apply to all projects)
     ignore_patterns: list[str] = Field(default_factory=list)
     use_ragignore_files: bool = True
+
+    # Secret-file exclusion allowlist (gitignore globs) — re-include specific
+    # secret-bearing paths a project genuinely needs indexed. Empty = strict.
+    secret_allowlist: list[str] = Field(default_factory=list)
 
     # Service
     service_host: str = "127.0.0.1"

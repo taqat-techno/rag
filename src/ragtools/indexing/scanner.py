@@ -61,12 +61,55 @@ def discover_markdown_files(
     return sorted(results)
 
 
+def discover_indexable_files(
+    directory: Path,
+    ignore_rules: IgnoreRules | None = None,
+    include_code: bool = True,
+) -> list[Path]:
+    """Find all supported files in a directory recursively, respecting ignore rules.
+
+    "Supported" is defined by ``chunking.languages.classify_file`` — Markdown,
+    source code, and config/data files. This is the broadened replacement for
+    ``discover_markdown_files`` used by the indexing pipeline.
+
+    Args:
+        directory: Directory to scan.
+        ignore_rules: Ignore rules engine. If None, uses default built-in rules.
+        include_code: When False, only documentation files are returned
+            (lets a deployment restrict the index to docs if desired).
+
+    Returns: sorted list of absolute Paths to indexable files.
+    """
+    from ragtools.chunking.languages import classify_file, DOCUMENTATION
+
+    if ignore_rules is None:
+        from ragtools.ignore import IgnoreRules as IR
+        ignore_rules = IR(content_root=directory)
+
+    results = []
+    for path in directory.rglob("*"):
+        if not path.is_file():
+            continue
+        fc = classify_file(path)
+        if fc is None:
+            continue
+        if not include_code and fc.chunk_type != DOCUMENTATION:
+            continue
+        if ignore_rules.is_secret(path):
+            continue
+        if ignore_rules.is_ignored(path, directory):
+            continue
+        results.append(path)
+    return sorted(results)
+
+
 def scan_project(
     content_root: str,
     project_id: str | None = None,
     ignore_rules: IgnoreRules | None = None,
+    include_code: bool = True,
 ) -> list[tuple[str, Path]]:
-    """Scan for markdown files using legacy content_root discovery (v1).
+    """Scan for indexable files using legacy content_root discovery (v1).
 
     If project_id is specified, only scan that project.
     Otherwise scan all discovered projects.
@@ -86,8 +129,8 @@ def scan_project(
 
     results = []
     for pid, project_dir in projects.items():
-        for md_file in discover_markdown_files(project_dir, ignore_rules=ignore_rules):
-            results.append((pid, md_file))
+        for f in discover_indexable_files(project_dir, ignore_rules=ignore_rules, include_code=include_code):
+            results.append((pid, f))
     return results
 
 
@@ -104,6 +147,8 @@ def scan_configured_projects(
     projects: list[ProjectConfig],
     global_ignore_patterns: list[str] | None = None,
     use_ragignore: bool = True,
+    include_code: bool = True,
+    secret_allowlist: list[str] | None = None,
 ) -> list[tuple[str, Path]]:
     """Scan explicitly configured projects for markdown files (v2).
 
@@ -146,19 +191,20 @@ def scan_configured_projects(
             content_root=project.path,
             global_patterns=combined_patterns,
             use_ragignore=use_ragignore,
+            secret_allowlist=secret_allowlist,
         )
 
-        for md_file in discover_markdown_files(project_path, ignore_rules=ignore_rules):
+        for found in discover_indexable_files(project_path, ignore_rules=ignore_rules, include_code=include_code):
             # Skip files that belong to a more specific child project
             if child_paths:
-                file_resolved = md_file.resolve()
+                file_resolved = found.resolve()
                 owned_by_child = any(
                     str(file_resolved).startswith(str(cp) + os.sep) or file_resolved == cp
                     for cp in child_paths
                 )
                 if owned_by_child:
                     continue
-            results.append((project.id, md_file))
+            results.append((project.id, found))
 
     return results
 

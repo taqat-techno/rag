@@ -8,6 +8,7 @@ Layers (all additive — if ANY layer matches, file is ignored):
 Uses pathspec library for gitignore-style matching.
 """
 
+import re
 from pathlib import Path
 
 import pathspec
@@ -38,11 +39,112 @@ BUILTIN_PATTERNS = [
     # File patterns
     "*.pyc",
     "*.pyo",
+    # Generated / minified / vendored code artifacts — supported extensions but
+    # noise for retrieval. Excluded by default; override with a negated
+    # .ragignore rule if a project genuinely needs them indexed.
+    "*.min.js",
+    "*.min.css",
+    "*.bundle.js",
+    "*.map",
+    "package-lock.json",
+    "yarn.lock",
+    "poetry.lock",
+    "pnpm-lock.yaml",
+    "*.lock",
+    "vendor/",
+    ".next/",
+    ".nuxt/",
+    "target/",
+    "bin/",
+    "obj/",
     # Files already read by Claude directly (no need to index)
     "CLAUDE.md",
 ]
 
 RAGIGNORE_FILENAME = ".ragignore"
+
+
+# --- Secret / credential exclusion (P0 security) -----------------------------
+# Secret-bearing files are NEVER indexed by default — their contents (API keys,
+# private keys, tokens, credentials) must not be embedded or stored in Qdrant.
+# This is a dedicated layer, separate from BUILTIN_PATTERNS, enforced at
+# discovery (scanner), storage (indexer), and the watcher. An explicit allowlist
+# (gitignore-style globs, from config) can re-include a path a project needs.
+#
+# Balanced policy:
+#   * SECRET_PATTERNS below match for ALL file types (specific secret artifacts).
+#   * A broad ``*secret*`` / ``*credential*`` name match applies ONLY to
+#     non-source files, so legitimate source modules (e.g. ``secret_manager.py``)
+#     remain indexable.
+SECRET_PATTERNS = [
+    # dotenv
+    ".env", ".env.*", "*.env",
+    # private keys / certs / keystores
+    "*.pem", "*.key", "*.p12", "*.pfx", "*.pkcs12", "*.keystore", "*.jks", "*.ppk",
+    "id_rsa", "id_rsa.*", "id_dsa", "id_ecdsa", "id_ed25519",
+    # credential stores / directories
+    ".aws/", ".ssh/", ".gnupg/",
+    ".netrc", ".pgpass", "*.pgpass", ".npmrc", ".pypirc",
+    # infra state / vars (frequently contain secrets)
+    "*.tfvars", "*.tfstate", "*.tfstate.*",
+    # explicit secret / credential files
+    "*.secret", "*.secrets",
+    "secrets.json", "secrets.yaml", "secrets.yml",
+    "credential.json", "credentials", "credentials.json", "credentials.yaml", "credentials.yml",
+    # secret/credential directory (symmetry with `credentials`: a bare name
+    # matches a directory OR a file of that name at any depth).
+    "secrets",
+]
+
+_SECRET_SPEC = pathspec.PathSpec.from_lines("gitignore", SECRET_PATTERNS)
+_SECRET_BROAD_RE = re.compile(r"(secret|credential)", re.IGNORECASE)
+
+# For the broad *secret*/*credential* NAME match: exempt true prose docs and
+# logic source modules (e.g. secret_manager.py) — named, but not secret stores.
+# Everything else named secret/credential (config/data, and data-bearing
+# scripts/SQL such as secrets.sh or db_credentials.sql) is treated as a secret.
+_PROSE_LANGUAGES = frozenset({"markdown", "restructuredtext"})
+_LOGIC_CODE_LANGUAGES = frozenset({
+    "python", "javascript", "typescript", "java", "go", "csharp", "php",
+    "rust", "kotlin", "scala", "swift", "c", "cpp",
+})
+
+
+def is_secret(file_path: Path | str, allowlist: "list[str] | tuple[str, ...]" = ()) -> bool:
+    """Return True if a file is secret-bearing and must never be indexed.
+
+    Specific secret artifacts (dotenv, keys, credential stores) are denied for
+    all file types, case-insensitively. Broad ``*secret*`` / ``*credential*``
+    name matches are denied for config/data files and data-bearing scripts
+    (e.g. ``secrets.sh``, ``db_credentials.sql``); prose docs (md/rst) and logic
+    source modules (e.g. ``secret_manager.py``) stay indexable. An explicit
+    ``allowlist`` of gitignore-style globs re-includes specific paths.
+    """
+    p = Path(file_path)
+    rel_l = p.as_posix().lower()
+    name_l = p.name.lower()
+
+    # Case-insensitive throughout — the target filesystem (Windows) is too.
+    if allowlist:
+        allow_spec = pathspec.PathSpec.from_lines("gitignore", [a.lower() for a in allowlist])
+        if allow_spec.match_file(rel_l) or allow_spec.match_file(name_l):
+            return False
+
+    if _SECRET_SPEC.match_file(rel_l) or _SECRET_SPEC.match_file(name_l):
+        return True
+
+    if _SECRET_BROAD_RE.search(name_l):
+        # Prose docs and logic source modules named secret/credential are not
+        # secret stores; everything else (config/data, data-bearing scripts) is.
+        from ragtools.chunking.languages import classify_file
+
+        fc = classify_file(p)
+        if fc is None:
+            return True
+        if fc.language not in _PROSE_LANGUAGES and fc.language not in _LOGIC_CODE_LANGUAGES:
+            return True
+
+    return False
 
 
 class IgnoreRules:
@@ -59,9 +161,11 @@ class IgnoreRules:
         content_root: Path | str = ".",
         global_patterns: list[str] | None = None,
         use_ragignore: bool = True,
+        secret_allowlist: list[str] | None = None,
     ):
         self.content_root = Path(content_root).resolve()
         self.use_ragignore = use_ragignore
+        self._secret_allowlist = secret_allowlist or []
 
         # Layer 3 (lowest priority): built-in defaults
         self._builtin_spec = pathspec.PathSpec.from_lines(
@@ -89,6 +193,13 @@ class IgnoreRules:
             True if the file should be ignored.
         """
         return self.get_reason(file_path, content_root) is not None
+
+    def is_secret(self, file_path: Path | str) -> bool:
+        """True if the file is secret-bearing and must never be indexed.
+
+        Honors this instance's secret allowlist (from config).
+        """
+        return is_secret(file_path, self._secret_allowlist)
 
     def get_reason(self, file_path: Path | str, content_root: Path | str | None = None) -> str | None:
         """Return why a file is ignored, or None if it's not ignored.
