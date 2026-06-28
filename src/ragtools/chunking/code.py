@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,6 +47,34 @@ class CodeUnit:
     class_name: str | None = None
     chunk_type: str = CODE
     symbols: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Language parser registry (extensible)
+# ---------------------------------------------------------------------------
+#
+# A language extractor turns source text into a list of CodeUnit. Register one
+# with ``register_language(language, extractor)`` to add a language WITHOUT
+# editing ``chunk_code_file``. Built-ins are registered at the bottom of this
+# module; anything unregistered falls back to the generic paragraph splitter.
+
+ExtractorFn = Callable[[str, str], "list[CodeUnit]"]
+
+_LANGUAGE_EXTRACTORS: dict[str, ExtractorFn] = {}
+
+
+def register_language(language: str, extractor: ExtractorFn) -> None:
+    """Register a unit extractor for ``language``.
+
+    ``extractor(source, language) -> list[CodeUnit]``. Re-registering overrides
+    the previous extractor (useful for custom parsers and tests).
+    """
+    _LANGUAGE_EXTRACTORS[language] = extractor
+
+
+def get_language_extractor(language: str) -> ExtractorFn | None:
+    """Return the registered extractor for ``language``, or None."""
+    return _LANGUAGE_EXTRACTORS.get(language)
 
 
 # ---------------------------------------------------------------------------
@@ -69,14 +98,8 @@ def chunk_code_file(
     if not source.strip():
         return []
 
-    if language == "python":
-        units = _extract_python_units(source)
-    elif language in ("javascript", "typescript", "java", "go", "csharp", "php", "css", "scss"):
-        units = _extract_brace_units(source, language)
-    elif language == "sql":
-        units = _extract_sql_units(source)
-    else:
-        units = _extract_generic_units(source)
+    extractor = _LANGUAGE_EXTRACTORS.get(language)
+    units = extractor(source, language) if extractor else _extract_generic_units(source)
 
     if not units:
         units = _extract_generic_units(source)
@@ -636,3 +659,22 @@ def _dedup(items: list[str]) -> list[str]:
             seen.add(it)
             out.append(it)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Built-in language registrations
+# ---------------------------------------------------------------------------
+
+
+def _python_extractor(source: str, language: str) -> list[CodeUnit]:
+    return _extract_python_units(source)
+
+
+def _sql_extractor(source: str, language: str) -> list[CodeUnit]:
+    return _extract_sql_units(source)
+
+
+register_language("python", _python_extractor)
+for _brace_lang in ("javascript", "typescript", "java", "go", "csharp", "php", "css", "scss"):
+    register_language(_brace_lang, _extract_brace_units)
+register_language("sql", _sql_extractor)
