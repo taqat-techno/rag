@@ -119,6 +119,7 @@ class QdrantOwner:
             content_root=".",
             global_patterns=settings.ignore_patterns,
             use_ragignore=settings.use_ragignore_files,
+            secret_allowlist=settings.secret_allowlist,
         )
 
         ensure_collection(self._client, settings.collection_name, self._encoder.dimension)
@@ -684,7 +685,8 @@ class QdrantOwner:
             self._settings.projects,
             global_ignore_patterns=self._settings.ignore_patterns,
             use_ragignore=self._settings.use_ragignore_files,
-            include_code=getattr(self._settings, "index_source_code", True),
+            include_code=getattr(self._settings, "index_source_code", False),
+            secret_allowlist=self._settings.secret_allowlist,
         )
 
         if project_id:

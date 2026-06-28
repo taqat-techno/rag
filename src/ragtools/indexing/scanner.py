@@ -148,6 +148,7 @@ def scan_configured_projects(
     global_ignore_patterns: list[str] | None = None,
     use_ragignore: bool = True,
     include_code: bool = True,
+    secret_allowlist: list[str] | None = None,
 ) -> list[tuple[str, Path]]:
     """Scan explicitly configured projects for markdown files (v2).
 
@@ -190,6 +191,7 @@ def scan_configured_projects(
             content_root=project.path,
             global_patterns=combined_patterns,
             use_ragignore=use_ragignore,
+            secret_allowlist=secret_allowlist,
         )
 
         for found in discover_indexable_files(project_path, ignore_rules=ignore_rules, include_code=include_code):

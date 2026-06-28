@@ -231,7 +231,7 @@ def run_full_index(
         )
 
     files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules,
-                         include_code=getattr(settings, "index_source_code", True))
+                         include_code=getattr(settings, "index_source_code", False))
 
     stats = {
         "files_indexed": 0,
@@ -301,7 +301,7 @@ def run_incremental_index(
 
     # Discover current files on disk
     files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules,
-                         include_code=getattr(settings, "index_source_code", True))
+                         include_code=getattr(settings, "index_source_code", False))
     current_paths = {get_relative_path(fp, settings.content_root) for _, fp in files}
 
     # Detect deleted files (in state but not on disk)

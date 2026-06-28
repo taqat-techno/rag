@@ -164,3 +164,27 @@ def test_secrets_directory_excluded(path):
 ])
 def test_secret_detection_is_case_insensitive(name):
     assert is_secret(name) is True, name
+
+
+def test_allowlist_reincludes_secret_end_to_end(tmp_path):
+    """A configured allowlist actually re-includes a supported-ext secret through
+    the indexer (the documented escape hatch is functional, not just at predicate level)."""
+    from ragtools.config import Settings
+    from ragtools.embedding.encoder import Encoder
+    from ragtools.indexing.indexer import ensure_collection, index_file
+
+    f = tmp_path / "credentials.json"
+    f.write_text('{"note": "intentionally indexed via allowlist"}\n', encoding="utf-8")
+
+    settings = Settings()
+    client = Settings.get_memory_client()
+    encoder = Encoder(settings.embedding_model)
+    ensure_collection(client, settings.collection_name, encoder.dimension)
+
+    common = dict(client=client, encoder=encoder, collection_name=settings.collection_name,
+                  project_id="p", file_path=f, relative_path="p/credentials.json")
+    assert index_file(**common) == 0                                   # blocked by default
+    n = index_file(**common, secret_allowlist=("**/credentials.json",))  # allowlisted
+    assert n > 0
+    points, _ = client.scroll(collection_name=settings.collection_name, limit=8, with_payload=True)
+    assert points
