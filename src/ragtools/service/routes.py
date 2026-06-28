@@ -630,9 +630,33 @@ def watcher_stop():
         return {"status": "stopped"}
 
 
+def _derive_watcher_state(snap: dict, alive: bool) -> str:
+    """Best-effort lifecycle label so consumers can tell apart the states the
+    raw null/0 observability fields otherwise collapse together (report L3 / the
+    real signal A-007 lacked).
+
+    - running  : daemon thread alive
+    - gave_up  : exceeded the retry budget (consecutive_failures >= _MAX_RETRIES)
+    - crashed  : exited with a recorded error
+    - exited   : started then exited cleanly (e.g. no enabled projects)
+    - inactive : never started, stopped, or an autostart that never landed
+                 (the cross-process autostart miss is indistinguishable here)
+    """
+    from ragtools.service.watcher_thread import WatcherThread
+    if alive:
+        return "running"
+    if snap.get("consecutive_failures", 0) >= WatcherThread._MAX_RETRIES:
+        return "gave_up"
+    if snap.get("last_error"):
+        return "crashed"
+    if snap.get("last_started_at"):
+        return "exited"
+    return "inactive"
+
+
 def _watcher_observability_snapshot() -> dict:
-    """Pull the four /api/watcher/status observability fields off the
-    daemon thread, with safe defaults when no thread instance exists.
+    """Pull the /api/watcher/status observability fields off the daemon thread
+    (plus a derived ``state``), with safe defaults when no thread exists.
 
     Lives inside the route module (not the watcher) so the response shape
     is owned by the same file that defines the contract.
@@ -643,12 +667,19 @@ def _watcher_observability_snapshot() -> dict:
         "last_error_at": None,
         "consecutive_failures": 0,
     }
-    if _watcher_thread is not None:
+    alive = False
+    t = _watcher_thread
+    if t is not None:
         try:
-            snap.update(_watcher_thread.get_state_snapshot())
+            snap.update(t.get_state_snapshot())
         except Exception:
             # A flaky introspection must never make the route 5xx.
             pass
+        try:
+            alive = t.is_alive()
+        except Exception:
+            alive = False
+    snap["state"] = _derive_watcher_state(snap, alive)
     return snap
 
 

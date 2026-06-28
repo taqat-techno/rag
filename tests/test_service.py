@@ -116,6 +116,22 @@ def test_uncaught_error_returns_json_500(monkeypatch):
         app_module._owner, app_module._settings = _prev_owner, _prev_settings
 
 
+def test_derive_watcher_state_branches():
+    """L3: the derived lifecycle label disambiguates the null/0 fingerprint."""
+    from ragtools.service.routes import _derive_watcher_state
+    assert _derive_watcher_state({}, True) == "running"
+    assert _derive_watcher_state({"consecutive_failures": 5}, False) == "gave_up"
+    assert _derive_watcher_state({"last_error": "boom"}, False) == "crashed"
+    assert _derive_watcher_state({"last_started_at": "t"}, False) == "exited"
+    assert _derive_watcher_state({}, False) == "inactive"
+
+
+def test_watcher_status_includes_state(test_client):
+    body = test_client.get("/api/watcher/status").json()
+    assert "state" in body
+    assert body["state"] == "inactive"  # test app never starts the watcher
+
+
 def test_health_503_returns_documented_json_shape(monkeypatch):
     """503 returns FastAPI's default {'detail': '...'} JSON body. Pin the
     shape so future refactors that drop the get_owner() RuntimeError path
