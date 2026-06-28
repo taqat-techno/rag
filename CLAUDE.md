@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Identity
 
-Local-first RAG system over **documentation AND source code**. Claude CLI searches a local Qdrant knowledge base first, then completes answers using its own reasoning. Indexes Markdown plus source files (`.py .js .ts .tsx .jsx .java .go .cs .php .html .css .scss .sql .sh`), config/data (`.json .yaml .yml .xml .toml .ini`, `Dockerfile`, `requirements.txt`, `pyproject.toml`, `package.json`), and README files.
+Local-first RAG system over documentation, with **opt-in** source-code and config indexing. Claude CLI searches a local Qdrant knowledge base first, then completes answers using its own reasoning. **By default only Markdown / README / text is indexed** (preserving the pre-2.6 documentation-only behavior so upgrades don't balloon the index). Set `index_source_code=True` (`RAG_INDEX_SOURCE_CODE=1`) to also index source files (`.py .js .ts .tsx .jsx .java .go .cs .php .html .css .scss .sql .sh`) and config/data (`.json .yaml .yml .xml .toml .ini`, `Dockerfile`, `requirements.txt`, `pyproject.toml`, `package.json`). **Secret-bearing files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `.aws/`, ...) are never indexed**, regardless of the setting.
 
 **Stack:** Python 3.12 / Qdrant local mode / Sentence Transformers / Claude CLI (MCP)
 **No Docker. No cloud. No containers.**
@@ -227,6 +227,8 @@ All settings in `config.py` via Pydantic Settings. Override with env vars prefix
 | `RAG_SCORE_THRESHOLD` | `0.3` | Minimum similarity score |
 | `RAG_CONTENT_ROOT` | `.` | Root for project discovery |
 | `RAG_STATE_DB` | `data/index_state.db` | SQLite state path |
+| `RAG_INDEX_SOURCE_CODE` | `false` | Opt-in: also index source code + config/data, not just docs |
+| `RAG_SECRET_ALLOWLIST` | `[]` | Globs to re-include specific secret-bearing files (default: none) |
 
 ## Entry Points
 
