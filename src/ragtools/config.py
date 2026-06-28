@@ -250,6 +250,10 @@ class Settings(BaseSettings):
     top_k: int = 10
     score_threshold: float = 0.3
 
+    # Index freshness — warn (in /api/status, /health, rag doctor) when the
+    # index's last_indexed timestamp is older than this many hours.
+    stale_index_hours: int = 24
+
     # State
     state_db: str = Field(default_factory=_default_state_db)
 
