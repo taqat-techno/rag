@@ -162,11 +162,20 @@ def index_file(
     relative_path: str,
     chunk_size: int = 400,
     chunk_overlap: int = 100,
+    secret_allowlist: tuple[str, ...] = (),
 ) -> int:
-    """Index a single Markdown file: chunk -> embed -> upsert.
+    """Index a single file: chunk -> embed -> upsert.
 
-    Returns: number of chunks indexed.
+    Secret-bearing files are skipped here too (defense in depth — the scanner
+    already excludes them at discovery), so their contents never reach Qdrant.
+
+    Returns: number of chunks indexed (0 if the file is secret or unsupported).
     """
+    from ragtools.ignore import is_secret
+
+    if is_secret(relative_path, secret_allowlist):
+        return 0
+
     file_hash = hash_file(file_path)
 
     chunks = chunk_file(
@@ -212,6 +221,15 @@ def run_full_index(
 
     ensure_collection(client, settings.collection_name, encoder.dimension)
 
+    if ignore_rules is None:
+        from ragtools.ignore import IgnoreRules
+        ignore_rules = IgnoreRules(
+            content_root=settings.content_root,
+            global_patterns=settings.ignore_patterns,
+            use_ragignore=settings.use_ragignore_files,
+            secret_allowlist=settings.secret_allowlist,
+        )
+
     files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules,
                          include_code=getattr(settings, "index_source_code", True))
 
@@ -232,6 +250,7 @@ def run_full_index(
             relative_path=relative_path,
             chunk_size=settings.chunk_size,
             chunk_overlap=settings.chunk_overlap,
+            secret_allowlist=tuple(settings.secret_allowlist),
         )
         stats["files_indexed"] += 1
         stats["chunks_indexed"] += count
@@ -270,6 +289,15 @@ def run_incremental_index(
     state = IndexState(settings.state_db)
 
     ensure_collection(client, settings.collection_name, encoder.dimension)
+
+    if ignore_rules is None:
+        from ragtools.ignore import IgnoreRules
+        ignore_rules = IgnoreRules(
+            content_root=settings.content_root,
+            global_patterns=settings.ignore_patterns,
+            use_ragignore=settings.use_ragignore_files,
+            secret_allowlist=settings.secret_allowlist,
+        )
 
     # Discover current files on disk
     files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules,
@@ -320,6 +348,7 @@ def run_incremental_index(
             relative_path=relative_path,
             chunk_size=settings.chunk_size,
             chunk_overlap=settings.chunk_overlap,
+            secret_allowlist=tuple(settings.secret_allowlist),
         )
 
         state.update(

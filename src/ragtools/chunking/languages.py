@@ -68,7 +68,6 @@ _EXTENSION_MAP: dict[str, tuple[str, str]] = {
     ".ini": ("ini", CONFIG),
     ".cfg": ("ini", CONFIG),
     ".dockerfile": ("dockerfile", CONFIG),
-    ".env": ("dotenv", CONFIG),
     # --- Documentation ---
     ".md": ("markdown", DOCUMENTATION),
     ".markdown": ("markdown", DOCUMENTATION),

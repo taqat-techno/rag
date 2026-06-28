@@ -95,6 +95,8 @@ def discover_indexable_files(
             continue
         if not include_code and fc.chunk_type != DOCUMENTATION:
             continue
+        if ignore_rules.is_secret(path):
+            continue
         if ignore_rules.is_ignored(path, directory):
             continue
         results.append(path)

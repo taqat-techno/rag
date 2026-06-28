@@ -255,6 +255,10 @@ class Settings(BaseSettings):
     ignore_patterns: list[str] = Field(default_factory=list)
     use_ragignore_files: bool = True
 
+    # Secret-file exclusion allowlist (gitignore globs) — re-include specific
+    # secret-bearing paths a project genuinely needs indexed. Empty = strict.
+    secret_allowlist: list[str] = Field(default_factory=list)
+
     # Service
     service_host: str = "127.0.0.1"
     service_port: int = Field(default_factory=_default_service_port)

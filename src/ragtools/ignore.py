@@ -8,6 +8,7 @@ Layers (all additive — if ANY layer matches, file is ignored):
 Uses pathspec library for gitignore-style matching.
 """
 
+import re
 from pathlib import Path
 
 import pathspec
@@ -63,6 +64,70 @@ BUILTIN_PATTERNS = [
 RAGIGNORE_FILENAME = ".ragignore"
 
 
+# --- Secret / credential exclusion (P0 security) -----------------------------
+# Secret-bearing files are NEVER indexed by default — their contents (API keys,
+# private keys, tokens, credentials) must not be embedded or stored in Qdrant.
+# This is a dedicated layer, separate from BUILTIN_PATTERNS, enforced at
+# discovery (scanner), storage (indexer), and the watcher. An explicit allowlist
+# (gitignore-style globs, from config) can re-include a path a project needs.
+#
+# Balanced policy:
+#   * SECRET_PATTERNS below match for ALL file types (specific secret artifacts).
+#   * A broad ``*secret*`` / ``*credential*`` name match applies ONLY to
+#     non-source files, so legitimate source modules (e.g. ``secret_manager.py``)
+#     remain indexable.
+SECRET_PATTERNS = [
+    # dotenv
+    ".env", ".env.*", "*.env",
+    # private keys / certs / keystores
+    "*.pem", "*.key", "*.p12", "*.pfx", "*.pkcs12", "*.keystore", "*.jks", "*.ppk",
+    "id_rsa", "id_rsa.*", "id_dsa", "id_ecdsa", "id_ed25519",
+    # credential stores / directories
+    ".aws/", ".ssh/", ".gnupg/",
+    ".netrc", ".pgpass", "*.pgpass", ".npmrc", ".pypirc",
+    # infra state / vars (frequently contain secrets)
+    "*.tfvars", "*.tfstate", "*.tfstate.*",
+    # explicit secret / credential files
+    "*.secret", "*.secrets",
+    "secrets.json", "secrets.yaml", "secrets.yml",
+    "credential.json", "credentials", "credentials.json", "credentials.yaml", "credentials.yml",
+]
+
+_SECRET_SPEC = pathspec.PathSpec.from_lines("gitignore", SECRET_PATTERNS)
+_SECRET_BROAD_RE = re.compile(r"(secret|credential)", re.IGNORECASE)
+
+
+def is_secret(file_path: Path | str, allowlist: "list[str] | tuple[str, ...]" = ()) -> bool:
+    """Return True if a file is secret-bearing and must never be indexed.
+
+    Specific secret artifacts (dotenv, keys, credential stores) are denied for
+    all file types. Broad ``*secret*`` / ``*credential*`` name matches are denied
+    only for non-source files, so legitimate source code stays indexable. An
+    explicit ``allowlist`` of gitignore-style globs re-includes specific paths.
+    """
+    p = Path(file_path)
+    rel = p.as_posix()
+    name = p.name
+
+    if allowlist:
+        allow_spec = pathspec.PathSpec.from_lines("gitignore", list(allowlist))
+        if allow_spec.match_file(rel) or allow_spec.match_file(name):
+            return False
+
+    if _SECRET_SPEC.match_file(rel) or _SECRET_SPEC.match_file(name):
+        return True
+
+    if _SECRET_BROAD_RE.search(name):
+        # Broad name match: treat as secret only for non-source files.
+        from ragtools.chunking.languages import CODE, classify_file
+
+        fc = classify_file(p)
+        if fc is None or fc.chunk_type != CODE:
+            return True
+
+    return False
+
+
 class IgnoreRules:
     """Three-layer ignore rule engine.
 
@@ -77,9 +142,11 @@ class IgnoreRules:
         content_root: Path | str = ".",
         global_patterns: list[str] | None = None,
         use_ragignore: bool = True,
+        secret_allowlist: list[str] | None = None,
     ):
         self.content_root = Path(content_root).resolve()
         self.use_ragignore = use_ragignore
+        self._secret_allowlist = secret_allowlist or []
 
         # Layer 3 (lowest priority): built-in defaults
         self._builtin_spec = pathspec.PathSpec.from_lines(
@@ -107,6 +174,13 @@ class IgnoreRules:
             True if the file should be ignored.
         """
         return self.get_reason(file_path, content_root) is not None
+
+    def is_secret(self, file_path: Path | str) -> bool:
+        """True if the file is secret-bearing and must never be indexed.
+
+        Honors this instance's secret allowlist (from config).
+        """
+        return is_secret(file_path, self._secret_allowlist)
 
     def get_reason(self, file_path: Path | str, content_root: Path | str | None = None) -> str | None:
         """Return why a file is ignored, or None if it's not ignored.
