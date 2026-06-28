@@ -1,0 +1,10 @@
+# CODEOWNERS — global ownership for branch protection
+#
+# Every change to any path in this repository requires review and approval
+# from the global owner below before it can be merged into the protected
+# default branch (master).
+#
+# NOTE: A CODEOWNERS entry is only enforced for users/teams that have write
+# access to this repository. @a-lakosha is the repository admin.
+
+* @a-lakosha
