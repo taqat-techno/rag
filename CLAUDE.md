@@ -146,7 +146,16 @@ implement, create endpoint, add API, modify workflow, extend module, enhance
 system, architecture review, refactor, bug fix, API modification* — call
 `search_project_context` (or `search_knowledge_base`) BEFORE generating an
 answer. Detection logic lives in `retrieval/feature_intent.py`
-(`detect_dev_intent`).
+(`detect_dev_intent`). The detector is **load-bearing**: when the query is a dev
+request it selects the codebase-first strategy; otherwise the tool falls back to
+a flat semantic search (no code-first bias).
+
+**Discovery, not navigation:** `search_project_context` is **semantic
+discovery** — it finds *where* relevant code/docs likely live and *what
+patterns* exist. It is **complementary to, not a replacement for, an LSP /
+language server**. For precise definitions, references, call sites, rename
+safety, and diagnostics, use language tooling and read the cited files; treat
+retrieved symbols as leads, not an authoritative index.
 
 **Search strategy** (implemented in `retrieval/dev_pipeline.py`):
 1. Search project **codebase** embeddings (`chunk_type=code`).

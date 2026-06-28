@@ -30,6 +30,7 @@ class DevSearchResult:
     results: list[SearchResult]
     triggers: list[str] = field(default_factory=list)
     is_dev_request: bool = False
+    strategy: str = "codebase-first"  # "codebase-first" (dev) | "flat" (non-dev)
     layers: dict[str, int] = field(default_factory=dict)  # layer name -> hit count
 
 
@@ -68,12 +69,21 @@ def dev_search(
     doc_hits = _layer(["documentation", "comment"])
     config_hits = _layer(["config"])
 
-    # Step 4: combine + rerank by context priority, then threshold on the
-    # *adjusted* score and record it so the caller/formatter can show the rerank.
+    # Step 4: intent selects the ranking strategy — this is what makes the
+    # feature-intent detector load-bearing rather than a passive annotation:
+    #   * dev request   -> codebase-first: rerank by the context-priority bonus,
+    #     then threshold on the adjusted score.
+    #   * non-dev query -> flat: plain semantic relevance by raw score, no
+    #     code-first bonus (don't force code to the top for a non-dev question).
+    is_dev = detect_dev_intent(query)
     threshold = searcher.settings.score_threshold
+    merged = merge_and_rerank(code_hits, doc_hits, config_hits)
+    if not is_dev:
+        merged = sorted(merged, key=lambda r: r.score, reverse=True)
+
     combined: list[SearchResult] = []
-    for r in merge_and_rerank(code_hits, doc_hits, config_hits):
-        r.adjusted_score = adjusted_score(r)
+    for r in merged:
+        r.adjusted_score = adjusted_score(r) if is_dev else r.score
         if r.adjusted_score >= threshold:
             combined.append(r)
     combined = combined[:top_k]
@@ -82,7 +92,8 @@ def dev_search(
         query=query,
         results=combined,
         triggers=matched_triggers(query),
-        is_dev_request=detect_dev_intent(query),
+        is_dev_request=is_dev,
+        strategy="codebase-first" if is_dev else "flat",
         layers={
             "code": len(code_hits),
             "documentation": len(doc_hits),

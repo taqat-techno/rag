@@ -100,3 +100,31 @@ def test_searcher_passes_explicit_zero_threshold_through():
                         settings=Settings(score_threshold=0.3))
     searcher.search("q", project_id="p", score_threshold=0.0)
     assert stub.kwargs["score_threshold"] == 0.0   # not silently defaulted to 0.3
+
+
+# --- Intent detector is load-bearing: it selects the ranking strategy (P2) ---
+
+def _two_layer_searcher():
+    return _FakeSearcher(
+        Settings(score_threshold=0.3, top_k=10),
+        {
+            "code": [_sr(0.50, "code", "svc.py")],
+            "documentation": [_sr(0.55, "documentation", "guide.md")],
+        },
+    )
+
+
+def test_dev_query_uses_codebase_first_strategy():
+    out = dev_search(_two_layer_searcher(), "implement an endpoint", project_id="p")
+    assert out.is_dev_request is True
+    assert out.strategy == "codebase-first"
+    # code 0.50 + 0.15 bonus = 0.65 outranks doc 0.55
+    assert out.results[0].file_path == "svc.py"
+
+
+def test_non_dev_query_uses_flat_strategy():
+    out = dev_search(_two_layer_searcher(), "what does the auth module store", project_id="p")
+    assert out.is_dev_request is False
+    assert out.strategy == "flat"
+    # no codebase-first bonus -> raw order, doc 0.55 above code 0.50
+    assert out.results[0].file_path == "guide.md"

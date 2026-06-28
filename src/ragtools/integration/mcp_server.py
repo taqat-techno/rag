@@ -367,6 +367,12 @@ def search_project_context(
     Always prefer extending the existing patterns it surfaces over inventing a
     new design. Cite the returned file paths in your answer.
 
+    This is SEMANTIC DISCOVERY (fuzzy "where might this live / what patterns
+    exist"), NOT precise code navigation. It complements but does NOT replace a
+    language server / LSP: for exact definitions, references, call sites, rename
+    safety, or type/diagnostic checks, use the editor's language tools and read
+    the cited files. Do not treat its symbol list as authoritative or exhaustive.
+
     Args:
         query:    The development request, in natural language.
         project:  Optional single project ID to scope the search.
