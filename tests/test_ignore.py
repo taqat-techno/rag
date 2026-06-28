@@ -251,9 +251,22 @@ def test_scanner_with_custom_ignore():
 def test_scan_project_with_default_rules():
     """scan_project without explicit rules should work (backward compat)."""
     from ragtools.indexing.scanner import scan_project
+    from ragtools.chunking.languages import is_supported
 
     results = scan_project(str(FIXTURES))
     assert len(results) > 0
-    # All results should be .md files
+    # All results should be indexable (docs + code + config), not just .md.
     for pid, path in results:
-        assert path.suffix == ".md"
+        assert is_supported(path), path
+    # Documentation is still discovered.
+    assert any(path.suffix == ".md" for _, path in results)
+
+
+def test_scan_project_docs_only():
+    """include_code=False restricts discovery to documentation."""
+    from ragtools.indexing.scanner import scan_project
+
+    results = scan_project(str(FIXTURES), include_code=False)
+    assert len(results) > 0
+    for pid, path in results:
+        assert path.suffix in (".md", ".markdown", ".rst", ".txt")

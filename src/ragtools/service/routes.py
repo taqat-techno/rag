@@ -134,6 +134,31 @@ def search(
     return result
 
 
+@router.get("/api/dev-search")
+def dev_search_endpoint(
+    query: str = Query(..., description="Development / feature-request query"),
+    project: Optional[str] = Query(None, description="Filter by a single project"),
+    projects: Optional[str] = Query(None, description="Comma-separated project IDs (union)"),
+    top_k: int = Query(10, description="Max combined results"),
+):
+    """Codebase-first layered retrieval (Project Context Mode).
+
+    Searches code, then documentation, then config embeddings, combines and
+    reranks by context priority (source code > APIs > workflows > architecture
+    > docs), and returns a formatted Project Context block.
+    """
+    owner = get_owner()
+    project_ids: Optional[list[str]] = None
+    if projects:
+        project_ids = [p.strip() for p in projects.split(",") if p.strip()]
+    return owner.search_project_context(
+        query=query,
+        project_id=project,
+        project_ids=project_ids,
+        top_k=top_k,
+    )
+
+
 # --- Indexing ---
 
 @router.post("/api/index")

@@ -233,6 +233,10 @@ class Settings(BaseSettings):
     chunk_size: int = 400
     chunk_overlap: int = 100
 
+    # File support — when False, only documentation (md/README/text) is indexed.
+    # When True (default), source code and config/data files are indexed too.
+    index_source_code: bool = True
+
     # Content (legacy — kept for backward compatibility with v1 config)
     content_root: str = "."
 

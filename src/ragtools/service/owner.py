@@ -14,7 +14,7 @@ from qdrant_client import QdrantClient
 from ragtools.config import Settings
 from ragtools.embedding.encoder import Encoder
 from ragtools.ignore import IgnoreRules
-from ragtools.chunking.markdown import chunk_markdown_file
+from ragtools.chunking.dispatch import chunk_file
 from ragtools.indexing.indexer import (
     ensure_collection,
     recreate_collection,
@@ -204,6 +204,61 @@ class QdrantOwner:
             "formatted": formatted,
         }
 
+    def search_project_context(
+        self,
+        query: str,
+        project_id: str | None = None,
+        project_ids: list[str] | None = None,
+        top_k: int | None = None,
+    ) -> dict:
+        """Codebase-first layered retrieval for development requests.
+
+        Runs the dev-search pipeline (code → docs → config, then rerank by
+        context priority) and returns a dict with the ranked results plus a
+        formatted "Project Context Mode" block ready for answer generation.
+        """
+        with self._lock:
+            from ragtools.retrieval.dev_pipeline import dev_search
+            from ragtools.retrieval.formatter import format_dev_context
+
+            searcher = Searcher(
+                client=self._client,
+                encoder=self._encoder,
+                settings=self._settings,
+            )
+            outcome = dev_search(
+                searcher,
+                query,
+                project_id=project_id,
+                project_ids=project_ids,
+                top_k=top_k,
+            )
+            formatted = format_dev_context(outcome.results, query, outcome.triggers)
+            return {
+                "query": query,
+                "count": len(outcome.results),
+                "is_dev_request": outcome.is_dev_request,
+                "triggers": outcome.triggers,
+                "layers": outcome.layers,
+                "results": [
+                    {
+                        "score": r.score,
+                        "confidence": r.confidence,
+                        "text": r.raw_text,
+                        "file_path": r.file_path,
+                        "project_id": r.project_id,
+                        "headings": r.headings,
+                        "language": r.language,
+                        "chunk_type": r.chunk_type,
+                        "class_name": r.class_name,
+                        "function_name": r.function_name,
+                        "symbols": r.symbols,
+                    }
+                    for r in outcome.results
+                ],
+                "formatted": formatted,
+            }
+
     def get_map_points(self, force_recompute: bool = False) -> list[dict]:
         """Get 2D map coordinates for all indexed files. Uses cache when valid. Thread-safe."""
         with self._lock:
@@ -236,7 +291,7 @@ class QdrantOwner:
         for pid, file_path in files:
             relative_path = self._resolve_relative_path(pid, file_path)
             file_hash = IndexState.hash_file(file_path)
-            chunks = chunk_markdown_file(
+            chunks = chunk_file(
                 file_path=file_path,
                 project_id=pid,
                 relative_path=relative_path,
@@ -322,7 +377,7 @@ class QdrantOwner:
                 continue
 
             # Chunk the file (pure I/O, no shared resources)
-            chunks = chunk_markdown_file(
+            chunks = chunk_file(
                 file_path=file_path,
                 project_id=pid,
                 relative_path=relative_path,
@@ -629,6 +684,7 @@ class QdrantOwner:
             self._settings.projects,
             global_ignore_patterns=self._settings.ignore_patterns,
             use_ragignore=self._settings.use_ragignore_files,
+            include_code=getattr(self._settings, "index_source_code", True),
         )
 
         if project_id:

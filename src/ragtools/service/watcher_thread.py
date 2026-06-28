@@ -195,11 +195,13 @@ class WatcherThread(threading.Thread):
             log_activity("warning", "watcher", "No valid project paths to watch")
             return
 
+        from ragtools.chunking.languages import is_supported
+
         def md_filter(change: Change, path: str) -> bool:
             fp = Path(path)
             if fp.name == RAGIGNORE_FILENAME:
                 return True
-            if not path.endswith(".md"):
+            if not is_supported(path):
                 return False
             # Find which project this file belongs to and apply its rules
             resolved = fp.resolve()
@@ -238,7 +240,7 @@ class WatcherThread(threading.Thread):
                         rules.clear_cache()
                     logger.debug(".ragignore changed — ignore rules reloaded")
 
-                md_changes = [(c, p) for c, p in changes if p.endswith(".md")]
+                md_changes = [(c, p) for c, p in changes if is_supported(p)]
                 if not md_changes:
                     continue
 
