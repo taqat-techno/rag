@@ -379,6 +379,11 @@ def doctor(
         else:
             checks.append(("Project paths", "OK", f"{len(_enabled)} project(s)"))
 
+    # --- Log file location (L6: surface where logs live; previously hidden) ---
+    _log_path = Path(settings.qdrant_path).parent / "logs" / "service.log"
+    data["log_path"] = str(_log_path)
+    checks.append(("Logs", "OK" if _log_path.exists() else "INFO", str(_log_path)))
+
     # --- Output ---
     _bad = {"MISSING", "ERROR", "NOT FOUND"}
     _warn = _bad | {"WARNING", "NOT CREATED", "UNKNOWN", "NOT RUNNING"}
@@ -398,6 +403,7 @@ def doctor(
             "freshness": data.get("freshness"),
             "watcher": data.get("watcher"),
             "projects": data.get("projects"),
+            "log_path": data.get("log_path"),
             "ok": all(stat not in _bad for _, stat, _ in checks),
             "checks": [{"component": n, "status": s.lower(), "detail": d} for n, s, d in checks],
             "recommended_actions": [d for n, s, d in checks if s in _warn and d],

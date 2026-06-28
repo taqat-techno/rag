@@ -39,3 +39,5 @@ def test_doctor_json_is_valid_and_structured(tmp_path, monkeypatch):
     watcher_row = next(c for c in report["checks"] if c["component"] == "Watcher")
     assert watcher_row["status"] == "unknown"
     assert "recommended_actions" in report and isinstance(report["recommended_actions"], list)
+    assert "Logs" in comps
+    assert report["log_path"] and report["log_path"].endswith("service.log")
