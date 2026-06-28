@@ -39,6 +39,9 @@ def build_chunk(
     class_name: str | None = None,
     function_name: str | None = None,
     symbols: list[str] | None = None,
+    imports: list[str] | None = None,
+    exports: list[str] | None = None,
+    signature: str = "",
 ) -> Chunk:
     """Construct a fully-populated Chunk.
 
@@ -73,4 +76,7 @@ def build_chunk(
         class_name=class_name,
         function_name=function_name,
         symbols=symbols,
+        imports=imports or [],
+        exports=exports or [],
+        signature=signature,
     )

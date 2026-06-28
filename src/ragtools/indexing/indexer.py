@@ -110,6 +110,9 @@ def chunks_to_points(chunks: list[Chunk], embeddings, file_hash: str) -> list[Po
                 "class_name": chunk.class_name,
                 "function_name": chunk.function_name,
                 "symbols": chunk.symbols,
+                "imports": chunk.imports,
+                "exports": chunk.exports,
+                "signature": chunk.signature,
             },
         )
         points.append(point)

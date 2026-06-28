@@ -47,6 +47,7 @@ class CodeUnit:
     class_name: str | None = None
     chunk_type: str = CODE
     symbols: list[str] = field(default_factory=list)
+    signature: str | None = None  # declaration line for function/class units
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +216,7 @@ def _python_class_units(lines: list[str], source: str, node: ast.ClassDef) -> li
             name=class_name,
             class_name=class_name,
             symbols=symbols,
+            signature=lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else None,
         )]
 
     # Large class → header unit + one unit per method (methods preserved whole).
@@ -232,6 +234,7 @@ def _python_class_units(lines: list[str], source: str, node: ast.ClassDef) -> li
         name=class_name,
         class_name=class_name,
         symbols=[class_name] + decorators,
+        signature=lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else None,
     ))
     for m in methods:
         units.append(_python_function_unit(lines, m, class_name=class_name))
@@ -245,12 +248,14 @@ def _python_function_unit(
 ) -> CodeUnit:
     seg = _segment(lines, node, with_decorators=True)
     decorators = _decorator_names(node)
+    sig = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else None
     return CodeUnit(
         text=seg,
         kind="method" if class_name else "function",
         name=node.name,
         class_name=class_name,
         symbols=[node.name] + decorators,
+        signature=sig,
     )
 
 
@@ -385,13 +390,14 @@ def _classify_brace_unit(text: str, language: str) -> CodeUnit:
             text=text, kind=kind, name=name,
             class_name=name if kind == "class" else None,
             symbols=_scan_symbols(text) or [name],
+            signature=first,
         )
 
     for pat in _FUNC_PATTERNS:
         fm = pat.search(first)
         if fm:
             name = fm.group(1)
-            return CodeUnit(text=text, kind="function", name=name, symbols=[name])
+            return CodeUnit(text=text, kind="function", name=name, symbols=[name], signature=first)
 
     # CSS/SCSS rule, or unclassified block.
     if language in ("css", "scss") and "{" in first:
@@ -510,8 +516,17 @@ def _pack_units(
         headings = _headings_for(units_in_chunk)
         class_name, function_name = _names_for(units_in_chunk)
         symbols: list[str] = []
+        imports: list[str] = []
+        exports: list[str] = []
         for u in units_in_chunk:
             symbols.extend(u.symbols)
+            if u.kind == "imports":
+                imports.extend(u.symbols)
+            if u.name and not u.name.startswith("_") and u.kind in (
+                "class", "function", "method", "interface", "enum",
+            ):
+                exports.append(u.name)
+        signature = next((u.signature for u in units_in_chunk if u.signature), "")
         chunk_type = _chunk_type_for(units_in_chunk)
         chunks.append(build_chunk(
             project_id=project_id,
@@ -527,6 +542,9 @@ def _pack_units(
             class_name=class_name,
             function_name=function_name,
             symbols=_dedup(symbols),
+            imports=_dedup(imports),
+            exports=_dedup(exports),
+            signature=signature,
         ))
         index += 1
 

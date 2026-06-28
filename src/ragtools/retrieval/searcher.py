@@ -117,6 +117,9 @@ class Searcher:
                     class_name=payload.get("class_name"),
                     function_name=payload.get("function_name"),
                     symbols=payload.get("symbols", []) or [],
+                    imports=payload.get("imports", []) or [],
+                    exports=payload.get("exports", []) or [],
+                    signature=payload.get("signature", "") or "",
                 )
             )
 

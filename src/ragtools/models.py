@@ -26,6 +26,9 @@ class Chunk(BaseModel):
     class_name: str | None = Field(default=None, description="Enclosing class name, if any")
     function_name: str | None = Field(default=None, description="Enclosing function/method name, if any")
     symbols: list[str] = Field(default_factory=list, description="Symbols defined in this chunk (classes, funcs, imports, ...)")
+    imports: list[str] = Field(default_factory=list, description="Modules/names imported by this chunk")
+    exports: list[str] = Field(default_factory=list, description="Public symbols this chunk defines/exposes")
+    signature: str = Field(default="", description="Declaration line of the chunk's primary function/class")
 
 
 class FileRecord(BaseModel):
@@ -56,5 +59,8 @@ class SearchResult(BaseModel):
     class_name: str | None = Field(default=None)
     function_name: str | None = Field(default=None)
     symbols: list[str] = Field(default_factory=list)
+    imports: list[str] = Field(default_factory=list)
+    exports: list[str] = Field(default_factory=list)
+    signature: str = Field(default="")
     # Rerank-adjusted score (set by the dev pipeline; None for plain search).
     adjusted_score: float | None = Field(default=None)

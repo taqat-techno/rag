@@ -31,7 +31,8 @@ Local-first RAG system over documentation, with **opt-in** source-code and confi
 - **Config/data** (`chunking/config_files.py`) — structure-aware: JSON/package.json by top-level key, YAML by top-level key, TOML/INI by `[section]`, others by line packing.
 - **chunk_size=400 tokens, chunk_overlap=100 tokens**
 - **Prepend context header** (`language file_name > symbol/heading path`) to chunk text before embedding; **store raw text** in payload for display.
-- **Per-chunk metadata** stored in the Qdrant payload: `file_name`, `extension`, `language`, `chunk_type` (code|comment|config|documentation), `module` (project name), `class_name`, `function_name`, `symbols`.
+- **Per-chunk metadata** stored in the Qdrant payload: `file_name`, `extension`, `language`, `chunk_type` (code|comment|config|documentation), `module` (project name), `class_name`, `function_name`, `symbols`, `imports`, `exports` (public symbols the chunk defines), `signature` (declaration line of the primary function/class).
+- **Language parsers are pluggable** — `chunking/code.register_language(language, extractor)` adds a language without editing `chunk_code_file`. Built-ins: Python (`ast`), brace scanner (js/ts/java/go/cs/php/css/scss/rust/kotlin/scala/swift/c/cpp), SQL; unregistered → generic.
 - **Deterministic chunk IDs** — `sha256(project_id::file_path::chunk_index)` formatted as UUID (shared helper `chunking/common.make_chunk_id`).
 
 ### Retrieval

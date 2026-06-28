@@ -155,10 +155,14 @@ def format_dev_context(results: list[SearchResult], query: str, triggers: list[s
         bits = []
         if r.language:
             bits.append(r.language)
+        if r.signature:
+            bits.append(r.signature)
         if r.class_name:
             bits.append(f"class {r.class_name}")
         if r.function_name:
             bits.append(f"fn {r.function_name}")
+        if r.imports:
+            bits.append("imports: " + ", ".join(r.imports[:5]))
         if r.symbols:
             bits.append("symbols: " + ", ".join(r.symbols[:6]))
         elif r.headings:
