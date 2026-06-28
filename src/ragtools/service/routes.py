@@ -72,11 +72,19 @@ def health():
         # /health return non-200. Fall through with watcher_running=False.
         watcher_running = False
 
+    # Additive degraded signal — `status` stays "ready" for liveness back-compat;
+    # this surfaces watcher-down on /health so callers needn't interpret the raw
+    # bool. Index staleness is reported on /api/status + `rag doctor` (which read
+    # the state DB); /health stays cheap and lock-free.
+    issues = [] if watcher_running else ["watcher_not_running"]
+
     return {
         "status": "ready",
         "collection": owner.settings.collection_name,
         "version": __version__,
         "watcher_running": watcher_running,
+        "degraded": bool(issues),
+        "issues": issues,
     }
 
 
@@ -1104,6 +1112,7 @@ def system_health_endpoint():
     })
 
     # Collection / scale
+    status = None
     try:
         owner = get_owner()
         status = owner.get_status()
@@ -1119,6 +1128,39 @@ def system_health_endpoint():
         })
     except Exception as e:
         checks.append({"component": "collection", "status": "error", "detail": str(e)})
+
+    # Index freshness (A-008)
+    if status is not None:
+        fr = status.get("freshness") or {}
+        checks.append({
+            "component": "index_freshness",
+            "status": "warning" if fr.get("level") == "stale" else "ok",
+            "detail": fr.get("message") or (fr.get("level") or "unknown"),
+            "level": fr.get("level"),
+            "last_indexed": fr.get("last_indexed"),
+            "age_seconds": fr.get("age_seconds"),
+        })
+
+    # Watcher health — the canonical health surface was previously blind to it.
+    try:
+        running = _watcher_thread is not None and _watcher_thread.is_alive()
+        obs = _watcher_observability_snapshot()
+        if running:
+            wstatus, detail = "ok", "running"
+        elif obs.get("last_error"):
+            wstatus, detail = "error", obs["last_error"]
+        else:
+            wstatus, detail = "warning", "not running"
+        checks.append({
+            "component": "watcher",
+            "status": wstatus,
+            "detail": detail,
+            "running": running,
+            "last_error": obs.get("last_error"),
+            "consecutive_failures": obs.get("consecutive_failures", 0),
+        })
+    except Exception as e:
+        checks.append({"component": "watcher", "status": "error", "detail": str(e)})
 
     # Startup + Watchdog (Windows only)
     if _sys.platform == "win32":

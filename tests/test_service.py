@@ -66,6 +66,26 @@ def test_health_includes_version_and_watcher(test_client):
     assert isinstance(body["watcher_running"], bool)
 
 
+def test_health_surfaces_degraded_and_issues(test_client):
+    """Additive: /health flags degraded (watcher down) without changing `status`."""
+    body = test_client.get("/health").json()
+    assert body["status"] == "ready"  # liveness contract unchanged
+    assert isinstance(body["degraded"], bool)
+    assert isinstance(body["issues"], list)
+    # The test app never starts the watcher -> degraded with a named issue.
+    assert body["watcher_running"] is False
+    assert body["degraded"] is True
+    assert "watcher_not_running" in body["issues"]
+
+
+def test_system_health_includes_watcher_and_freshness(test_client):
+    """rag doctor's HTTP twin now reports watcher + index freshness."""
+    body = test_client.get("/api/system-health").json()
+    comps = {c["component"] for c in body["checks"]}
+    assert "watcher" in comps
+    assert "index_freshness" in comps
+
+
 def test_health_503_returns_documented_json_shape(monkeypatch):
     """503 returns FastAPI's default {'detail': '...'} JSON body. Pin the
     shape so future refactors that drop the get_owner() RuntimeError path
