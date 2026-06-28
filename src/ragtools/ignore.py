@@ -91,38 +91,56 @@ SECRET_PATTERNS = [
     "*.secret", "*.secrets",
     "secrets.json", "secrets.yaml", "secrets.yml",
     "credential.json", "credentials", "credentials.json", "credentials.yaml", "credentials.yml",
+    # secret/credential directory (symmetry with `credentials`: a bare name
+    # matches a directory OR a file of that name at any depth).
+    "secrets",
 ]
 
 _SECRET_SPEC = pathspec.PathSpec.from_lines("gitignore", SECRET_PATTERNS)
 _SECRET_BROAD_RE = re.compile(r"(secret|credential)", re.IGNORECASE)
+
+# For the broad *secret*/*credential* NAME match: exempt true prose docs and
+# logic source modules (e.g. secret_manager.py) — named, but not secret stores.
+# Everything else named secret/credential (config/data, and data-bearing
+# scripts/SQL such as secrets.sh or db_credentials.sql) is treated as a secret.
+_PROSE_LANGUAGES = frozenset({"markdown", "restructuredtext"})
+_LOGIC_CODE_LANGUAGES = frozenset({
+    "python", "javascript", "typescript", "java", "go", "csharp", "php",
+})
 
 
 def is_secret(file_path: Path | str, allowlist: "list[str] | tuple[str, ...]" = ()) -> bool:
     """Return True if a file is secret-bearing and must never be indexed.
 
     Specific secret artifacts (dotenv, keys, credential stores) are denied for
-    all file types. Broad ``*secret*`` / ``*credential*`` name matches are denied
-    only for non-source files, so legitimate source code stays indexable. An
-    explicit ``allowlist`` of gitignore-style globs re-includes specific paths.
+    all file types, case-insensitively. Broad ``*secret*`` / ``*credential*``
+    name matches are denied for config/data files and data-bearing scripts
+    (e.g. ``secrets.sh``, ``db_credentials.sql``); prose docs (md/rst) and logic
+    source modules (e.g. ``secret_manager.py``) stay indexable. An explicit
+    ``allowlist`` of gitignore-style globs re-includes specific paths.
     """
     p = Path(file_path)
-    rel = p.as_posix()
-    name = p.name
+    rel_l = p.as_posix().lower()
+    name_l = p.name.lower()
 
+    # Case-insensitive throughout — the target filesystem (Windows) is too.
     if allowlist:
-        allow_spec = pathspec.PathSpec.from_lines("gitignore", list(allowlist))
-        if allow_spec.match_file(rel) or allow_spec.match_file(name):
+        allow_spec = pathspec.PathSpec.from_lines("gitignore", [a.lower() for a in allowlist])
+        if allow_spec.match_file(rel_l) or allow_spec.match_file(name_l):
             return False
 
-    if _SECRET_SPEC.match_file(rel) or _SECRET_SPEC.match_file(name):
+    if _SECRET_SPEC.match_file(rel_l) or _SECRET_SPEC.match_file(name_l):
         return True
 
-    if _SECRET_BROAD_RE.search(name):
-        # Broad name match: treat as secret only for non-source files.
-        from ragtools.chunking.languages import CODE, classify_file
+    if _SECRET_BROAD_RE.search(name_l):
+        # Prose docs and logic source modules named secret/credential are not
+        # secret stores; everything else (config/data, data-bearing scripts) is.
+        from ragtools.chunking.languages import classify_file
 
         fc = classify_file(p)
-        if fc is None or fc.chunk_type != CODE:
+        if fc is None:
+            return True
+        if fc.language not in _PROSE_LANGUAGES and fc.language not in _LOGIC_CODE_LANGUAGES:
             return True
 
     return False

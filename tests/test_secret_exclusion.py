@@ -88,14 +88,21 @@ def test_discover_excludes_secrets_keeps_source(tmp_path):
 
 
 def test_index_file_does_not_store_secret_values(tmp_path):
-    """Storage gate: a secret file never reaches Qdrant payload or vectors."""
+    """Storage gate: a secret file never reaches Qdrant payload or vectors.
+
+    Uses ``credentials.json`` (a SUPPORTED, chunkable extension) so that n==0 is
+    attributable to the is_secret gate, not to the file being non-classifiable.
+    """
     from ragtools.config import Settings
     from ragtools.embedding.encoder import Encoder
     from ragtools.indexing.indexer import ensure_collection, index_file
+    from ragtools.chunking.languages import classify_file
 
     secret_token = "sk-LEAK-CANARY-d34db33f"
-    secret = tmp_path / "prod.env"
-    secret.write_text(f"API_KEY={secret_token}\n", encoding="utf-8")
+    secret = tmp_path / "credentials.json"
+    secret.write_text('{"api_key": "' + secret_token + '"}\n', encoding="utf-8")
+    # Precondition: this file WOULD chunk if the gate were absent.
+    assert classify_file(secret) is not None
 
     settings = Settings()
     client = Settings.get_memory_client()
@@ -108,10 +115,52 @@ def test_index_file_does_not_store_secret_values(tmp_path):
         collection_name=settings.collection_name,
         project_id="proj",
         file_path=secret,
-        relative_path="proj/prod.env",
+        relative_path="proj/credentials.json",
     )
     assert n == 0
     points, _ = client.scroll(
         collection_name=settings.collection_name, limit=16, with_payload=True
     )
     assert points == []
+
+
+# --- Adversarial-review follow-ups: secret-layer correctness ----------------
+
+@pytest.mark.parametrize("name", [
+    "secrets.sh", "export-secrets.sh", "set-credentials.bash",
+    "db_credentials.sql", "secret_dump.sql", "load_credentials.sql",
+])
+def test_data_bearing_scripts_named_secret_are_excluded(name):
+    # .sh/.bash/.sql named secret/credential are the secret artifact itself
+    # (e.g. `export AWS_SECRET_ACCESS_KEY=...`), not logic modules.
+    assert is_secret(name) is True, name
+
+
+@pytest.mark.parametrize("name", [
+    "secret_manager.py", "credential_service.ts", "secrets.go", "secretStore.java",
+])
+def test_logic_modules_named_secret_stay_indexable(name):
+    assert is_secret(name) is False, name
+
+
+@pytest.mark.parametrize("name", [
+    "docs/credential-rotation-runbook.md", "secrets-policy.md", "our-credentials.rst",
+])
+def test_prose_docs_named_secret_stay_indexable(name):
+    # Markdown/rst prose named secret/credential is documentation, not a store —
+    # excluding it would be a silent regression vs the docs-only baseline.
+    assert is_secret(name) is False, name
+
+
+@pytest.mark.parametrize("path", [
+    "secrets/app.json", "secrets/db.yml", "config/secrets/token.yaml",
+])
+def test_secrets_directory_excluded(path):
+    assert is_secret(path) is True, path
+
+
+@pytest.mark.parametrize("name", [
+    "ID_RSA", "PROD.ENV", "SERVER.KEY", "Credentials.JSON", "App.Secrets.YAML",
+])
+def test_secret_detection_is_case_insensitive(name):
+    assert is_secret(name) is True, name

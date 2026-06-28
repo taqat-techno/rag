@@ -292,7 +292,7 @@ def _run_incremental_memory(settings: Settings) -> dict:
         delete_file_points,
     )
 
-    files = scan_project(settings.content_root)
+    files = scan_project(settings.content_root, include_code=settings.index_source_code)
     current_paths = {get_relative_path(fp, settings.content_root) for _, fp in files}
 
     tracked_paths = state.get_all_paths()
