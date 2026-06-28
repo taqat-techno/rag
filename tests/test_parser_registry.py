@@ -40,3 +40,28 @@ def test_unregistered_language_falls_back_to_generic(tmp_path):
     f.write_text("alpha\n\nbeta gamma\n", encoding="utf-8")
     chunks = codemod.chunk_code_file(f, "p", "x.unknownlang", language="unknownlang")
     assert chunks  # generic fallback produced something
+
+
+# --- Increment 2: more brace-family languages via the registry --------------
+
+def test_new_brace_languages_classified_and_chunked(tmp_path):
+    from ragtools.chunking.languages import CODE, classify_file
+    snippet = "struct Point { x: i32 }\n\nclass Foo {\n    bar() { return 1; }\n}\n"
+    for ext, lang in [(".rs", "rust"), (".kt", "kotlin"), (".scala", "scala"),
+                      (".swift", "swift"), (".c", "c"), (".cpp", "cpp"), (".hpp", "cpp")]:
+        fc = classify_file(f"a{ext}")
+        assert fc is not None and fc.chunk_type == CODE and fc.language == lang, ext
+        assert lang in codemod._LANGUAGE_EXTRACTORS, lang
+        f = tmp_path / f"a{ext}"
+        f.write_text(snippet, encoding="utf-8")
+        chunks = codemod.chunk_code_file(f, "p", f"a{ext}", language=lang)
+        assert chunks, ext
+        syms = [s for c in chunks for s in c.symbols]
+        assert "Point" in syms or "Foo" in syms, (ext, syms)
+
+
+def test_logic_languages_named_secret_stay_indexable():
+    from ragtools.ignore import is_secret
+    assert is_secret("secret_config.rs") is False        # rust logic module
+    assert is_secret("CredentialStore.kt") is False      # kotlin logic module
+    assert is_secret("secrets.yaml") is True             # config still excluded

@@ -106,6 +106,7 @@ _SECRET_BROAD_RE = re.compile(r"(secret|credential)", re.IGNORECASE)
 _PROSE_LANGUAGES = frozenset({"markdown", "restructuredtext"})
 _LOGIC_CODE_LANGUAGES = frozenset({
     "python", "javascript", "typescript", "java", "go", "csharp", "php",
+    "rust", "kotlin", "scala", "swift", "c", "cpp",
 })
 
 

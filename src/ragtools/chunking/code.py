@@ -675,6 +675,9 @@ def _sql_extractor(source: str, language: str) -> list[CodeUnit]:
 
 
 register_language("python", _python_extractor)
-for _brace_lang in ("javascript", "typescript", "java", "go", "csharp", "php", "css", "scss"):
+for _brace_lang in (
+    "javascript", "typescript", "java", "go", "csharp", "php", "css", "scss",
+    "rust", "kotlin", "scala", "swift", "c", "cpp",
+):
     register_language(_brace_lang, _extract_brace_units)
 register_language("sql", _sql_extractor)
