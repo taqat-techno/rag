@@ -24,21 +24,37 @@ from ragtools.ignore import IgnoreRules, RAGIGNORE_FILENAME
 console = Console()
 
 
-def _make_md_filter(ignore_rules: IgnoreRules, content_root: Path):
+def is_indexable_change(path: str, ignore_rules: IgnoreRules, content_root: Path, include_code: bool) -> bool:
+    """Shared watcher predicate: should a changed file be (re)indexed?
+
+    Honors index_source_code (docs-only when disabled), excludes secret-bearing
+    files, and respects ignore rules. Used by both the CLI watcher (observer)
+    and the service watcher thread so they behave identically.
+    """
+    from ragtools.chunking.languages import is_documentation, is_supported
+
+    p = Path(path)
+    if not is_supported(path):
+        return False
+    if not include_code and not is_documentation(path):
+        return False
+    if ignore_rules.is_secret(p):
+        return False
+    return not ignore_rules.is_ignored(p, content_root)
+
+
+def _make_md_filter(ignore_rules: IgnoreRules, content_root: Path, include_code: bool):
     """Create a watchfiles filter using ignore rules.
 
-    Accepts any supported indexable file (Markdown, source code, config) plus
-    ``.ragignore`` changes. Returns a closure watchfiles can use as watch_filter.
+    Accepts indexable files (Markdown always; source/config only when
+    ``include_code``), excludes secrets, plus ``.ragignore`` changes (to trigger
+    a rule reload). Returns a closure watchfiles can use as watch_filter.
     """
-    from ragtools.chunking.languages import is_supported
-
     def md_filter(change: Change, path: str) -> bool:
         # Accept .ragignore file changes (to trigger rule reload)
         if Path(path).name == RAGIGNORE_FILENAME:
             return True
-        if not is_supported(path):
-            return False
-        return not ignore_rules.is_ignored(Path(path), content_root)
+        return is_indexable_change(path, ignore_rules, content_root, include_code)
 
     return md_filter
 
@@ -68,6 +84,7 @@ def run_watch(
         content_root=root_path,
         global_patterns=settings.ignore_patterns,
         use_ragignore=settings.use_ragignore_files,
+        secret_allowlist=settings.secret_allowlist,
     )
 
     console.print(f"[bold]Watching[/bold] {content_root} for Markdown changes...")
@@ -77,7 +94,7 @@ def run_watch(
     try:
         for changes in watch(
             content_root,
-            watch_filter=_make_md_filter(ignore_rules, root_path),
+            watch_filter=_make_md_filter(ignore_rules, root_path, settings.index_source_code),
             debounce=debounce_ms,
             recursive=True,
             raise_interrupt=False,
@@ -94,8 +111,10 @@ def run_watch(
                 console.print("  [dim].ragignore changed — ignore rules reloaded[/dim]")
 
             # Filter to only actual indexable-file changes (not .ragignore changes)
-            from ragtools.chunking.languages import is_supported
-            md_changes = [(c, p) for c, p in changes if is_supported(p)]
+            md_changes = [
+                (c, p) for c, p in changes
+                if is_indexable_change(p, ignore_rules, root_path, settings.index_source_code)
+            ]
             if not md_changes:
                 continue
 
@@ -137,7 +156,11 @@ def _run_incremental(settings: Settings, ignore_rules: IgnoreRules) -> None:
 
         ensure_collection(client, settings.collection_name, encoder.dimension)
 
-        files = scan_project(settings.content_root, ignore_rules=ignore_rules)
+        files = scan_project(
+            settings.content_root,
+            ignore_rules=ignore_rules,
+            include_code=getattr(settings, "index_source_code", False),
+        )
         current_paths = {get_relative_path(fp, settings.content_root) for _, fp in files}
         tracked_paths = state.get_all_paths()
         deleted_paths = tracked_paths - current_paths
@@ -172,6 +195,7 @@ def _run_incremental(settings: Settings, ignore_rules: IgnoreRules) -> None:
                 relative_path=relative_path,
                 chunk_size=settings.chunk_size,
                 chunk_overlap=settings.chunk_overlap,
+                secret_allowlist=tuple(settings.secret_allowlist),
             )
             state.update(relative_path, pid, current_hash, count)
             indexed += 1
