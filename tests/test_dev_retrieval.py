@@ -128,3 +128,15 @@ def test_non_dev_query_uses_flat_strategy():
     assert out.strategy == "flat"
     # no codebase-first bonus -> raw order, doc 0.55 above code 0.50
     assert out.results[0].file_path == "guide.md"
+    # flat must not apply the rerank bonus at all
+    assert all(r.adjusted_score == r.score for r in out.results)
+
+
+def test_format_dev_context_confidence_band_reflects_rerank():
+    # A code chunk reranked from raw MODERATE (0.55) up to HIGH (0.72) should
+    # display the HIGH band, not the stale raw-derived one.
+    r = _sr(0.55, "code", "svc.py")
+    r.adjusted_score = 0.72
+    out = format_dev_context([r], "implement token validation", ["implement"])
+    assert "HIGH" in out
+    assert "0.55→0.72 reranked" in out

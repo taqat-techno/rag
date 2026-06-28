@@ -239,6 +239,12 @@ All settings in `config.py` via Pydantic Settings. Override with env vars prefix
 | `RAG_INDEX_SOURCE_CODE` | `false` | Opt-in: also index source code + config/data, not just docs |
 | `RAG_SECRET_ALLOWLIST` | `[]` | Globs to re-include specific secret-bearing files (default: none) |
 
+## Upgrade notes (2.6)
+
+- **Code/config indexing is now opt-in** (`index_source_code` default `False`). If you indexed source on a prior `master` build, the first incremental run after upgrade treats those code files as deletions and purges them from Qdrant + the state DB. Set `RAG_INDEX_SOURCE_CODE=1` to keep indexing code, or run `rag rebuild` for a clean docs-only index.
+- **Global `[ignore].patterns` now apply on the direct-API indexing path** (previously dropped when no `ignore_rules` was passed). A file that newly matches a configured ignore pattern is removed on the next incremental run.
+- **Secret-bearing files are never indexed** (`.env*`, keys, `credentials*`, `secrets/`, …); use `secret_allowlist` / `RAG_SECRET_ALLOWLIST` to re-include specific paths.
+
 ## Entry Points
 
 Defined in `pyproject.toml`:

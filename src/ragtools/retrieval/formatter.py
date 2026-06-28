@@ -164,7 +164,8 @@ def format_dev_context(results: list[SearchResult], query: str, triggers: list[s
         elif r.headings:
             bits.append(" > ".join(r.headings))
         descriptor = " | ".join(bits) if bits else "see retrieved chunk"
-        lines.append(f"* {f} — {descriptor} ({r.confidence}, {_score_label(r)})")
+        disp_score = r.adjusted_score if r.adjusted_score is not None else r.score
+        lines.append(f"* {f} — {descriptor} ({_confidence_band(disp_score)}, {_score_label(r)})")
 
     lines.append("")
     lines.append("--- Retrieved chunks ---")
@@ -194,6 +195,16 @@ def _score_label(r: SearchResult) -> str:
     if r.adjusted_score is not None and abs(r.adjusted_score - r.score) > 1e-9:
         return f"{r.score:.2f}→{r.adjusted_score:.2f} reranked"
     return f"{r.score:.2f}"
+
+
+def _confidence_band(score: float) -> str:
+    """HIGH/MODERATE/LOW band for the (possibly reranked) display score, so the
+    confidence WORD stays consistent with the adjusted ranking."""
+    if score >= 0.7:
+        return "HIGH"
+    if score >= 0.5:
+        return "MODERATE"
+    return "LOW"
 
 
 def _truncate(text: str, max_chars: int = 600) -> str:

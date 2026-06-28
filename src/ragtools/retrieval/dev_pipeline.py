@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from ragtools.models import SearchResult
 from ragtools.retrieval.feature_intent import detect_dev_intent, matched_triggers
-from ragtools.retrieval.rerank import adjusted_score, merge_and_rerank
+from ragtools.retrieval.rerank import adjusted_score, dedup_by_chunk_id, merge_and_rerank
 from ragtools.retrieval.searcher import Searcher
 
 
@@ -77,9 +77,13 @@ def dev_search(
     #     code-first bonus (don't force code to the top for a non-dev question).
     is_dev = detect_dev_intent(query)
     threshold = searcher.settings.score_threshold
-    merged = merge_and_rerank(code_hits, doc_hits, config_hits)
-    if not is_dev:
-        merged = sorted(merged, key=lambda r: r.score, reverse=True)
+    if is_dev:
+        merged = merge_and_rerank(code_hits, doc_hits, config_hits)
+    else:
+        # flat: dedup, then order by RAW score directly — no code-first bonus,
+        # not even as a tie-break on equal scores.
+        merged = sorted(dedup_by_chunk_id(code_hits, doc_hits, config_hits),
+                        key=lambda r: r.score, reverse=True)
 
     combined: list[SearchResult] = []
     for r in merged:

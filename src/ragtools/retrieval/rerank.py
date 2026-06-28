@@ -81,11 +81,11 @@ def rerank(results: list[SearchResult]) -> list[SearchResult]:
     return [r for _, r in indexed]
 
 
-def merge_and_rerank(*result_lists: list[SearchResult]) -> list[SearchResult]:
-    """Combine several result lists (dedup by chunk_id), then priority-rerank.
+def dedup_by_chunk_id(*result_lists: list[SearchResult]) -> list[SearchResult]:
+    """Merge several result lists, keeping the highest-raw-score entry per chunk_id.
 
-    Used by the layered dev-search pipeline: search code, then docs, then
-    architecture, then combine + rerank into a single ordered context set.
+    Order is undefined (callers sort). Used by both the codebase-first path
+    (then reranked) and the flat path (then sorted by raw score).
     """
     by_id: dict[str, SearchResult] = {}
     for results in result_lists:
@@ -93,4 +93,13 @@ def merge_and_rerank(*result_lists: list[SearchResult]) -> list[SearchResult]:
             existing = by_id.get(r.chunk_id)
             if existing is None or r.score > existing.score:
                 by_id[r.chunk_id] = r
-    return rerank(list(by_id.values()))
+    return list(by_id.values())
+
+
+def merge_and_rerank(*result_lists: list[SearchResult]) -> list[SearchResult]:
+    """Combine several result lists (dedup by chunk_id), then priority-rerank.
+
+    Used by the layered dev-search pipeline: search code, then docs, then
+    architecture, then combine + rerank into a single ordered context set.
+    """
+    return rerank(dedup_by_chunk_id(*result_lists))
