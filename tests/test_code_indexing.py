@@ -76,6 +76,29 @@ class TestCodeFilesIndexed:
         assert "code" in chunk_types          # at least one code chunk
         assert "comment" in chunk_types        # module docstring extracted as comment
 
+    def test_code_metadata_round_trips_through_qdrant(self, indexed):
+        """symbols / class_name / function_name survive upsert -> stored payload."""
+        _, client, _, _, _ = indexed
+        points, _ = client.scroll(
+            collection_name="markdown_kb", limit=256, with_payload=True, with_vectors=False
+        )
+        py = [p for p in points if p.payload.get("file_path", "").endswith("auth_service.py")]
+        assert py
+        assert any(p.payload.get("symbols") for p in py), "symbols lost in payload round-trip"
+        assert any(
+            p.payload.get("function_name") or p.payload.get("class_name") for p in py
+        ), "class_name/function_name lost in payload round-trip"
+
+    def test_search_result_carries_code_metadata(self, indexed):
+        """The metadata also survives into SearchResult (searcher payload mapping)."""
+        _, _, _, searcher, _ = indexed
+        results = searcher.search(
+            "authenticate a user and issue a session token",
+            project_id="code_project", chunk_types=["code"],
+        )
+        assert results
+        assert any(r.symbols for r in results), "SearchResult.symbols empty after round-trip"
+
 
 class TestRetrievalWorks:
     def test_search_finds_code(self, indexed):

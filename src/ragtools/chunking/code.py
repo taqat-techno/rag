@@ -603,13 +603,22 @@ def _headings_for(units: list[CodeUnit]) -> list[str]:
 
 
 def _names_for(units: list[CodeUnit]) -> tuple[str | None, str | None]:
-    if len(units) == 1:
-        u = units[0]
-        if u.kind in ("function", "method"):
-            return u.class_name, u.name
-        if u.kind in ("class", "interface", "enum", "rule"):
-            return u.name, None
-    return None, None
+    """Best-effort (class_name, function_name) for a chunk.
+
+    Single-unit chunks map directly; multi-unit chunks (small files whose units
+    pack together) surface the first class and first function/method they hold
+    so the names aren't lost from the chunk metadata.
+    """
+    class_name: str | None = None
+    function_name: str | None = None
+    for u in units:
+        if u.class_name and class_name is None:
+            class_name = u.class_name
+        if u.kind in ("function", "method") and function_name is None:
+            function_name = u.name
+        elif u.kind in ("class", "interface", "enum", "rule") and class_name is None:
+            class_name = u.name
+    return class_name, function_name
 
 
 def _chunk_type_for(units: list[CodeUnit]) -> str:
