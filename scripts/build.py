@@ -32,7 +32,16 @@ def download_model():
     # Use sentence-transformers to download to our cache location
     os.environ["SENTENCE_TRANSFORMERS_HOME"] = str(MODEL_CACHE_DIR)
     from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer("all-MiniLM-L6-v2", cache_folder=str(MODEL_CACHE_DIR))
+    # Force CPU: the build only downloads + bundles the model files (we just read
+    # the embedding dim below), and the bundled model runs CPU-only at runtime.
+    # Letting sentence-transformers auto-select the device makes it pick MPS on
+    # macOS CI runners, where the headless Metal backend spuriously fails to
+    # allocate ("MPS backend out of memory" with the pool empty) and breaks the
+    # build. CPU is already the default on the Windows/Linux runners, so this is
+    # a no-op there.
+    model = SentenceTransformer(
+        "all-MiniLM-L6-v2", cache_folder=str(MODEL_CACHE_DIR), device="cpu"
+    )
     dim = model.get_sentence_embedding_dimension()
     print(f"Model downloaded: all-MiniLM-L6-v2 (dim={dim})")
     print(f"Cache location: {MODEL_CACHE_DIR}")
