@@ -194,7 +194,10 @@ def scan_configured_projects(
             secret_allowlist=secret_allowlist,
         )
 
-        for found in discover_indexable_files(project_path, ignore_rules=ignore_rules, include_code=include_code):
+        # Per-project "dev mode": resolve this project's effective code-indexing
+        # decision (its override, or the global `include_code` as the fallback).
+        proj_include = project.resolve_index_code(include_code)
+        for found in discover_indexable_files(project_path, ignore_rules=ignore_rules, include_code=proj_include):
             # Skip files that belong to a more specific child project
             if child_paths:
                 file_resolved = found.resolve()

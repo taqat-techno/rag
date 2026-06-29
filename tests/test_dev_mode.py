@@ -82,3 +82,64 @@ def test_loaded_project_roundtrips_through_settings(tmp_path, monkeypatch):
     by_id = {p.id: p for p in Settings().projects}
     assert by_id["code"].index_source_code is True
     assert by_id["inherit"].index_source_code is None
+
+
+# --- Phase 3: pipeline threading (scanner per-project + watcher deepest-match) ---
+
+def _mk(path, files):
+    path.mkdir(parents=True, exist_ok=True)
+    for name, content in files.items():
+        (path / name).write_text(content)
+
+
+def test_scan_resolves_index_code_per_project(tmp_path):
+    from ragtools.indexing.scanner import scan_configured_projects
+    a = tmp_path / "code_proj"
+    _mk(a, {"app.py": "x = 1\n", "readme.md": "# A\n"})
+    b = tmp_path / "docs_proj"
+    _mk(b, {"util.py": "y = 2\n", "notes.md": "# B\n"})
+    projects = [
+        ProjectConfig(id="A", path=str(a), index_source_code=True),  # force code
+        ProjectConfig(id="B", path=str(b)),                          # inherit (None)
+    ]
+    # global OFF -> A forces code, B inherits docs-only
+    names = {(pid, p.name) for pid, p in scan_configured_projects(projects, include_code=False)}
+    assert ("A", "app.py") in names
+    assert ("A", "readme.md") in names
+    assert ("B", "util.py") not in names
+    assert ("B", "notes.md") in names
+
+
+def test_scan_global_on_project_forced_docs(tmp_path):
+    from ragtools.indexing.scanner import scan_configured_projects
+    b = tmp_path / "forced_docs"
+    _mk(b, {"util.py": "y = 2\n", "notes.md": "# B\n"})
+    projects = [ProjectConfig(id="B", path=str(b), index_source_code=False)]
+    # global ON, but this project is forced docs-only
+    names = {(pid, p.name) for pid, p in scan_configured_projects(projects, include_code=True)}
+    assert ("B", "util.py") not in names
+    assert ("B", "notes.md") in names
+
+
+def test_scan_secret_excluded_even_in_code_mode(tmp_path):
+    from ragtools.indexing.scanner import scan_configured_projects
+    a = tmp_path / "code_secret"
+    _mk(a, {"app.py": "x = 1\n", "credentials.json": "{}\n"})
+    projects = [ProjectConfig(id="A", path=str(a), index_source_code=True)]
+    names = {p.name for _, p in scan_configured_projects(projects, include_code=False)}
+    assert "app.py" in names
+    assert "credentials.json" not in names  # secret layer is orthogonal & always-on
+
+
+def test_watcher_deepest_matching_root(tmp_path):
+    from pathlib import Path
+    from ragtools.service.watcher_thread import _deepest_matching_root
+    parent = (tmp_path / "parent").resolve()
+    child = (parent / "child").resolve()
+    roots = [parent, child]
+    # a file inside the nested child must attribute to the DEEPEST root (child)
+    assert _deepest_matching_root((child / "x.py").resolve(), roots) == child
+    # a file directly under parent attributes to parent
+    assert _deepest_matching_root((parent / "y.py").resolve(), roots) == parent
+    # outside both roots -> None
+    assert _deepest_matching_root((tmp_path / "other.py").resolve(), roots) is None
