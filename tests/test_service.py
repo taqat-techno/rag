@@ -66,6 +66,72 @@ def test_health_includes_version_and_watcher(test_client):
     assert isinstance(body["watcher_running"], bool)
 
 
+def test_health_surfaces_degraded_and_issues(test_client):
+    """Additive: /health flags degraded (watcher down) without changing `status`."""
+    body = test_client.get("/health").json()
+    assert body["status"] == "ready"  # liveness contract unchanged
+    assert isinstance(body["degraded"], bool)
+    assert isinstance(body["issues"], list)
+    # The test app never starts the watcher -> degraded with a named issue.
+    assert body["watcher_running"] is False
+    assert body["degraded"] is True
+    assert "watcher_not_running" in body["issues"]
+
+
+def test_system_health_includes_watcher_and_freshness(test_client):
+    """rag doctor's HTTP twin now reports watcher + index freshness."""
+    body = test_client.get("/api/system-health").json()
+    comps = {c["component"] for c in body["checks"]}
+    assert "watcher" in comps
+    assert "index_freshness" in comps
+
+
+def test_uncaught_error_returns_json_500(monkeypatch):
+    """Contract: non-200 bodies are JSON even on an UNCAUGHT 5xx (report L2).
+
+    Without the global exception handler, Starlette returns plain-text
+    'Internal Server Error'. Force /health to raise an unexpected error and
+    assert the response is JSON {'detail': ...}.
+    """
+    from starlette.testclient import TestClient
+    from ragtools.service.app import create_app
+    from ragtools.service import app as app_module
+
+    class _BadOwner:
+        @property
+        def settings(self):
+            raise ValueError("boom")  # uncaught, non-HTTPException
+
+    _prev_owner, _prev_settings = app_module._owner, app_module._settings
+    app_module._owner = _BadOwner()
+    app_module._settings = object()
+    try:
+        app = create_app()
+        with TestClient(app, raise_server_exceptions=False) as tc:
+            r = tc.get("/health")
+        assert r.status_code == 500
+        assert r.headers["content-type"].startswith("application/json")
+        assert r.json()["detail"] == "Internal Server Error"
+    finally:
+        app_module._owner, app_module._settings = _prev_owner, _prev_settings
+
+
+def test_derive_watcher_state_branches():
+    """L3: the derived lifecycle label disambiguates the null/0 fingerprint."""
+    from ragtools.service.routes import _derive_watcher_state
+    assert _derive_watcher_state({}, True) == "running"
+    assert _derive_watcher_state({"consecutive_failures": 5}, False) == "gave_up"
+    assert _derive_watcher_state({"last_error": "boom"}, False) == "crashed"
+    assert _derive_watcher_state({"last_started_at": "t"}, False) == "exited"
+    assert _derive_watcher_state({}, False) == "inactive"
+
+
+def test_watcher_status_includes_state(test_client):
+    body = test_client.get("/api/watcher/status").json()
+    assert "state" in body
+    assert body["state"] == "inactive"  # test app never starts the watcher
+
+
 def test_health_503_returns_documented_json_shape(monkeypatch):
     """503 returns FastAPI's default {'detail': '...'} JSON body. Pin the
     shape so future refactors that drop the get_owner() RuntimeError path
@@ -310,3 +376,75 @@ def test_watcher_status_not_running(test_client):
     r = test_client.get("/api/watcher/status")
     assert r.status_code == 200
     assert r.json()["running"] is False
+
+
+def test_lifespan_autostarts_watcher(monkeypatch):
+    """M3: the watcher is started by the service lifecycle (lifespan), NOT by a
+    delayed HTTP self-POST in run.py. Drive the real-startup branch with a fake
+    owner (no encoder load) and assert the lifespan invokes autostart_watcher().
+    """
+    from starlette.testclient import TestClient
+    from ragtools.service.app import create_app
+    from ragtools.service import app as app_module
+    from ragtools.service import routes as routes_mod
+
+    class _FakeOwner:
+        def __init__(self, settings):
+            self._settings = settings
+
+        def close(self):
+            pass
+
+    called = {"n": 0}
+
+    def _spy_autostart():
+        called["n"] += 1
+        return {"status": "started"}
+
+    # Fake owner so the real-startup branch doesn't load the encoder; spy on the
+    # controller so no real watcher thread spins up.
+    monkeypatch.setattr(app_module, "QdrantOwner", _FakeOwner)
+    monkeypatch.setattr(routes_mod, "autostart_watcher", _spy_autostart)
+
+    _prev_owner, _prev_settings = app_module._owner, app_module._settings
+    app_module._owner = None  # force the real-startup branch (not the test-inject one)
+    app_module._settings = None
+    try:
+        with TestClient(create_app(), raise_server_exceptions=True):
+            pass
+        assert called["n"] == 1, "lifespan did not call autostart_watcher()"
+    finally:
+        app_module._owner, app_module._settings = _prev_owner, _prev_settings
+
+
+def test_health_not_degraded_when_user_stopped(test_client):
+    """M3: a watcher that is down because the user stopped it is intentional —
+    /health must NOT flag it as degraded (only an undesired-down watcher is)."""
+    from ragtools.service import routes as routes_mod
+
+    prev = routes_mod._watcher_desired_run
+    routes_mod._watcher_desired_run = False
+    try:
+        body = test_client.get("/health").json()
+        assert body["status"] == "ready"
+        assert body["watcher_running"] is False
+        assert body["degraded"] is False
+        assert "watcher_not_running" not in body["issues"]
+    finally:
+        routes_mod._watcher_desired_run = prev
+
+
+def test_system_health_watcher_ok_when_user_stopped(test_client):
+    """M3: system-health reports a user-stopped watcher as ok ('stopped by user'),
+    not a warning — the operator deliberately turned it off."""
+    from ragtools.service import routes as routes_mod
+
+    prev = routes_mod._watcher_desired_run
+    routes_mod._watcher_desired_run = False
+    try:
+        body = test_client.get("/api/system-health").json()
+        watcher = next(c for c in body["checks"] if c["component"] == "watcher")
+        assert watcher["status"] == "ok"
+        assert watcher["state"] == "stopped"
+    finally:
+        routes_mod._watcher_desired_run = prev

@@ -31,6 +31,16 @@ def _mcp_source(request: Request) -> str:
 # --- Watcher state ---
 _watcher_thread = None
 _watcher_lock = threading.Lock()
+# Desired lifecycle state: should the watcher be running? Set False only by an
+# explicit user stop (POST /api/watcher/stop) so that lifecycle autostart and
+# the project-edit restart path never fight a deliberate stop. Per-process: a
+# service restart re-arms autostart (a restart is itself an operator action).
+_watcher_desired_run = True
+# Set when a *lifecycle-owned* autostart fails to even construct/start the
+# thread. There is no WatcherThread to hold a last_error in that case, so the
+# failure is recorded here to stay visible via the derived state + /health.
+_watcher_autostart_error: Optional[str] = None
+_watcher_autostart_error_at: Optional[str] = None
 
 
 # --- Request/Response models ---
@@ -72,11 +82,22 @@ def health():
         # /health return non-200. Fall through with watcher_running=False.
         watcher_running = False
 
+    # Additive degraded signal — `status` stays "ready" for liveness back-compat;
+    # this surfaces watcher-down on /health so callers needn't interpret the raw
+    # bool. Only an *undesired* down counts: a watcher the user explicitly stopped
+    # (desired_run False) is intentional, not degraded. Index staleness is reported
+    # on /api/status + `rag doctor` (state DB); /health stays cheap and lock-free.
+    issues = []
+    if not watcher_running and _watcher_desired_run:
+        issues.append("watcher_not_running")
+
     return {
         "status": "ready",
         "collection": owner.settings.collection_name,
         "version": __version__,
         "watcher_running": watcher_running,
+        "degraded": bool(issues),
+        "issues": issues,
     }
 
 
@@ -587,44 +608,142 @@ def notifications_test():
 
 # --- Watcher ---
 
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _start_watcher_locked() -> dict:
+    """Construct + start the watcher thread. Caller MUST hold ``_watcher_lock``.
+
+    Idempotent — a live thread is left untouched. These lock-free internals
+    exist so the FastAPI lifespan (autostart) and the project-edit restart
+    path can drive startup without re-entering the non-reentrant lock through
+    the route handlers (which previously self-deadlocked the restart thread).
+    """
+    global _watcher_thread, _watcher_autostart_error, _watcher_autostart_error_at
+    if _watcher_thread is not None and _watcher_thread.is_alive():
+        return {"status": "already_running"}
+
+    from ragtools.service.watcher_thread import WatcherThread
+    owner = get_owner()
+    settings = get_settings()
+    _watcher_thread = WatcherThread(owner=owner, settings=settings)
+    _watcher_thread.start()
+    _watcher_autostart_error = None
+    _watcher_autostart_error_at = None
+    project_count = len(settings.enabled_projects) if settings.has_explicit_projects else 0
+    logger.info("Watcher started: %d projects", project_count)
+    return {"status": "started", "project_count": project_count}
+
+
+def _stop_watcher_locked() -> dict:
+    """Stop + join the watcher thread. Caller MUST hold ``_watcher_lock``."""
+    global _watcher_thread
+    if _watcher_thread is None or not _watcher_thread.is_alive():
+        return {"status": "not_running"}
+    _watcher_thread.stop()
+    _watcher_thread.join(timeout=5)
+    _watcher_thread = None
+    logger.info("Watcher stopped")
+    return {"status": "stopped"}
+
+
+def autostart_watcher() -> dict:
+    """Start the watcher from the service lifecycle (FastAPI lifespan) — M3.
+
+    The watcher's startup is owned by the service process rather than a delayed
+    HTTP self-POST that could miss the readiness window and leave the watcher
+    silently inactive. Respects an explicit user stop (desired-state) and NEVER
+    raises: a construction failure is recorded so it surfaces via the derived
+    watcher ``state`` (``autostart_failed``) and ``/health`` degraded instead of
+    crashing startup.
+    """
+    global _watcher_autostart_error, _watcher_autostart_error_at
+    with _watcher_lock:
+        if not _watcher_desired_run:
+            return {"status": "skipped_user_stopped"}
+        try:
+            return _start_watcher_locked()
+        except Exception as e:  # noqa: BLE001 — startup must never die here
+            _watcher_autostart_error = f"{type(e).__name__}: {e}"
+            _watcher_autostart_error_at = _now_iso()
+            logger.exception("Watcher autostart failed")
+            return {"status": "error", "error": _watcher_autostart_error}
+
+
 @router.post("/api/watcher/start")
 def watcher_start():
-    """Start the file watcher as a background thread."""
-    global _watcher_thread
+    """Start the file watcher as a background thread (explicit user/API start)."""
+    global _watcher_desired_run
 
     with _watcher_lock:
-        if _watcher_thread is not None and _watcher_thread.is_alive():
-            return {"status": "already_running"}
-
-        from ragtools.service.watcher_thread import WatcherThread
-        owner = get_owner()
-        settings = get_settings()
-        _watcher_thread = WatcherThread(owner=owner, settings=settings)
-        _watcher_thread.start()
-        project_count = len(settings.enabled_projects) if settings.has_explicit_projects else 0
-        logger.info("Watcher started: %d projects", project_count)
-        return {"status": "started", "project_count": project_count}
+        _watcher_desired_run = True  # explicit (re)arm — clears a prior user stop
+        return _start_watcher_locked()
 
 
 @router.post("/api/watcher/stop")
 def watcher_stop():
-    """Stop the file watcher."""
-    global _watcher_thread
+    """Stop the file watcher (records the user's intent to stay stopped)."""
+    global _watcher_desired_run, _watcher_thread
+    global _watcher_autostart_error, _watcher_autostart_error_at
 
     with _watcher_lock:
-        if _watcher_thread is None or not _watcher_thread.is_alive():
-            return {"status": "not_running"}
-
-        _watcher_thread.stop()
-        _watcher_thread.join(timeout=5)
+        _watcher_desired_run = False  # user intent: do not auto-restart
+        result = _stop_watcher_locked()
+        # A deliberate stop also clears prior failure markers so the watcher
+        # reports cleanly as "stopped" — not autostart_failed / crashed / gave_up.
+        # The operator turned it off on purpose; system-health must not keep
+        # flagging it as an error (Decision 17). The persistent crash marker +
+        # toast already fired, so nothing diagnostic is lost. Dropping the
+        # dead-but-not-None thread ref discards its stale error fingerprint too.
+        _watcher_autostart_error = None
+        _watcher_autostart_error_at = None
         _watcher_thread = None
-        logger.info("Watcher stopped")
-        return {"status": "stopped"}
+        return result
+
+
+def _derive_watcher_state(
+    snap: dict,
+    alive: bool,
+    *,
+    desired_run: bool = True,
+    autostart_error: Optional[str] = None,
+) -> str:
+    """Best-effort lifecycle label so consumers can tell apart the states the
+    raw null/0 observability fields otherwise collapse together (report L3 / the
+    real signal A-007 lacked).
+
+    - running         : daemon thread alive
+    - autostart_failed: a lifecycle autostart could not construct/start it (M3)
+    - gave_up         : exceeded the retry budget (consecutive_failures >= _MAX_RETRIES)
+    - crashed         : exited with a recorded error
+    - stopped         : an explicit user stop is in effect (desired_run is False)
+    - exited          : started then exited cleanly (e.g. no enabled projects)
+    - inactive        : never started / not yet autostarted
+
+    ``desired_run``/``autostart_error`` default to the "should be running, no
+    autostart failure" case so older positional callers keep their behavior.
+    """
+    from ragtools.service.watcher_thread import WatcherThread
+    if alive:
+        return "running"
+    if autostart_error:
+        return "autostart_failed"
+    if snap.get("consecutive_failures", 0) >= WatcherThread._MAX_RETRIES:
+        return "gave_up"
+    if snap.get("last_error"):
+        return "crashed"
+    if not desired_run:
+        return "stopped"
+    if snap.get("last_started_at"):
+        return "exited"
+    return "inactive"
 
 
 def _watcher_observability_snapshot() -> dict:
-    """Pull the four /api/watcher/status observability fields off the
-    daemon thread, with safe defaults when no thread instance exists.
+    """Pull the /api/watcher/status observability fields off the daemon thread
+    (plus a derived ``state``), with safe defaults when no thread exists.
 
     Lives inside the route module (not the watcher) so the response shape
     is owned by the same file that defines the contract.
@@ -635,12 +754,38 @@ def _watcher_observability_snapshot() -> dict:
         "last_error_at": None,
         "consecutive_failures": 0,
     }
-    if _watcher_thread is not None:
+    alive = False
+    t = _watcher_thread
+    if t is not None:
         try:
-            snap.update(_watcher_thread.get_state_snapshot())
+            snap.update(t.get_state_snapshot())
         except Exception:
             # A flaky introspection must never make the route 5xx.
             pass
+        try:
+            alive = t.is_alive()
+        except Exception:
+            alive = False
+    # Snapshot the desired-state + autostart globals into locals once (lock-free
+    # reads) so the derived state and the emitted keys below are mutually
+    # consistent within one response, even if a concurrent start/stop mutates
+    # them mid-call. Per-field reads are GIL-atomic; this just avoids pairing a
+    # state derived from a stale error with a since-cleared error key.
+    desired_run = _watcher_desired_run
+    autostart_error = _watcher_autostart_error
+    autostart_error_at = _watcher_autostart_error_at
+    snap["state"] = _derive_watcher_state(
+        snap,
+        alive,
+        desired_run=desired_run,
+        autostart_error=autostart_error,
+    )
+    # Additive M3 fields: the user's desired-state, and the autostart failure
+    # detail (only when one occurred). Older clients ignore the extra keys.
+    snap["desired"] = "run" if desired_run else "stopped"
+    if autostart_error:
+        snap["autostart_error"] = autostart_error
+        snap["autostart_error_at"] = autostart_error_at
     return snap
 
 
@@ -680,8 +825,12 @@ def _restart_watcher_if_running():
     def _do_restart():
         with _watcher_lock:
             if _watcher_thread is not None and _watcher_thread.is_alive():
-                watcher_stop()
-                watcher_start()
+                # Call the lock-free internals — NOT the route handlers, which
+                # re-acquire _watcher_lock and would self-deadlock this thread
+                # (and then hang every /api/watcher/status reader behind it).
+                # A restart of a running watcher keeps desired_run == True.
+                _stop_watcher_locked()
+                _start_watcher_locked()
                 logger.info("Watcher restarted after project config change")
     _th.Thread(target=_do_restart, daemon=True).start()
 
@@ -1104,6 +1253,7 @@ def system_health_endpoint():
     })
 
     # Collection / scale
+    status = None
     try:
         owner = get_owner()
         status = owner.get_status()
@@ -1119,6 +1269,47 @@ def system_health_endpoint():
         })
     except Exception as e:
         checks.append({"component": "collection", "status": "error", "detail": str(e)})
+
+    # Index freshness (A-008)
+    if status is not None:
+        fr = status.get("freshness") or {}
+        checks.append({
+            "component": "index_freshness",
+            "status": "warning" if fr.get("level") == "stale" else "ok",
+            "detail": fr.get("message") or (fr.get("level") or "unknown"),
+            "level": fr.get("level"),
+            "last_indexed": fr.get("last_indexed"),
+            "age_seconds": fr.get("age_seconds"),
+        })
+
+    # Watcher health — the canonical health surface was previously blind to it.
+    try:
+        running = _watcher_thread is not None and _watcher_thread.is_alive()
+        obs = _watcher_observability_snapshot()
+        state = obs.get("state")
+        if running:
+            wstatus, detail = "ok", "running"
+        elif state == "stopped":
+            # Deliberately stopped by the user — intentional, not a problem.
+            wstatus, detail = "ok", "stopped by user"
+        elif obs.get("autostart_error"):
+            wstatus, detail = "error", obs["autostart_error"]
+        elif obs.get("last_error"):
+            wstatus, detail = "error", obs["last_error"]
+        else:
+            wstatus, detail = "warning", "not running"
+        checks.append({
+            "component": "watcher",
+            "status": wstatus,
+            "detail": detail,
+            "running": running,
+            "state": state,
+            "last_error": obs.get("last_error"),
+            "autostart_error": obs.get("autostart_error"),
+            "consecutive_failures": obs.get("consecutive_failures", 0),
+        })
+    except Exception as e:
+        checks.append({"component": "watcher", "status": "error", "detail": str(e)})
 
     # Startup + Watchdog (Windows only)
     if _sys.platform == "win32":
@@ -1154,8 +1345,11 @@ def shutdown():
     from ragtools.service.activity import log_activity
     log_activity("warning", "service", "Shutdown requested")
 
-    # Stop watcher if running
-    watcher_stop()
+    # Stop the watcher WITHOUT recording user intent — a service shutdown must
+    # not flip the desired-state flag (only an explicit POST /api/watcher/stop
+    # should). Use the lock-free internal, like _restart_watcher_if_running does.
+    with _watcher_lock:
+        _stop_watcher_locked()
 
     # Signal shutdown
     event = get_shutdown_event()

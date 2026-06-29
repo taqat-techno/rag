@@ -7,6 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+_Nothing yet — `main` is at 2.6.0._
+
+---
+
+## [2.6.0] — 2026-06-29 — Diagnostics & observability · lifecycle-owned watcher autostart (M3) · port-owner detection (L5)
+
+### Added — Diagnostics & observability
+
+- **Index-freshness detection (A-008).** `compute_index_freshness()` classifies
+  `last_indexed` as never/fresh/stale/unknown against `stale_index_hours`
+  (default 24); surfaced on `/api/status`, `/api/system-health`, and `rag doctor`.
+- **Watcher health is no longer invisible.** `rag doctor` and `/api/system-health`
+  now report watcher running/`last_error`; `/health` adds an additive
+  `degraded` + `issues` signal (e.g. `watcher_not_running`) without changing the
+  `status` liveness contract.
+- **`rag doctor --json`** — stable machine-readable report (install_mode, service,
+  index, freshness, watcher, projects, checks, recommended_actions) so tooling no
+  longer parses the human table. New Watcher / Index-freshness / Project-path rows.
+
+### Changed — Watcher autostart is lifecycle-owned (M3)
+
+- **The file watcher now starts from the service lifecycle** (the FastAPI
+  lifespan calls `autostart_watcher()`), replacing the delayed HTTP self-POST in
+  `run.py` that could miss the readiness window and leave the watcher silently
+  inactive. Startup is idempotent (no duplicate threads) and never fatal — a
+  construct/start failure is recorded and surfaced, not raised.
+- **An explicit user stop is respected.** A per-process desired-state flag means
+  lifecycle autostart and the project-edit restart never re-start a watcher the
+  user deliberately stopped. `/health` no longer flags a user-stopped watcher as
+  `degraded`, and `/api/system-health` reports it as "stopped by user".
+- **Richer watcher `state`** — adds `stopped` (user intent) and `autostart_failed`
+  (a lifecycle autostart that could not construct/start the thread) on
+  `/api/watcher/status`, `/api/system-health`, and `rag doctor`. All additive.
+
+### Changed — service-status port-owner detection (L5)
+
+- **`rag service status` no longer mistakes a foreign process for a healthy
+  service.** A `200` on `/health` is only trusted as `ready` when the body
+  carries the ragtools identity markers (`status=="ready"` + `collection` +
+  `version`). A 200 that isn't ragtools-shaped, or any HTTP response on the port
+  with no live ragtools PID, is reported as the additive status
+  `port_occupied_foreign` (with a best-effort foreign PID); the CLI says so
+  clearly and exits `1` (our service is not running). A ragtools `503` during
+  startup with a live PID still reads as `starting`. The exit-code contract
+  (`0` running/starting, `1` down, `2` internal error) is unchanged.
+
+### Fixed
+
+- **Watcher restart no longer self-deadlocks.** `_restart_watcher_if_running`
+  (run after a project edit while the watcher is live) called the lock-acquiring
+  route handlers while already holding the watcher lock — a re-entrant acquire on
+  a non-reentrant `Lock` that hung the restart thread and every subsequent
+  `/api/watcher/status` reader. It now calls the lock-free internals.
+- **`/health` (and all routes) now return JSON on an uncaught 5xx** via a global
+  exception handler, matching the documented contract (previously Starlette
+  returned plain text).
+- **Docs:** corrected the service-log path to `{data_dir}/data/logs/service.log`
+  (was inconsistently `{data_dir}/logs/...`) in `CLAUDE.md` and `docs/decisions.md`.
+
+---
+
+## [2.5.5] — 2026-05-08
+
+Packaging-only hotfix on top of v2.5.4 (no `rag.exe` code changes). Closes two install-flow gaps found in live testing.
+
+### Fixed
+- **Existing watchdog Scheduled Task is repaired on upgrade.** The installer now runs `rag.exe service watchdog install` *only when an existing `RAGTools Watchdog` task is detected* (new `HasRAGToolsWatchdogTask()` Inno check), re-registering it with the silent VBS launcher — no more console-window flash every 15 min. Users who never opted into the watchdog get no new task.
+- **Tray icon appears immediately after install/upgrade.** The installer launches the freshly-written Startup VBS once post-install (hidden + `nowait`, gated on the `startup` task), so the icon no longer waits for the next Windows login.
+
+---
+
+## [2.5.4] — 2026-05-08
+
+Hotfix on top of v2.5.3.
+
+### Fixed
+- **System-tray icon is now actually bundled.** v2.5.0–v2.5.3 shipped without `pystray` + `Pillow` in the PyInstaller bundle (`release.yml` installed `[dev,build]` only), so `rag tray` from a packaged install failed with `ModuleNotFoundError` and exited silently. Fix: `release.yml` installs `[dev,build,tray]` on all platforms and `rag.spec` lists `pystray` / `PIL` in `hiddenimports`.
+
+---
+
+## [2.5.3] — 2026-05-08
+
+Bundle release: the Phase A API/contract pass plus Windows UX fixes.
+
+### Added
+- **`/health` 200 — `version` + `watcher_running`** (additive, Decision 16).
+- **`/api/watcher/status` observability fields** — `last_started_at`, `last_error`, `last_error_at`, `consecutive_failures`. Older clients reading only `running` / `paths` / `project_count` are unaffected.
+- **Decision 16 — API contracts are additive-only** — pins `scale.level` ⊆ `{ok, approaching, over}`, the `/health` 200 key set, and the `rag service status` exit codes.
+- **Reference: HTTP API** documentation; first `docs/wiki-src/` wiki release; a rotating `tray.log` under `…\RAGTools\data\logs\`.
+
+### Changed
+- **`rag service status` exit codes — `0` / `1` / `2`** (was always-`0` in every state). Behavior change: any CI relying on the always-`0` contract will start failing — treat this as a correctness fix.
+
+### Fixed
+- **Watchdog Scheduled Task no longer flashes a console window every 15 min** — it runs `wscript.exe RAGTools-Watchdog.vbs` (a silent launcher) instead of the console-subsystem `rag.exe`.
+- **Tray icon reliably appears after login** — the tray VBS sleeps 15 s to outwait `explorer.exe`'s systray initialisation.
+
+---
+
 ## [2.5.2] — 2026-04-19
 
 Small, focused patch on top of v2.5.1 covering two issues reported

@@ -57,6 +57,18 @@ async def lifespan(app: FastAPI):
     from ragtools.service.activity import log_activity
     log_activity("success", "service", f"Service ready on {_settings.service_host}:{_settings.service_port}")
 
+    # M3: own the watcher's startup here, in the service lifecycle, rather than
+    # relying solely on run.py's delayed HTTP self-POST (which could miss the
+    # readiness window and leave the watcher silently inactive). Idempotent and
+    # never fatal — a construct/start failure is recorded and surfaced via
+    # /health degraded + /api/watcher/status state, not raised.
+    try:
+        from ragtools.service.routes import autostart_watcher
+        result = autostart_watcher()
+        logger.info("Watcher autostart: %s", result.get("status"))
+    except Exception:
+        logger.exception("Watcher autostart call failed (non-fatal)")
+
     yield
 
     # Shutdown
@@ -80,6 +92,18 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    # Guarantee JSON on an uncaught error. The HTTP-API contract documents
+    # non-200 bodies as JSON; without this, Starlette returns plain-text
+    # "Internal Server Error" on an unhandled 500. Explicit HTTPException
+    # responses already render JSON via FastAPI's default handler.
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
+
+    @app.exception_handler(Exception)
+    async def _json_error_handler(request: Request, exc: Exception):
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
     from ragtools.service.routes import router
     app.include_router(router)

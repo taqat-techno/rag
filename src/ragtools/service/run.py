@@ -42,22 +42,14 @@ def setup_logging(settings: Settings) -> None:
 
 
 def _post_startup(settings: Settings, from_scheduler: bool) -> None:
-    """Run post-startup tasks: watcher, auto-register startup, optional browser."""
-    logger = logging.getLogger("ragtools.service")
+    """Run post-startup tasks: auto-register startup/watchdog, toast, sync, browser.
 
-    # Always start the file watcher
-    try:
-        import httpx
-        r = httpx.post(
-            f"http://{settings.service_host}:{settings.service_port}/api/watcher/start",
-            timeout=5.0,
-        )
-        if r.status_code == 200:
-            logger.info("Watcher auto-started")
-        else:
-            logger.warning("Watcher auto-start returned %d", r.status_code)
-    except Exception as e:
-        logger.warning("Failed to auto-start watcher: %s", e)
+    The file watcher is NOT started here. As of M3 it is owned by the service
+    lifecycle (the FastAPI lifespan calls ``autostart_watcher()``), replacing the
+    old delayed HTTP self-POST that could miss the readiness window and leave the
+    watcher silently inactive.
+    """
+    logger = logging.getLogger("ragtools.service")
 
     # Auto-register Windows startup task (idempotent — skips if already installed)
     # Only the packaged/installed app should write to the Windows Startup folder.

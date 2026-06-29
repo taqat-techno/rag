@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Owner** | TBD (proposed: docs lead) |
-| **Last validated against version** | 2.5.2 |
+| **Last validated against version** | 2.6.0 |
 | **Last reviewed** | 2026-04-19 |
 | **Format** | Loosely follows [Keep a Changelog](https://keepachangelog.com). Semantic versioning. |
 
@@ -14,6 +14,25 @@
 ## [Unreleased]
 
 Changes on `main` not yet tagged.
+
+---
+
+## [2.6.0] — 2026-06-29
+
+Diagnostics & observability release on top of v2.5.5 — plus **M3** watcher-lifecycle autostart and **L5** service-status port-owner detection. All additive (Decision 16); the `rag service status` exit codes and the `/health` `status:"ready"` liveness contract are unchanged.
+
+### Added
+- **Index-freshness detection** (`compute_index_freshness`) surfaced on `/api/status`, `/api/system-health`, and `rag doctor`; new `stale_index_hours` config (default 24).
+- **Watcher health visibility** — a watcher row in `rag doctor` + `/api/system-health`; a derived watcher `state`; `/health` adds additive `degraded` + `issues`.
+- **`rag doctor --json`** machine-readable report; **JSON on uncaught 5xx**.
+- **Decision 17** — watcher autostart is lifecycle-owned (FastAPI lifespan); desired-state respects an explicit user stop.
+
+### Changed
+- **M3 — watcher autostart is lifecycle-owned:** the lifespan calls `autostart_watcher()` (idempotent, never fatal) instead of a delayed HTTP self-POST; a user-stopped watcher is intentional, not degraded. Fixes a latent re-entrant-lock deadlock in the project-edit restart path.
+- **L5 — service-status port-owner detection:** a foreign process holding the port is reported as `port_occupied_foreign` (exit 1, clear message) instead of being mistaken for a healthy service; exit codes unchanged.
+
+### Tests
+- Full suite: **740 passed, 1 skipped**.
 
 ---
 

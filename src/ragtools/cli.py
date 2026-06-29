@@ -217,9 +217,19 @@ def status():
 
 
 @app.command()
-def doctor():
-    """Check system health and dependencies."""
+def doctor(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit a machine-readable JSON report instead of the table."
+    ),
+):
+    """Check system health and dependencies.
+
+    Use ``--json`` for a stable machine-readable report (install_mode, service,
+    index freshness/scale, watcher, projects, checks, recommended_actions) so
+    tooling does not have to parse the human table.
+    """
     checks: list[tuple[str, str, str]] = []
+    data: dict = {}
 
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     if sys.version_info >= (3, 10):
@@ -278,6 +288,7 @@ def doctor():
             else:
                 status_label = "OK"
                 detail = f"{points_count} points"
+            data["index"] = {"points_count": points_count, "scale": scale}
             checks.append(("Collection", status_label, detail))
         except Exception:
             checks.append(("Collection", "NOT FOUND", f"'{settings.collection_name}' missing"))
@@ -317,12 +328,95 @@ def doctor():
         except Exception as e:
             checks.append(("Watchdog", "ERROR", str(e)))
 
+    # --- Index freshness (A-008) ---
+    if state_path.exists():
+        try:
+            from ragtools.indexing.state import IndexState
+            from ragtools.service.owner import compute_index_freshness
+            _st = IndexState(settings.state_db)
+            _summary = _st.get_summary()
+            _st.close()
+            fr = compute_index_freshness(
+                _summary.get("last_indexed"), getattr(settings, "stale_index_hours", 24)
+            )
+            data["freshness"] = fr
+            if fr["level"] == "stale":
+                checks.append(("Index freshness", "WARNING", fr["message"]))
+            elif fr["level"] == "never":
+                checks.append(("Index freshness", "OK", "never indexed"))
+            elif fr.get("age_seconds") is not None:
+                checks.append(("Index freshness", "OK", f"last indexed {fr['age_seconds'] / 3600:.1f}h ago"))
+            else:
+                checks.append(("Index freshness", "OK", fr["level"]))
+        except Exception as e:
+            checks.append(("Index freshness", "ERROR", str(e)))
+
+    # --- Watcher (meaningful only when the service is up) ---
+    if _probe_service(settings):
+        try:
+            import httpx
+            _wurl = f"http://{settings.service_host}:{settings.service_port}/api/watcher/status"
+            w = httpx.get(_wurl, timeout=2.0).json()
+            data["watcher"] = w
+            if w.get("running"):
+                checks.append(("Watcher", "OK", f"running, {w.get('project_count', 0)} project(s)"))
+            elif w.get("last_error"):
+                checks.append(("Watcher", "ERROR", str(w["last_error"])))
+            else:
+                checks.append(("Watcher", "WARNING", "not running — POST /api/watcher/start to re-arm"))
+        except Exception as e:
+            checks.append(("Watcher", "ERROR", str(e)))
+    else:
+        checks.append(("Watcher", "UNKNOWN", "service not running"))
+
+    # --- Project paths (warn when an enabled project folder is gone) ---
+    _enabled = [p for p in settings.projects if getattr(p, "enabled", True)]
+    if _enabled:
+        _missing = [p.id for p in _enabled if not Path(p.path).is_dir()]
+        data["projects"] = {"enabled": len(_enabled), "missing": _missing}
+        if _missing:
+            checks.append(("Project paths", "WARNING", f"{len(_missing)} missing: {', '.join(_missing)}"))
+        else:
+            checks.append(("Project paths", "OK", f"{len(_enabled)} project(s)"))
+
+    # --- Log file location (L6: surface where logs live; previously hidden) ---
+    _log_path = Path(settings.qdrant_path).parent / "logs" / "service.log"
+    data["log_path"] = str(_log_path)
+    checks.append(("Logs", "OK" if _log_path.exists() else "INFO", str(_log_path)))
+
+    # --- Output ---
+    _bad = {"MISSING", "ERROR", "NOT FOUND"}
+    _warn = _bad | {"WARNING", "NOT CREATED", "UNKNOWN", "NOT RUNNING"}
+    if json_output:
+        import json as _json
+        from ragtools import __version__
+        from ragtools.config import is_packaged
+        report = {
+            "install_mode": "packaged" if is_packaged() else "source",
+            "version": __version__,
+            "data_dir": str(data_path),
+            "service": {
+                "running": _probe_service(settings),
+                "url": f"http://{settings.service_host}:{settings.service_port}",
+            },
+            "index": data.get("index"),
+            "freshness": data.get("freshness"),
+            "watcher": data.get("watcher"),
+            "projects": data.get("projects"),
+            "log_path": data.get("log_path"),
+            "ok": all(stat not in _bad for _, stat, _ in checks),
+            "checks": [{"component": n, "status": s.lower(), "detail": d} for n, s, d in checks],
+            "recommended_actions": [d for n, s, d in checks if s in _warn and d],
+        }
+        typer.echo(_json.dumps(report, indent=2))
+        return
+
     table = Table(title="RAG System Health Check")
     table.add_column("Component", style="bold")
     table.add_column("Status")
     table.add_column("Details")
     for name, stat, details in checks:
-        color = "green" if stat in ("OK", "RUNNING") else "red" if stat in ("MISSING", "ERROR", "NOT FOUND") else "yellow"
+        color = "green" if stat in ("OK", "RUNNING") else "red" if stat in _bad else "yellow"
         table.add_row(name, f"[{color}]{stat}[/{color}]", details)
     console.print(table)
 
@@ -549,6 +643,22 @@ def service_status_cmd():
         table.add_row("Host", str(info.get("host", "")))
         console.print(table)
         return  # exit code 0
+
+    # L5 — a foreign process is holding the port. Our service is NOT running
+    # (exit 1, same as down), but say so clearly so the operator doesn't read
+    # the down message as "just start it" when the port is actually taken.
+    if info.get("status") == "port_occupied_foreign":
+        port = info.get("port", "")
+        fpid = info.get("foreign_pid")
+        who = f" (PID {fpid})" if fpid else ""
+        console.print(
+            f"[red]Port {port} is occupied by a non-ragtools process{who}.[/red]"
+        )
+        console.print(
+            "The RAG service is not running. Free the port or set a different "
+            "service_port, then: rag service start"
+        )
+        raise typer.Exit(1)
 
     console.print("[yellow]Service is not running.[/yellow]")
     console.print("Start with: rag service start")

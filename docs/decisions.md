@@ -230,7 +230,7 @@ Defaults: `patterns = []`, `use_ragignore_files = true`.
 
 **Service mode:**
 - Python `logging` with `RotatingFileHandler`
-- Path: `{data_dir}/logs/service.log`
+- Path: `{data_dir}/data/logs/service.log` (under the `data/` subdir alongside Qdrant — derived as `qdrant_path.parent/logs/`; packaged: `%LOCALAPPDATA%\RAGTools\data\logs\service.log`)
 - Rotation: 10 MB per file, keep 3 backups
 - Format: `%(asctime)s %(levelname)-8s %(name)s %(message)s` (human-readable)
 - Named loggers: `ragtools.service`, `ragtools.indexing`, `ragtools.watcher`, `ragtools.mcp`
@@ -389,14 +389,30 @@ Single encoder instance, single lock. The lock protects both the encoder and the
 - `scale.level` ⊆ `{"ok", "approaching", "over"}`. The set is closed; a fourth level is a breaking change.
 - `/health` 200 keys: `status`, `collection`, `version`, `watcher_running`. Future additive fields are allowed.
 - `/health` non-200 responses always carry FastAPI's default `{"detail": "..."}` JSON body.
-- `/api/watcher/status` keys: `running`, `paths`, `project_count`, `last_started_at`, `last_error`, `last_error_at`, `consecutive_failures`. Older clients that only inspect the first three continue to work.
-- `rag service status` exit code: `0` running or starting, `1` down, `2` internal error. CI scripts may rely on these.
+- `/api/watcher/status` keys: `running`, `paths`, `project_count`, `last_started_at`, `last_error`, `last_error_at`, `consecutive_failures`. Older clients that only inspect the first three continue to work. *(Additive since, per Decision 17: `state`, `desired`, and — only on an autostart failure — `autostart_error`/`autostart_error_at`.)*
+- `rag service status` exit code: `0` running or starting, `1` down, `2` internal error. CI scripts may rely on these. *(L5: a foreign process occupying the port is reported via the additive `status: "port_occupied_foreign"` and maps to `1` — our service is not running — so a `200` from a non-ragtools server is never read as healthy. The exit codes themselves are unchanged.)*
 
 **Test enforcement:** `tests/test_scale_warning.py` includes `test_scale_level_enum_is_closed_set` so any silent fourth level fails CI. Route tests assert the documented field set is present.
 
 **Rationale:** The plugin layer, admin panel, and external monitors all read these endpoints today. Stable contracts mean each side can ship independently — covered by the cross-repo decision report (May 2026).
 
 **Tradeoff:** Some legitimate refactors become more expensive. Acceptable: the cost of a contract break (downstream consumers stop working) is far higher than the cost of an extra field.
+
+---
+
+## Decision 17 — Watcher Autostart Is Lifecycle-Owned (M3)
+
+**Decision:** The file watcher is started by the **service lifecycle** — the FastAPI lifespan calls `autostart_watcher()` once the encoder + Qdrant are ready — not by a delayed HTTP self-`POST /api/watcher/start` from `run.py`. Autostart is idempotent (a live thread is left untouched), respects a per-process **desired-state**, and never raises: a construct/start failure is recorded and surfaced via the derived watcher `state` (`autostart_failed`) and `/health` `degraded`, rather than crashing startup.
+
+**Desired-state:** An explicit user stop (`POST /api/watcher/stop`) sets `desired_run = False`; lifecycle autostart and the project-edit restart will not re-start a watcher the user deliberately stopped. It is per-process — a service restart re-arms autostart (a restart is itself an operator action). A user-stopped watcher reports `state: "stopped"`, is **not** `degraded` on `/health`, and shows "stopped by user" on `/api/system-health`.
+
+**Concurrency:** Start/stop logic lives in lock-free internals (`_start_watcher_locked` / `_stop_watcher_locked`) that assume the caller holds `_watcher_lock`; the lifespan, the route handlers, and the project-edit restart all funnel through them. This also removed a latent re-entrant-lock deadlock where the background restart held `_watcher_lock` and then called the lock-acquiring route handlers.
+
+**Rationale:** The old self-POST had a ~30s readiness window; a miss left the watcher silently inactive (report finding A-007) with no signal. Lifecycle ownership removes the window and the race, and the new `state`/`degraded` make any remaining failure visible.
+
+**Non-goals:** In-process auto-restart of a *given-up* watcher thread without a service restart (the Task Scheduler watchdog recovers process death cross-process); cross-restart persistence of desired-state.
+
+**Test enforcement:** `tests/test_watcher_lifecycle.py` and the watcher/lifespan cases in `tests/test_service.py`.
 
 ---
 
@@ -420,3 +436,4 @@ Single encoder instance, single lock. The lock protects both the encoder and the
 | 14 | CLI dual-mode | Transparent HTTP/direct based on health probe | Yes |
 | 15 | Watcher unavailable paths | Skip, warn, retry 60s | Yes |
 | 16 | API contracts additive-only | `scale.level` enum closed; route fields stable | Yes |
+| 17 | Watcher autostart ownership | Lifecycle-owned (lifespan); desired-state respected | Yes |

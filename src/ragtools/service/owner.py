@@ -83,6 +83,47 @@ def compute_scale_warning(points_count: int) -> dict:
     }
 
 
+def compute_index_freshness(last_indexed, stale_after_hours: float = 24, now=None) -> dict:
+    """Classify index freshness from a ``last_indexed`` timestamp. Pure function.
+
+    Levels:
+      - ``never``   : no index has ever been built (last_indexed is falsy)
+      - ``fresh``   : age <= stale_after_hours
+      - ``stale``   : age >  stale_after_hours (results may be out of date)
+      - ``unknown`` : last_indexed could not be parsed
+
+    Mirrors :func:`compute_scale_warning` so /api/status, /health and
+    ``rag doctor`` can surface a staleness signal consistently. Easy to unit-test
+    (inject ``now``); no side effects.
+    """
+    from datetime import datetime as _dt
+
+    now = now or _dt.now()
+    base = {
+        "last_indexed": last_indexed,
+        "age_seconds": None,
+        "stale_after_hours": stale_after_hours,
+    }
+    if not last_indexed:
+        return {**base, "level": "never", "message": "Index has never been built."}
+    try:
+        ts = _dt.fromisoformat(str(last_indexed))
+    except (ValueError, TypeError):
+        return {**base, "level": "unknown",
+                "message": "last_indexed timestamp could not be parsed."}
+    # Tolerate tz-aware vs naive mismatch (state stores naive local times).
+    if (ts.tzinfo is None) != (now.tzinfo is None):
+        ts = ts.replace(tzinfo=None)
+        now = now.replace(tzinfo=None)
+    age = max((now - ts).total_seconds(), 0.0)
+    if age > stale_after_hours * 3600:
+        return {**base, "age_seconds": age, "level": "stale",
+                "message": (f"Index last updated ~{age / 3600:.1f}h ago, beyond the "
+                            f"{stale_after_hours}h freshness threshold. If the watcher "
+                            "is not running, search results may be out of date.")}
+    return {**base, "age_seconds": age, "level": "fresh", "message": ""}
+
+
 def _log_scale_warning_once(points_count: int) -> None:
     """Log the scale warning at service/index-complete time.
 
@@ -532,6 +573,10 @@ class QdrantOwner:
                 "points_count": points_count,
                 "collection_name": self._settings.collection_name,
                 "scale": compute_scale_warning(points_count),
+                "freshness": compute_index_freshness(
+                    summary.get("last_indexed"),
+                    getattr(self._settings, "stale_index_hours", 24),
+                ),
                 **summary,
             }
 

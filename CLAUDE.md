@@ -61,7 +61,7 @@ Full decisions in `docs/decisions.md`. Key constraints:
 - **Config resolution** — `RAG_CONFIG_PATH` env > `%LOCALAPPDATA%\RAGTools\config.toml` > `./ragtools.toml`. Env vars always override config file. TOML format.
 - **Data directory** — dev: `./data/` (current). Installed: `%LOCALAPPDATA%\RAGTools\`. Detected automatically.
 - **Service port** — `127.0.0.1:21420`, localhost-only, no auth.
-- **Logging** — service mode: `RotatingFileHandler` at `{data_dir}/logs/service.log`, 10MB, 3 backups.
+- **Logging** — service mode: `RotatingFileHandler` at `{data_dir}/data/logs/service.log` (alongside Qdrant under `data/`; packaged: `%LOCALAPPDATA%\RAGTools\data\logs\service.log`), 10MB, 3 backups.
 - **Startup** — Task Scheduler (Phase 5), not Startup Folder or Windows Service.
 
 ## Data Pipeline
