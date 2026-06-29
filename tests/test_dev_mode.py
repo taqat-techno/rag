@@ -267,3 +267,54 @@ def test_projects_configured_includes_dev_mode(monkeypatch, tmp_path):
     assert by_id["c"]["index_source_code_effective"] is True
     assert by_id["i"]["index_source_code"] == "inherit"
     assert by_id["i"]["index_source_code_effective"] is False
+
+
+# --- Phase 5: admin UI (add form + edit form + list badge) ---
+
+def _ui_env(monkeypatch, projects):
+    from ragtools.config import Settings
+    from ragtools.service import app as app_module, pages as pages_mod, routes as routes_mod
+
+    class _FakeOwner:
+        captured = None
+        def update_projects(self, projs):
+            _FakeOwner.captured = list(projs)
+
+    app_module._owner = _FakeOwner()
+    app_module._settings = Settings(projects=projects)
+    monkeypatch.setattr(pages_mod, "_save_projects_to_toml", lambda *a, **k: None)
+    monkeypatch.setattr(routes_mod, "_restart_watcher_if_running", lambda *a, **k: None)
+    monkeypatch.setattr(routes_mod, "_schedule_auto_index", lambda pid: None)
+    monkeypatch.setattr(routes_mod, "_schedule_reindex", lambda pid: None)
+    return pages_mod, _FakeOwner
+
+
+def test_ui_add_threads_dev_mode(monkeypatch, tmp_path):
+    pages_mod, owner = _ui_env(monkeypatch, [])
+    pages_mod.ui_projects_add(
+        id="np", name="NP", path=str(tmp_path), ignore_patterns="", index_source_code="code"
+    )
+    by_id = {p.id: p for p in owner.captured}
+    assert by_id["np"].index_source_code is True
+
+
+def test_ui_save_threads_dev_mode(monkeypatch, tmp_path):
+    proj = ProjectConfig(id="p", path=str(tmp_path))
+    pages_mod, _ = _ui_env(monkeypatch, [proj])
+    pages_mod.ui_projects_save(
+        "p", name="P", path=str(tmp_path), ignore_patterns="", index_source_code="docs"
+    )
+    assert proj.index_source_code is False
+
+
+def test_ui_edit_form_preselects_stored_mode(monkeypatch, tmp_path):
+    pages_mod, _ = _ui_env(monkeypatch, [ProjectConfig(id="p", path=str(tmp_path), index_source_code=True)])
+    html = pages_mod.ui_projects_edit("p")
+    assert 'name="index_source_code"' in html
+    assert 'value="code" selected' in html  # stored True -> "code" pre-selected
+
+
+def test_projects_list_shows_mode_badge(monkeypatch, tmp_path):
+    pages_mod, _ = _ui_env(monkeypatch, [ProjectConfig(id="p", path=str(tmp_path), index_source_code=True)])
+    html = pages_mod._render_projects_list()
+    assert ">Code<" in html   # effective dev-mode badge on the row (code project)

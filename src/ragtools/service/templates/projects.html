@@ -51,6 +51,15 @@
                     </div>
                 </div>
             </details>
+            <div class="form-group" style="margin-top: 12px;">
+                <label class="form-label">Dev mode</label>
+                <select name="index_source_code" class="form-input">
+                    <option value="inherit" selected>Inherit global default</option>
+                    <option value="code">Index source code &amp; config</option>
+                    <option value="docs">Docs only (Markdown / text)</option>
+                </select>
+                <small style="color: var(--color-text-muted);">Whether to index this project's source code &amp; config, not just docs. Secret-bearing files are always excluded.</small>
+            </div>
             <div style="margin-top: 12px;">
                 <button type="submit" class="btn btn-primary">Add Project</button>
             </div>

@@ -376,6 +376,10 @@ def _render_projects_list() -> str:
     for p in settings.projects:
         idx = index_data.get(p.id, {"files": 0, "chunks": 0})
         badge = '<span class="badge badge-success">Enabled</span>' if p.enabled else '<span class="badge badge-muted">Disabled</span>'
+        # Effective dev-mode badge (Code = source code + config indexed; Docs = docs only).
+        effective = p.resolve_index_code(settings.index_source_code)
+        mode_src = "inherited from global" if p.index_source_code is None else "set on this project"
+        mode_badge = f'<span class="badge badge-muted" title="dev mode {mode_src}">{"Code" if effective else "Docs"}</span>'
         files = str(idx["files"]) if idx["files"] > 0 else "--"
         chunks = str(idx["chunks"]) if idx["chunks"] > 0 else "--"
         toggle_label = "Disable" if p.enabled else "Enable"
@@ -386,7 +390,7 @@ def _render_projects_list() -> str:
         rows += f"""<tr id="project-row-{escape(p.id)}">
             <td><strong>{escape(p.name)}</strong><br><code style="font-size:11px;color:var(--color-text-muted)">{escape(p.id)}</code></td>
             <td title="{escape(p.path)}"><code style="font-size:12px">{path_display}</code></td>
-            <td>{badge}</td>
+            <td>{badge} {mode_badge}</td>
             <td>{files}</td>
             <td>{chunks}</td>
             <td style="white-space:nowrap">
@@ -423,13 +427,15 @@ def ui_projects_add(
     name: str = Form(""),
     path: str = Form(""),
     ignore_patterns: str = Form(""),
+    index_source_code: str = Form("inherit"),
 ):
     """Add a new project via UI form."""
     try:
         from fastapi.responses import HTMLResponse as HR
         from ragtools.service.routes import project_create, ProjectCreateRequest
         patterns = [line.strip() for line in ignore_patterns.splitlines() if line.strip()]
-        req = ProjectCreateRequest(id=id.strip().lower(), name=name.strip(), path=path.strip(), ignore_patterns=patterns)
+        req = ProjectCreateRequest(id=id.strip().lower(), name=name.strip(), path=path.strip(),
+                                   ignore_patterns=patterns, index_source_code=index_source_code)
         project_create(req)
         response = HR(content=_render_projects_list())
         response.headers["HX-Trigger"] = "projectAdded"
@@ -448,6 +454,20 @@ def ui_projects_edit(project_id: str):
         return f'<tr><td colspan="6"><div class="flash flash-error">Project not found</div></td></tr>'
 
     patterns_text = "\n".join(project.ignore_patterns)
+    from ragtools.service.routes import _index_code_enum
+    cur_mode = _index_code_enum(project.index_source_code)
+
+    def _sel(v):
+        return " selected" if cur_mode == v else ""
+
+    mode_select = f'''<div class="form-group" style="margin-top:8px;">
+                    <label class="form-label">Dev mode</label>
+                    <select name="index_source_code" class="form-input">
+                        <option value="inherit"{_sel('inherit')}>Inherit global default</option>
+                        <option value="code"{_sel('code')}>Index source code &amp; config</option>
+                        <option value="docs"{_sel('docs')}>Docs only (Markdown / text)</option>
+                    </select>
+                </div>'''
     return f"""<tr id="project-row-{escape(project_id)}">
         <td colspan="6">
             <form hx-put="/ui/projects/{escape(project_id)}/save" hx-target="#projects-list" hx-swap="innerHTML">
@@ -467,6 +487,7 @@ def ui_projects_edit(project_id: str):
                         <textarea name="ignore_patterns" rows="3" class="form-textarea" placeholder="One pattern per line">{escape(patterns_text)}</textarea>
                     </div>
                 </details>
+                {mode_select}
                 <div style="display:flex;gap:8px;margin-top:10px;">
                     <button type="submit" class="btn btn-primary btn-sm"
                         hx-disabled-elt="this" hx-indicator="#projects-overlay">Save</button>
@@ -485,12 +506,14 @@ def ui_projects_save(
     name: str = Form(""),
     path: str = Form(""),
     ignore_patterns: str = Form(""),
+    index_source_code: str = Form("inherit"),
 ):
     """Save edited project via UI form."""
     try:
         from ragtools.service.routes import project_update, ProjectUpdateRequest
         patterns = [line.strip() for line in ignore_patterns.splitlines() if line.strip()]
-        req = ProjectUpdateRequest(name=name.strip() or None, path=path.strip() or None, ignore_patterns=patterns)
+        req = ProjectUpdateRequest(name=name.strip() or None, path=path.strip() or None,
+                                   ignore_patterns=patterns, index_source_code=index_source_code)
         project_update(project_id, req)
         return _render_projects_list()
     except Exception as e:
