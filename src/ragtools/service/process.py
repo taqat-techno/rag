@@ -286,34 +286,90 @@ def _force_kill(settings: Settings) -> bool:
         return False
 
 
+def _is_ragtools_health(body) -> bool:
+    """True only if a /health 200 body carries the ragtools identity markers.
+
+    A genuine ragtools /health 200 always has ``status == "ready"`` plus the
+    ``collection`` + ``version`` fields (Decision 16 — these are pinned). A
+    foreign server answering on the same port won't, so we must not report it
+    as our service (L5).
+    """
+    return (
+        isinstance(body, dict)
+        and body.get("status") == "ready"
+        and "collection" in body
+        and "version" in body
+    )
+
+
+def _port_listener_pid(port: int):
+    """Best-effort PID of whatever process is LISTENing on ``port`` (or None).
+
+    Used only to enrich a 'port occupied by a foreign process' message; never
+    load-bearing — any failure (psutil missing, permission denied) returns None.
+    """
+    try:
+        import psutil  # type: ignore[import-untyped]
+
+        for c in psutil.net_connections(kind="inet"):
+            laddr = getattr(c, "laddr", None)
+            if (
+                laddr
+                and getattr(laddr, "port", None) == port
+                and c.status == psutil.CONN_LISTEN
+            ):
+                return c.pid
+    except Exception:
+        return None
+    return None
+
+
 def service_status(settings: Settings) -> dict:
     """Check if service is running and get status info.
 
-    When supervised, the returned dict includes `supervisor_pid` so operators
-    and automation can tell who is keeping the service alive.
+    Distinguishes a healthy ragtools service from a *foreign* process occupying
+    the same port (L5): a 200 on ``/health`` is only trusted as ``ready`` when
+    the body carries the ragtools identity markers. When supervised, the returned
+    dict includes ``supervisor_pid``.
+
+    ``status`` values: ``ready`` / ``starting`` (``running=True``);
+    ``port_occupied_foreign`` or a bare ``{"running": False}`` down
+    (``running=False``). The CLI exit-code mapping (0/1/2) is unchanged — a
+    foreign occupation maps to 1 (our service is not running) with a clear
+    message.
     """
     import httpx
 
     url = f"http://{settings.service_host}:{settings.service_port}"
 
-    # Try health endpoint (authoritative "running" signal)
+    http_responded = False
+    # Try health endpoint (authoritative "ready" signal — but only when the body
+    # proves it is actually ragtools).
     try:
         r = httpx.get(f"{url}/health", timeout=2.0)
+        http_responded = True
         if r.status_code == 200:
-            return {
-                "running": True,
-                "status": "ready",
-                "pid": _read_pid(settings),
-                "supervisor_pid": _read_supervisor_pid(settings),
-                "port": settings.service_port,
-                "host": settings.service_host,
-                **r.json(),
-            }
+            try:
+                body = r.json()
+            except Exception:
+                body = None
+            if _is_ragtools_health(body):
+                return {
+                    "running": True,
+                    "status": "ready",
+                    "pid": _read_pid(settings),
+                    "supervisor_pid": _read_supervisor_pid(settings),
+                    "port": settings.service_port,
+                    "host": settings.service_host,
+                    **body,
+                }
+            # 200 but not a ragtools body — a foreign server. Fall through.
     except Exception:
+        # No HTTP response at all (connection refused / timeout).
         pass
 
-    # Health is down but the service process may still be coming up.
-    # Consider either PID file as evidence the system is in a transient state.
+    # Health did not confirm a ready ragtools service. A live ragtools PID means
+    # our service is still coming up (the common 503-during-startup case).
     pid = _read_pid(settings)
     sup_pid = _read_supervisor_pid(settings)
     if (pid and _process_alive(pid)) or (sup_pid and _process_alive(sup_pid)):
@@ -323,6 +379,22 @@ def service_status(settings: Settings) -> dict:
             "pid": pid,
             "supervisor_pid": sup_pid,
             "port": settings.service_port,
+        }
+
+    # No live ragtools PID. If *something* answered on the port, it is a foreign
+    # process (or an unidentifiable responder) — report it distinctly so the CLI
+    # never calls it 'healthy'. running=False keeps the down exit code (1).
+    if http_responded:
+        return {
+            "running": False,
+            "status": "port_occupied_foreign",
+            "port": settings.service_port,
+            "host": settings.service_host,
+            "foreign_pid": _port_listener_pid(settings.service_port),
+            "detail": (
+                f"Port {settings.service_port} is held by a process that is not "
+                f"a ragtools service (no ragtools /health identity, no live PID)."
+            ),
         }
 
     # Not running at all; any stale files have already been cleaned by

@@ -297,3 +297,104 @@ def test_service_status_cmd_exits_2_on_internal_error(monkeypatch):
     monkeypatch.setattr(proc_mod, "service_status", boom)
     result = CliRunner().invoke(cli_app, ["service", "status"])
     assert result.exit_code == 2
+
+
+# ---------------------------------------------------------------------------
+# L5 — service-status port-owner detection. A foreign process answering on the
+# service port must NOT be reported as a healthy ragtools service. Exit codes
+# (0/1/2) are unchanged; foreign occupation is an additive `status` value that
+# maps to exit 1 (our service is not running) with a clear message.
+# ---------------------------------------------------------------------------
+
+
+class _FakeHealthResp:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
+
+
+def _patch_health(monkeypatch, status_code, body):
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "get", lambda *a, **k: _FakeHealthResp(status_code, body))
+
+
+def _l5_settings(tmp_path):
+    return Settings(
+        qdrant_path=str(tmp_path / "q"),
+        state_db=str(tmp_path / "s.db"),
+        service_port=59999,
+    )
+
+
+def test_service_status_ready_requires_ragtools_identity(tmp_path, monkeypatch):
+    """A 200 with a genuine ragtools /health body => ready."""
+    settings = _l5_settings(tmp_path)
+    _patch_health(monkeypatch, 200, {
+        "status": "ready", "collection": "markdown_kb",
+        "version": "2.5.5", "watcher_running": True,
+    })
+    status = proc_mod.service_status(settings)
+    assert status["running"] is True
+    assert status["status"] == "ready"
+
+
+def test_service_status_foreign_200_not_ragtools(tmp_path, monkeypatch):
+    """A 200 that is NOT a ragtools /health body => foreign, never 'ready'."""
+    settings = _l5_settings(tmp_path)
+    _patch_health(monkeypatch, 200, {"hello": "world"})  # some other server
+    status = proc_mod.service_status(settings)
+    assert status["running"] is False
+    assert status["status"] == "port_occupied_foreign"
+
+
+def test_service_status_malformed_health_200(tmp_path, monkeypatch):
+    """A 200 whose body isn't JSON / lacks ragtools fields => foreign."""
+    settings = _l5_settings(tmp_path)
+    _patch_health(monkeypatch, 200, None)
+    status = proc_mod.service_status(settings)
+    assert status["running"] is False
+    assert status["status"] == "port_occupied_foreign"
+
+
+def test_service_status_foreign_non200_no_pid(tmp_path, monkeypatch):
+    """A non-200 HTTP response with no live ragtools PID => foreign."""
+    settings = _l5_settings(tmp_path)
+    _patch_health(monkeypatch, 404, {"error": "nope"})
+    status = proc_mod.service_status(settings)
+    assert status["running"] is False
+    assert status["status"] == "port_occupied_foreign"
+
+
+def test_service_status_starting_on_503_with_live_pid(tmp_path, monkeypatch):
+    """A ragtools 503 during startup (app up, owner not ready) with a live PID
+    is 'starting' (running) — NOT foreign."""
+    settings = _l5_settings(tmp_path)
+    _write_pid_file(settings, os.getpid())  # alive
+    _patch_health(monkeypatch, 503, {"detail": "Service not ready"})
+    status = proc_mod.service_status(settings)
+    assert status["running"] is True
+    assert status["status"] == "starting"
+
+
+def test_service_status_cmd_foreign_exits_1_with_message(monkeypatch):
+    """Foreign-port occupation maps to exit 1 (our service is not running) but
+    with a clear message — never reported as healthy."""
+    from typer.testing import CliRunner
+    from ragtools.cli import app as cli_app
+
+    monkeypatch.setattr(
+        proc_mod, "service_status",
+        lambda settings: {
+            "running": False, "status": "port_occupied_foreign",
+            "port": 21420, "host": "127.0.0.1", "foreign_pid": 4242,
+        },
+    )
+    result = CliRunner().invoke(cli_app, ["service", "status"])
+    assert result.exit_code == 1
+    out = result.stdout.lower()
+    assert "occupied" in out or "non-ragtools" in out or "foreign" in out

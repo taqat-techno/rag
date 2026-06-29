@@ -644,6 +644,22 @@ def service_status_cmd():
         console.print(table)
         return  # exit code 0
 
+    # L5 — a foreign process is holding the port. Our service is NOT running
+    # (exit 1, same as down), but say so clearly so the operator doesn't read
+    # the down message as "just start it" when the port is actually taken.
+    if info.get("status") == "port_occupied_foreign":
+        port = info.get("port", "")
+        fpid = info.get("foreign_pid")
+        who = f" (PID {fpid})" if fpid else ""
+        console.print(
+            f"[red]Port {port} is occupied by a non-ragtools process{who}.[/red]"
+        )
+        console.print(
+            "The RAG service is not running. Free the port or set a different "
+            "service_port, then: rag service start"
+        )
+        raise typer.Exit(1)
+
     console.print("[yellow]Service is not running.[/yellow]")
     console.print("Start with: rag service start")
     raise typer.Exit(1)
