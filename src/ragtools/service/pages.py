@@ -787,16 +787,12 @@ def _save_projects_to_toml(projects: list) -> None:
             existing = tomllib.load(f)
 
     existing["version"] = 2
-    existing["projects"] = [
-        {
-            "id": p.id,
-            "name": p.name,
-            "path": p.path,
-            "enabled": p.enabled,
-            "ignore_patterns": p.ignore_patterns,
-        }
-        for p in projects
-    ]
+    # Serialize via model_dump so every ProjectConfig field round-trips (no
+    # hand-maintained key list to forget). exclude_none drops None values —
+    # required because tomli_w cannot serialize None (TOML has no null), and it
+    # is exactly the right semantics for the tri-state index_source_code (None =
+    # inherit -> omit the key so the project keeps inheriting the global).
+    existing["projects"] = [p.model_dump(exclude_none=True) for p in projects]
     # Remove legacy content_root if upgrading
     existing.pop("content_root", None)
 
