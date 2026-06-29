@@ -7,7 +7,19 @@ False = force docs-only for this project
 Secret-bearing files are ALWAYS excluded regardless (orthogonal layer).
 """
 
+import pytest
+
 from ragtools.config import ProjectConfig
+
+
+@pytest.fixture(autouse=True)
+def _restore_app_singletons():
+    """Save/restore the service app singletons so endpoint tests that inject a
+    fake owner/settings can't leak into other test modules."""
+    from ragtools.service import app as app_module
+    o, s = app_module._owner, app_module._settings
+    yield
+    app_module._owner, app_module._settings = o, s
 
 
 # --- Phase 1: data model + resolver ---
@@ -143,3 +155,115 @@ def test_watcher_deepest_matching_root(tmp_path):
     assert _deepest_matching_root((parent / "y.py").resolve(), roots) == parent
     # outside both roots -> None
     assert _deepest_matching_root((tmp_path / "other.py").resolve(), roots) is None
+
+
+# --- Phase 4: API request models + reindex-on-change (G1) ---
+
+def test_dev_mode_enum_mapping():
+    from ragtools.service.routes import _stored_index_code, _index_code_enum
+    assert _stored_index_code("code") is True
+    assert _stored_index_code("docs") is False
+    assert _stored_index_code("inherit") is None
+    assert _stored_index_code(None) is None
+    assert _index_code_enum(True) == "code"
+    assert _index_code_enum(False) == "docs"
+    assert _index_code_enum(None) == "inherit"
+
+
+def _routes_env(monkeypatch, projects):
+    from ragtools.config import Settings
+    from ragtools.service import app as app_module, routes as routes_mod
+
+    class _FakeOwner:
+        captured = None
+        def update_projects(self, projs):
+            _FakeOwner.captured = list(projs)
+
+    from ragtools.service import pages as pages_mod
+    app_module._owner = _FakeOwner()
+    app_module._settings = Settings(projects=projects)
+    # _save_projects_to_toml is imported inside the route fns -> patch it at source.
+    monkeypatch.setattr(pages_mod, "_save_projects_to_toml", lambda *a, **k: None)
+    monkeypatch.setattr(routes_mod, "_restart_watcher_if_running", lambda *a, **k: None)
+    return routes_mod, app_module._owner
+
+
+def test_project_update_reindexes_only_on_effective_change(monkeypatch, tmp_path):
+    from ragtools.service.routes import ProjectUpdateRequest
+    proj = ProjectConfig(id="p", path=str(tmp_path))  # None -> inherit (global False -> docs)
+    routes_mod, _ = _routes_env(monkeypatch, [proj])
+    reindexed = []
+    monkeypatch.setattr(routes_mod, "_schedule_reindex", lambda pid: reindexed.append(pid))
+
+    routes_mod.project_update("p", ProjectUpdateRequest(index_source_code="code"))
+    assert proj.index_source_code is True
+    assert reindexed == ["p"]                 # docs -> code: effective changed -> reindex
+
+    reindexed.clear()
+    routes_mod.project_update("p", ProjectUpdateRequest(index_source_code="code"))
+    assert reindexed == []                    # same value: no reindex
+
+    routes_mod.project_update("p", ProjectUpdateRequest(name="renamed"))
+    assert reindexed == []                    # field not provided: unchanged
+    assert proj.index_source_code is True
+
+
+def test_project_create_threads_dev_mode(monkeypatch, tmp_path):
+    from ragtools.service.routes import ProjectCreateRequest
+    routes_mod, owner = _routes_env(monkeypatch, [])
+    monkeypatch.setattr(routes_mod, "_schedule_auto_index", lambda pid: None)
+    routes_mod.project_create(
+        ProjectCreateRequest(id="np", path=str(tmp_path), index_source_code="code")
+    )
+    by_id = {p.id: p for p in owner.captured}
+    assert by_id["np"].index_source_code is True
+
+
+def test_schedule_reindex_is_delete_aware(monkeypatch):
+    # G1: a dev-mode flip must use reindex_project (delete+full), NOT run_full_index
+    # (upsert-only) — else disabling dev mode leaves stale code chunks on disk.
+    import threading
+    from ragtools.service import app as app_module, routes as routes_mod
+    import ragtools.service.activity as activity_mod
+
+    calls = {"reindex_project": 0, "run_full_index": 0}
+
+    class _FakeOwner:
+        def reindex_project(self, project_id):
+            calls["reindex_project"] += 1
+            return {}
+        def run_full_index(self, project_id=None):
+            calls["run_full_index"] += 1
+            return {}
+
+    app_module._owner = _FakeOwner()
+    monkeypatch.setattr(activity_mod, "log_activity", lambda *a, **k: None)
+
+    class _ImmediateTimer:
+        def __init__(self, delay, fn):
+            self._fn = fn
+            self.daemon = True
+        def start(self):
+            self._fn()
+
+    monkeypatch.setattr(threading, "Timer", _ImmediateTimer)
+    routes_mod._schedule_reindex("p")
+    assert calls["reindex_project"] == 1
+    assert calls["run_full_index"] == 0
+
+
+def test_projects_configured_includes_dev_mode(monkeypatch, tmp_path):
+    from ragtools.config import Settings
+    from ragtools.service import app as app_module, routes as routes_mod
+    app_module._settings = Settings(
+        state_db=str(tmp_path / "none.db"),
+        projects=[
+            ProjectConfig(id="c", path=str(tmp_path), index_source_code=True),
+            ProjectConfig(id="i", path=str(tmp_path)),  # inherit
+        ],
+    )
+    by_id = {p["id"]: p for p in routes_mod.projects_configured()["projects"]}
+    assert by_id["c"]["index_source_code"] == "code"
+    assert by_id["c"]["index_source_code_effective"] is True
+    assert by_id["i"]["index_source_code"] == "inherit"
+    assert by_id["i"]["index_source_code_effective"] is False

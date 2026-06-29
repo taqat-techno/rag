@@ -5,7 +5,7 @@ import os
 import re
 import signal
 import threading
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -234,6 +234,8 @@ class ProjectCreateRequest(BaseModel):
     path: str
     enabled: bool = True
     ignore_patterns: list[str] = []
+    # Per-project "dev mode": inherit (global) / code (force on) / docs (force off).
+    index_source_code: Optional[Literal["inherit", "code", "docs"]] = None
 
 
 class ProjectUpdateRequest(BaseModel):
@@ -241,6 +243,23 @@ class ProjectUpdateRequest(BaseModel):
     path: Optional[str] = None
     enabled: Optional[bool] = None
     ignore_patterns: Optional[list[str]] = None
+    # None = field not provided (leave unchanged). "inherit"/"code"/"docs" set it.
+    index_source_code: Optional[Literal["inherit", "code", "docs"]] = None
+
+
+def _stored_index_code(enum_val: Optional[str]) -> Optional[bool]:
+    """Map the API dev-mode enum (inherit/code/docs, or None) to the stored
+    ProjectConfig.index_source_code (None/True/False). inherit and None -> None."""
+    return {"code": True, "docs": False}.get(enum_val or "inherit")
+
+
+def _index_code_enum(stored: Optional[bool]) -> str:
+    """Map a stored ProjectConfig.index_source_code (bool|None) to the API enum."""
+    if stored is True:
+        return "code"
+    if stored is False:
+        return "docs"
+    return "inherit"
 
 
 def _validate_project_id(pid: str) -> str | None:
@@ -272,6 +291,8 @@ def projects_configured():
         {
             "id": p.id, "name": p.name, "path": p.path,
             "enabled": p.enabled, "ignore_patterns": p.ignore_patterns,
+            "index_source_code": _index_code_enum(p.index_source_code),
+            "index_source_code_effective": p.resolve_index_code(settings.index_source_code),
             "files": index_data.get(p.id, {}).get("files", 0),
             "chunks": index_data.get(p.id, {}).get("chunks", 0),
         }
@@ -310,6 +331,32 @@ def _schedule_auto_index(project_id: str):
     timer.start()
 
 
+def _schedule_reindex(project_id: str):
+    """Background DELETE-AWARE reindex — used when a project's effective dev-mode
+    changes. Unlike _schedule_auto_index (run_full_index, which is upsert-only),
+    this calls reindex_project (delete_project_data + run_full_index) so disabling
+    dev mode PURGES the now-excluded code chunks and enabling backfills code.
+    """
+    import threading
+    from ragtools.service.activity import log_activity
+
+    def _run():
+        try:
+            log_activity("info", "indexer", f"Reindexing {project_id} (dev-mode change)...")
+            stats = get_owner().reindex_project(project_id)
+            files = stats.get("files_indexed", stats.get("files", 0))
+            chunks = stats.get("chunks_indexed", stats.get("chunks", 0))
+            log_activity("success", "indexer",
+                f"Reindexed {project_id}: {files} files, {chunks} chunks "
+                f"({stats.get('deleted_files', 0)} purged)")
+        except Exception as e:
+            log_activity("error", "indexer", f"Reindex failed for {project_id}: {e}")
+
+    timer = threading.Timer(3.0, _run)
+    timer.daemon = False
+    timer.start()
+
+
 @router.post("/api/projects")
 def project_create(req: ProjectCreateRequest):
     """Add a new project."""
@@ -339,6 +386,7 @@ def project_create(req: ProjectCreateRequest):
     new_project = ProjectConfig(
         id=req.id, name=req.name or req.id, path=path,
         enabled=req.enabled, ignore_patterns=req.ignore_patterns,
+        index_source_code=_stored_index_code(req.index_source_code),
     )
     updated = list(settings.projects) + [new_project]
 
@@ -376,6 +424,12 @@ def project_update(project_id: str, req: ProjectUpdateRequest):
         project.enabled = req.enabled
     if req.ignore_patterns is not None:
         project.ignore_patterns = req.ignore_patterns
+    # Per-project dev mode: capture the effective value before the change so we
+    # can reindex only when it actually flips (G1: delete-aware reindex below).
+    old_effective = project.resolve_index_code(settings.index_source_code)
+    if req.index_source_code is not None:
+        project.index_source_code = _stored_index_code(req.index_source_code)
+    new_effective = project.resolve_index_code(settings.index_source_code)
 
     from ragtools.service.pages import _save_projects_to_toml
     _save_projects_to_toml(list(settings.projects))
@@ -384,6 +438,8 @@ def project_update(project_id: str, req: ProjectUpdateRequest):
     from ragtools.service.activity import log_activity
     log_activity("info", "config", f"Project updated: {project_id}")
     _restart_watcher_if_running()
+    if new_effective != old_effective:
+        _schedule_reindex(project_id)
     return {"status": "updated", "project": {"id": project.id, "name": project.name, "path": project.path}}
 
 
