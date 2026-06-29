@@ -57,6 +57,18 @@ async def lifespan(app: FastAPI):
     from ragtools.service.activity import log_activity
     log_activity("success", "service", f"Service ready on {_settings.service_host}:{_settings.service_port}")
 
+    # M3: own the watcher's startup here, in the service lifecycle, rather than
+    # relying solely on run.py's delayed HTTP self-POST (which could miss the
+    # readiness window and leave the watcher silently inactive). Idempotent and
+    # never fatal — a construct/start failure is recorded and surfaced via
+    # /health degraded + /api/watcher/status state, not raised.
+    try:
+        from ragtools.service.routes import autostart_watcher
+        result = autostart_watcher()
+        logger.info("Watcher autostart: %s", result.get("status"))
+    except Exception:
+        logger.exception("Watcher autostart call failed (non-fatal)")
+
     yield
 
     # Shutdown

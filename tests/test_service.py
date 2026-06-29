@@ -376,3 +376,42 @@ def test_watcher_status_not_running(test_client):
     r = test_client.get("/api/watcher/status")
     assert r.status_code == 200
     assert r.json()["running"] is False
+
+
+def test_lifespan_autostarts_watcher(monkeypatch):
+    """M3: the watcher is started by the service lifecycle (lifespan), NOT by a
+    delayed HTTP self-POST in run.py. Drive the real-startup branch with a fake
+    owner (no encoder load) and assert the lifespan invokes autostart_watcher().
+    """
+    from starlette.testclient import TestClient
+    from ragtools.service.app import create_app
+    from ragtools.service import app as app_module
+    from ragtools.service import routes as routes_mod
+
+    class _FakeOwner:
+        def __init__(self, settings):
+            self._settings = settings
+
+        def close(self):
+            pass
+
+    called = {"n": 0}
+
+    def _spy_autostart():
+        called["n"] += 1
+        return {"status": "started"}
+
+    # Fake owner so the real-startup branch doesn't load the encoder; spy on the
+    # controller so no real watcher thread spins up.
+    monkeypatch.setattr(app_module, "QdrantOwner", _FakeOwner)
+    monkeypatch.setattr(routes_mod, "autostart_watcher", _spy_autostart)
+
+    _prev_owner, _prev_settings = app_module._owner, app_module._settings
+    app_module._owner = None  # force the real-startup branch (not the test-inject one)
+    app_module._settings = None
+    try:
+        with TestClient(create_app(), raise_server_exceptions=True):
+            pass
+        assert called["n"] == 1, "lifespan did not call autostart_watcher()"
+    finally:
+        app_module._owner, app_module._settings = _prev_owner, _prev_settings
