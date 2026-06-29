@@ -84,9 +84,12 @@ def health():
 
     # Additive degraded signal — `status` stays "ready" for liveness back-compat;
     # this surfaces watcher-down on /health so callers needn't interpret the raw
-    # bool. Index staleness is reported on /api/status + `rag doctor` (which read
-    # the state DB); /health stays cheap and lock-free.
-    issues = [] if watcher_running else ["watcher_not_running"]
+    # bool. Only an *undesired* down counts: a watcher the user explicitly stopped
+    # (desired_run False) is intentional, not degraded. Index staleness is reported
+    # on /api/status + `rag doctor` (state DB); /health stays cheap and lock-free.
+    issues = []
+    if not watcher_running and _watcher_desired_run:
+        issues.append("watcher_not_running")
 
     return {
         "status": "ready",
@@ -1264,8 +1267,14 @@ def system_health_endpoint():
     try:
         running = _watcher_thread is not None and _watcher_thread.is_alive()
         obs = _watcher_observability_snapshot()
+        state = obs.get("state")
         if running:
             wstatus, detail = "ok", "running"
+        elif state == "stopped":
+            # Deliberately stopped by the user — intentional, not a problem.
+            wstatus, detail = "ok", "stopped by user"
+        elif obs.get("autostart_error"):
+            wstatus, detail = "error", obs["autostart_error"]
         elif obs.get("last_error"):
             wstatus, detail = "error", obs["last_error"]
         else:
@@ -1275,7 +1284,9 @@ def system_health_endpoint():
             "status": wstatus,
             "detail": detail,
             "running": running,
+            "state": state,
             "last_error": obs.get("last_error"),
+            "autostart_error": obs.get("autostart_error"),
             "consecutive_failures": obs.get("consecutive_failures", 0),
         })
     except Exception as e:

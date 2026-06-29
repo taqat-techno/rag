@@ -415,3 +415,36 @@ def test_lifespan_autostarts_watcher(monkeypatch):
         assert called["n"] == 1, "lifespan did not call autostart_watcher()"
     finally:
         app_module._owner, app_module._settings = _prev_owner, _prev_settings
+
+
+def test_health_not_degraded_when_user_stopped(test_client):
+    """M3: a watcher that is down because the user stopped it is intentional —
+    /health must NOT flag it as degraded (only an undesired-down watcher is)."""
+    from ragtools.service import routes as routes_mod
+
+    prev = routes_mod._watcher_desired_run
+    routes_mod._watcher_desired_run = False
+    try:
+        body = test_client.get("/health").json()
+        assert body["status"] == "ready"
+        assert body["watcher_running"] is False
+        assert body["degraded"] is False
+        assert "watcher_not_running" not in body["issues"]
+    finally:
+        routes_mod._watcher_desired_run = prev
+
+
+def test_system_health_watcher_ok_when_user_stopped(test_client):
+    """M3: system-health reports a user-stopped watcher as ok ('stopped by user'),
+    not a warning — the operator deliberately turned it off."""
+    from ragtools.service import routes as routes_mod
+
+    prev = routes_mod._watcher_desired_run
+    routes_mod._watcher_desired_run = False
+    try:
+        body = test_client.get("/api/system-health").json()
+        watcher = next(c for c in body["checks"] if c["component"] == "watcher")
+        assert watcher["status"] == "ok"
+        assert watcher["state"] == "stopped"
+    finally:
+        routes_mod._watcher_desired_run = prev
