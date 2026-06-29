@@ -37,6 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a lifecycle autostart that could not construct/start the thread) on
   `/api/watcher/status`, `/api/system-health`, and `rag doctor`. All additive.
 
+### Changed — service-status port-owner detection (L5)
+
+- **`rag service status` no longer mistakes a foreign process for a healthy
+  service.** A `200` on `/health` is only trusted as `ready` when the body
+  carries the ragtools identity markers (`status=="ready"` + `collection` +
+  `version`). A 200 that isn't ragtools-shaped, or any HTTP response on the port
+  with no live ragtools PID, is reported as the additive status
+  `port_occupied_foreign` (with a best-effort foreign PID); the CLI says so
+  clearly and exits `1` (our service is not running). A ragtools `503` during
+  startup with a live PID still reads as `starting`. The exit-code contract
+  (`0` running/starting, `1` down, `2` internal error) is unchanged.
+
 ### Fixed
 
 - **Watcher restart no longer self-deadlocks.** `_restart_watcher_if_running`
@@ -49,6 +61,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returned plain text).
 - **Docs:** corrected the service-log path to `{data_dir}/data/logs/service.log`
   (was inconsistently `{data_dir}/logs/...`) in `CLAUDE.md` and `docs/decisions.md`.
+
+---
+
+## [2.5.5] — 2026-05-08
+
+Packaging-only hotfix on top of v2.5.4 (no `rag.exe` code changes). Closes two install-flow gaps found in live testing.
+
+### Fixed
+- **Existing watchdog Scheduled Task is repaired on upgrade.** The installer now runs `rag.exe service watchdog install` *only when an existing `RAGTools Watchdog` task is detected* (new `HasRAGToolsWatchdogTask()` Inno check), re-registering it with the silent VBS launcher — no more console-window flash every 15 min. Users who never opted into the watchdog get no new task.
+- **Tray icon appears immediately after install/upgrade.** The installer launches the freshly-written Startup VBS once post-install (hidden + `nowait`, gated on the `startup` task), so the icon no longer waits for the next Windows login.
+
+---
+
+## [2.5.4] — 2026-05-08
+
+Hotfix on top of v2.5.3.
+
+### Fixed
+- **System-tray icon is now actually bundled.** v2.5.0–v2.5.3 shipped without `pystray` + `Pillow` in the PyInstaller bundle (`release.yml` installed `[dev,build]` only), so `rag tray` from a packaged install failed with `ModuleNotFoundError` and exited silently. Fix: `release.yml` installs `[dev,build,tray]` on all platforms and `rag.spec` lists `pystray` / `PIL` in `hiddenimports`.
+
+---
+
+## [2.5.3] — 2026-05-08
+
+Bundle release: the Phase A API/contract pass plus Windows UX fixes.
+
+### Added
+- **`/health` 200 — `version` + `watcher_running`** (additive, Decision 16).
+- **`/api/watcher/status` observability fields** — `last_started_at`, `last_error`, `last_error_at`, `consecutive_failures`. Older clients reading only `running` / `paths` / `project_count` are unaffected.
+- **Decision 16 — API contracts are additive-only** — pins `scale.level` ⊆ `{ok, approaching, over}`, the `/health` 200 key set, and the `rag service status` exit codes.
+- **Reference: HTTP API** documentation; first `docs/wiki-src/` wiki release; a rotating `tray.log` under `…\RAGTools\data\logs\`.
+
+### Changed
+- **`rag service status` exit codes — `0` / `1` / `2`** (was always-`0` in every state). Behavior change: any CI relying on the always-`0` contract will start failing — treat this as a correctness fix.
+
+### Fixed
+- **Watchdog Scheduled Task no longer flashes a console window every 15 min** — it runs `wscript.exe RAGTools-Watchdog.vbs` (a silent launcher) instead of the console-subsystem `rag.exe`.
+- **Tray icon reliably appears after login** — the tray VBS sleeps 15 s to outwait `explorer.exe`'s systray initialisation.
 
 ---
 

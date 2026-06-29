@@ -390,7 +390,7 @@ Single encoder instance, single lock. The lock protects both the encoder and the
 - `/health` 200 keys: `status`, `collection`, `version`, `watcher_running`. Future additive fields are allowed.
 - `/health` non-200 responses always carry FastAPI's default `{"detail": "..."}` JSON body.
 - `/api/watcher/status` keys: `running`, `paths`, `project_count`, `last_started_at`, `last_error`, `last_error_at`, `consecutive_failures`. Older clients that only inspect the first three continue to work. *(Additive since, per Decision 17: `state`, `desired`, and — only on an autostart failure — `autostart_error`/`autostart_error_at`.)*
-- `rag service status` exit code: `0` running or starting, `1` down, `2` internal error. CI scripts may rely on these.
+- `rag service status` exit code: `0` running or starting, `1` down, `2` internal error. CI scripts may rely on these. *(L5: a foreign process occupying the port is reported via the additive `status: "port_occupied_foreign"` and maps to `1` — our service is not running — so a `200` from a non-ragtools server is never read as healthy. The exit codes themselves are unchanged.)*
 
 **Test enforcement:** `tests/test_scale_warning.py` includes `test_scale_level_enum_is_closed_set` so any silent fourth level fails CI. Route tests assert the documented field set is present.
 
