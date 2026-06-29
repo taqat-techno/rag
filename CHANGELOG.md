@@ -30,6 +30,7 @@ Source-code indexing is now a **per-project** toggle, not just the global `index
 
 ### Fixed
 - Changing a project's effective dev mode triggers a **delete-aware** reindex (`reindex_project`), so disabling dev mode purges the project's now-excluded code chunks instead of leaving them stale.
+- The project-list overlay spinner no longer gets stuck `active` and block the inline edit-form Save — an `outerHTML` swap (Edit button → edit form) detached the indicator's element so it was never cleared; the handler now clears all active section overlays after any htmx request.
 
 ### Tests
 - +25 tests in `tests/test_dev_mode.py` across all layers (data model, persistence, pipeline, API/reindex, UI, CLI, MCP). Full suite **765 passed, 1 skipped**. Validated end-to-end against this repo's own code: index → search → toggle-off → purge.
