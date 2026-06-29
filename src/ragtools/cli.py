@@ -952,9 +952,14 @@ def project_add(
     name: str = typer.Option(..., "--name", "-n", help="Display name for the project"),
     path: str = typer.Option(..., "--path", "-p", help="Path to project folder"),
     project_id: str = typer.Option("", "--id", help="Project ID (auto-generated from name if not provided)"),
+    mode: str = typer.Option("inherit", "--mode", help="Dev mode: inherit (global default), code (index source code & config), or docs (Markdown only)"),
 ):
     """Add a new project folder to the configuration."""
     import re
+
+    if mode not in ("inherit", "code", "docs"):
+        console.print("[red]--mode must be: inherit, code, or docs.[/red]")
+        raise typer.Exit(2)
 
     # Auto-generate ID from name if not provided
     if not project_id:
@@ -974,7 +979,8 @@ def project_add(
         import httpx
         try:
             r = httpx.post(f"{_service_url(settings)}/api/projects",
-                          json={"id": project_id, "name": name, "path": resolved_path},
+                          json={"id": project_id, "name": name, "path": resolved_path,
+                                "index_source_code": mode},
                           timeout=10.0)
             r.raise_for_status()
             console.print(f"[green]Project added:[/green] {project_id} ({name}) → {resolved_path}")
@@ -988,7 +994,8 @@ def project_add(
         if any(p.id == project_id for p in settings.projects):
             console.print(f"[red]Project ID '{project_id}' already exists.[/red]")
             raise typer.Exit(1)
-        new_project = ProjectConfig(id=project_id, name=name, path=resolved_path)
+        new_project = ProjectConfig(id=project_id, name=name, path=resolved_path,
+                                    index_source_code={"code": True, "docs": False}.get(mode))
         updated = list(settings.projects) + [new_project]
         from ragtools.service.pages import _save_projects_to_toml
         _save_projects_to_toml(updated)
@@ -1214,6 +1221,41 @@ def _toggle_project(project_id: str, enable: bool):
 
     state = "enabled" if enable else "disabled"
     console.print(f"[green]Project {state}:[/green] {project_id}")
+
+
+@project_app.command("dev-mode")
+def project_dev_mode(
+    project_id: str = typer.Argument(..., help="Project ID"),
+    state: str = typer.Argument(..., help="on = index source code & config, off = docs only, inherit = use the global default"),
+):
+    """Set a project's dev mode (whether its source code & config are indexed)."""
+    mode = {"on": "code", "off": "docs", "inherit": "inherit"}.get(state.lower())
+    if mode is None:
+        console.print("[red]state must be: on, off, or inherit.[/red]")
+        raise typer.Exit(2)
+
+    settings = _get_settings()
+    project = next((p for p in settings.projects if p.id == project_id), None)
+    if not project:
+        console.print(f"[yellow]Project '{project_id}' not found.[/yellow]")
+        raise typer.Exit(1)
+
+    if _probe_service(settings):
+        import httpx
+        try:
+            r = httpx.put(f"{_service_url(settings)}/api/projects/{project_id}",
+                          json={"index_source_code": mode}, timeout=10.0)
+            r.raise_for_status()
+        except Exception as e:
+            console.print(f"[red]Failed:[/red] {e}")
+            raise typer.Exit(1)
+        console.print(f"[green]Dev mode set:[/green] {project_id} → {mode} (reindex scheduled)")
+    else:
+        # Direct mode: write TOML. inherit -> None (omitted on save).
+        project.index_source_code = {"code": True, "docs": False}.get(mode)
+        from ragtools.service.pages import _save_projects_to_toml
+        _save_projects_to_toml(list(settings.projects))
+        console.print(f"[green]Dev mode set:[/green] {project_id} → {mode}. Run `rag index` to apply.")
 
 
 # --- Backup commands ---

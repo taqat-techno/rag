@@ -318,3 +318,56 @@ def test_projects_list_shows_mode_badge(monkeypatch, tmp_path):
     pages_mod, _ = _ui_env(monkeypatch, [ProjectConfig(id="p", path=str(tmp_path), index_source_code=True)])
     html = pages_mod._render_projects_list()
     assert ">Code<" in html   # effective dev-mode badge on the row (code project)
+
+
+# --- Phase 6: CLI (rag project dev-mode + add --mode), direct mode ---
+
+def _cli_env(tmp_path, monkeypatch):
+    import ragtools.config as cfg
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setattr(cfg, "get_config_write_path", lambda: config_path)
+    monkeypatch.setenv("RAG_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("RAG_STATE_DB", str(tmp_path / "s.db"))
+    monkeypatch.setenv("RAG_QDRANT_PATH", str(tmp_path / "q"))
+    monkeypatch.setenv("RAG_SERVICE_PORT", "21599")  # dead -> CLI uses direct mode
+    return config_path
+
+
+def _load_toml(path):
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def test_cli_project_dev_mode_direct(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from ragtools.cli import app as cli_app
+    from ragtools.service import pages
+    config_path = _cli_env(tmp_path, monkeypatch)
+    pages._save_projects_to_toml([ProjectConfig(id="p", path=str(tmp_path))])  # seed
+
+    res = CliRunner().invoke(cli_app, ["project", "dev-mode", "p", "on"])
+    assert res.exit_code == 0, res.stdout
+    assert _load_toml(config_path)["projects"][0]["index_source_code"] is True
+
+    res = CliRunner().invoke(cli_app, ["project", "dev-mode", "p", "off"])
+    assert res.exit_code == 0, res.stdout
+    assert _load_toml(config_path)["projects"][0]["index_source_code"] is False
+
+    res = CliRunner().invoke(cli_app, ["project", "dev-mode", "p", "inherit"])
+    assert res.exit_code == 0, res.stdout
+    assert "index_source_code" not in _load_toml(config_path)["projects"][0]
+
+
+def test_cli_project_add_mode_direct(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from ragtools.cli import app as cli_app
+    config_path = _cli_env(tmp_path, monkeypatch)
+    res = CliRunner().invoke(
+        cli_app, ["project", "add", "--name", "Code Proj", "--path", str(tmp_path), "--mode", "code"]
+    )
+    assert res.exit_code == 0, res.stdout
+    assert _load_toml(config_path)["projects"][0]["index_source_code"] is True
