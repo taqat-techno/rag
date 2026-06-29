@@ -38,10 +38,20 @@ class ProjectConfig(BaseModel):
     path: str                                        # absolute path to project folder
     enabled: bool = True                             # skip if False
     ignore_patterns: list[str] = Field(default_factory=list)  # per-project ignore patterns
+    # Per-project "dev mode" — override the global Settings.index_source_code.
+    #   None  = inherit the global (back-compat default; existing projects stay docs-only)
+    #   True  = index this project's source code + config/data (secrets still excluded)
+    #   False = force docs-only for this project, even if the global is on
+    index_source_code: bool | None = None
 
     def model_post_init(self, __context: Any) -> None:
         if not self.name:
             self.name = self.id
+
+    def resolve_index_code(self, global_default: bool) -> bool:
+        """Effective code-indexing decision for THIS project: the per-project
+        override when set, otherwise the global default."""
+        return self.index_source_code if self.index_source_code is not None else global_default
 
 
 # --- Path Resolution ---
