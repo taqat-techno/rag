@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet — `main` is at 2.6.0._
+
+---
+
+## [2.6.0] — 2026-06-29 — Diagnostics & observability · lifecycle-owned watcher autostart (M3) · port-owner detection (L5)
+
 ### Added — Diagnostics & observability
 
 - **Index-freshness detection (A-008).** `compute_index_freshness()` classifies
