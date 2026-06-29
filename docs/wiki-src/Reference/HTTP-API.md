@@ -265,10 +265,16 @@ or `{"status": "not_running"}`.
 | `last_error` | string \| null | Most recent error captured by the retry/give-up path. `"<ExceptionType>: <message>"`. Cleared on successful (re)start. |
 | `last_error_at` | ISO-8601 string \| null | UTC timestamp of the most recent error. Cleared with `last_error`. |
 | `consecutive_failures` | int | Number of consecutive failures since the last successful start. `0` while healthy. Reaches `_MAX_RETRIES + 1` on terminal give-up. |
+| `state` | string | Derived lifecycle label (see below). Always present. |
+| `desired` | string | `"run"` or `"stopped"` — the user's desired-state. `"stopped"` only after an explicit `POST /api/watcher/stop`. Always present. |
+| `autostart_error` | string | Only present when a lifecycle autostart failed to construct/start the thread; `"<ExceptionType>: <message>"`. |
+| `autostart_error_at` | ISO-8601 string | UTC timestamp of the autostart failure; present with `autostart_error`. |
+
+**`state` values** (Decision 17): `running` (thread alive) · `autostart_failed` (a lifecycle autostart could not start it) · `gave_up` (exhausted `_MAX_RETRIES`) · `crashed` (exited with a recorded error) · `stopped` (an explicit user stop is in effect) · `exited` (started then exited cleanly, e.g. no enabled projects) · `inactive` (never started / not yet autostarted).
 
 `last_error` may include absolute filesystem paths from the underlying exception (e.g. `Permission denied: 'D:\\…'`). The endpoint is localhost-only by design (Decision 5 — Localhost Auth) so paths are not redacted; operators need them to debug.
 
-The four observability fields are **additive** — older clients that only looked at `running` / `paths` / `project_count` continue to work.
+These fields are **additive** — older clients that only looked at `running` / `paths` / `project_count` continue to work. The `state` / `desired` / `autostart_error*` fields were added with the lifecycle-owned watcher autostart (Decision 17); the `/api/system-health` watcher check likewise additively gained `state` + `autostart_error`.
 
 ## Semantic map
 

@@ -685,11 +685,22 @@ def watcher_start():
 @router.post("/api/watcher/stop")
 def watcher_stop():
     """Stop the file watcher (records the user's intent to stay stopped)."""
-    global _watcher_desired_run
+    global _watcher_desired_run, _watcher_thread
+    global _watcher_autostart_error, _watcher_autostart_error_at
 
     with _watcher_lock:
         _watcher_desired_run = False  # user intent: do not auto-restart
-        return _stop_watcher_locked()
+        result = _stop_watcher_locked()
+        # A deliberate stop also clears prior failure markers so the watcher
+        # reports cleanly as "stopped" — not autostart_failed / crashed / gave_up.
+        # The operator turned it off on purpose; system-health must not keep
+        # flagging it as an error (Decision 17). The persistent crash marker +
+        # toast already fired, so nothing diagnostic is lost. Dropping the
+        # dead-but-not-None thread ref discards its stale error fingerprint too.
+        _watcher_autostart_error = None
+        _watcher_autostart_error_at = None
+        _watcher_thread = None
+        return result
 
 
 def _derive_watcher_state(
@@ -755,18 +766,26 @@ def _watcher_observability_snapshot() -> dict:
             alive = t.is_alive()
         except Exception:
             alive = False
+    # Snapshot the desired-state + autostart globals into locals once (lock-free
+    # reads) so the derived state and the emitted keys below are mutually
+    # consistent within one response, even if a concurrent start/stop mutates
+    # them mid-call. Per-field reads are GIL-atomic; this just avoids pairing a
+    # state derived from a stale error with a since-cleared error key.
+    desired_run = _watcher_desired_run
+    autostart_error = _watcher_autostart_error
+    autostart_error_at = _watcher_autostart_error_at
     snap["state"] = _derive_watcher_state(
         snap,
         alive,
-        desired_run=_watcher_desired_run,
-        autostart_error=_watcher_autostart_error,
+        desired_run=desired_run,
+        autostart_error=autostart_error,
     )
     # Additive M3 fields: the user's desired-state, and the autostart failure
     # detail (only when one occurred). Older clients ignore the extra keys.
-    snap["desired"] = "run" if _watcher_desired_run else "stopped"
-    if _watcher_autostart_error:
-        snap["autostart_error"] = _watcher_autostart_error
-        snap["autostart_error_at"] = _watcher_autostart_error_at
+    snap["desired"] = "run" if desired_run else "stopped"
+    if autostart_error:
+        snap["autostart_error"] = autostart_error
+        snap["autostart_error_at"] = autostart_error_at
     return snap
 
 
@@ -1326,8 +1345,11 @@ def shutdown():
     from ragtools.service.activity import log_activity
     log_activity("warning", "service", "Shutdown requested")
 
-    # Stop watcher if running
-    watcher_stop()
+    # Stop the watcher WITHOUT recording user intent — a service shutdown must
+    # not flip the desired-state flag (only an explicit POST /api/watcher/stop
+    # should). Use the lock-free internal, like _restart_watcher_if_running does.
+    with _watcher_lock:
+        _stop_watcher_locked()
 
     # Signal shutdown
     event = get_shutdown_event()

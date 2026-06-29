@@ -162,6 +162,69 @@ def test_state_is_stopped_after_user_stop(wenv):
     assert snap["desired"] == "stopped"
 
 
+def test_user_stop_clears_autostart_failure(wenv):
+    """A deliberate stop after a failed autostart must read as 'stopped', not
+    keep reporting 'autostart_failed' (else system-health pages on a watcher the
+    operator turned off — contradicts Decision 17)."""
+    routes_mod._watcher_autostart_error = "RuntimeError: boom"
+    routes_mod._watcher_autostart_error_at = "2026-01-01T00:00:00+00:00"
+    assert routes_mod._watcher_observability_snapshot()["state"] == "autostart_failed"
+
+    routes_mod.watcher_stop()
+
+    assert routes_mod._watcher_desired_run is False
+    assert routes_mod._watcher_autostart_error is None
+    snap = routes_mod._watcher_observability_snapshot()
+    assert snap["state"] == "stopped"
+    assert "autostart_error" not in snap
+
+
+def test_user_stop_after_crash_resolves_to_stopped(wenv):
+    """Same intent for a crashed/gave-up watcher: once the user stops it, its
+    dead-thread error fingerprint must not keep it pinned to crashed/gave_up."""
+    crashed = FakeWatcher(object(), Settings())
+    crashed._alive = False
+    crashed.get_state_snapshot = lambda: {
+        "last_started_at": "2026-01-01T00:00:00+00:00",
+        "last_error": "boom",
+        "last_error_at": "2026-01-01T00:00:00+00:00",
+        "consecutive_failures": 5,
+    }
+    routes_mod._watcher_thread = crashed
+    assert routes_mod._watcher_observability_snapshot()["state"] in ("gave_up", "crashed")
+
+    routes_mod.watcher_stop()
+
+    snap = routes_mod._watcher_observability_snapshot()
+    assert snap["state"] == "stopped"
+    assert routes_mod._watcher_thread is None
+
+
+def test_shutdown_does_not_mutate_desired_state(wenv, monkeypatch):
+    """A service shutdown stops the watcher but must NOT record a user 'stop'
+    intent — only an explicit POST /api/watcher/stop should flip desired-state."""
+    import ragtools.service.activity as activity_mod
+
+    # shutdown() spawns a daemon thread that sleeps 0.5s then os.kill(SIGINT)s
+    # the process. Neutralize BOTH: stop that thread from starting (so a deferred
+    # kill can't fire after monkeypatch restores os.kill and abort the session)
+    # and no-op os.kill as a belt-and-suspenders guard.
+    class _NoThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(routes_mod.threading, "Thread", _NoThread)
+    monkeypatch.setattr(routes_mod.os, "kill", lambda *a, **k: None)
+    monkeypatch.setattr(activity_mod, "log_activity", lambda *a, **k: None)
+
+    routes_mod._watcher_desired_run = True
+    routes_mod.shutdown()
+    assert routes_mod._watcher_desired_run is True
+
+
 # --- pure derivation ---------------------------------------------------------
 
 def test_derive_state_distinguishes_stopped_and_autostart_failed():
