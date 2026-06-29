@@ -237,7 +237,7 @@ All settings in `config.py` via Pydantic Settings. Override with env vars prefix
 | `RAG_SCORE_THRESHOLD` | `0.3` | Minimum similarity score |
 | `RAG_CONTENT_ROOT` | `.` | Root for project discovery |
 | `RAG_STATE_DB` | `data/index_state.db` | SQLite state path |
-| `RAG_INDEX_SOURCE_CODE` | `false` | Opt-in: also index source code + config/data, not just docs |
+| `RAG_INDEX_SOURCE_CODE` | `false` | Global default: also index source code + config/data, not just docs. Overridable **per-project** ("dev mode") via the admin panel, `rag project dev-mode <id> on/off/inherit`, or the `set_project_dev_mode` MCP tool — stored as `ProjectConfig.index_source_code` (None=inherit / True=code / False=docs). |
 | `RAG_SECRET_ALLOWLIST` | `[]` | Globs to re-include specific secret-bearing files (default: none) |
 
 ## Upgrade notes (2.6)

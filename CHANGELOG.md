@@ -9,7 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet — `main` is at 2.6.0._
+_Nothing yet — `main` is at 2.7.0._
+
+---
+
+## [2.7.0] — 2026-06-29 — Per-project "dev mode" (per-project source-code indexing)
+
+Source-code indexing is now a **per-project** toggle, not just the global `index_source_code`. Mark a project as a code/dev project (index its source code & config) or docs-only, independent of the global default — settable when adding a project, editable on existing ones, and via the CLI + an MCP tool. Secret-bearing files are always excluded regardless.
+
+### Added
+- **`ProjectConfig.index_source_code`** — a tri-state per-project override (`None` = inherit the global / `True` = index code & config / `False` = docs only). Existing projects inherit (zero migration).
+- **Admin panel** — a "Dev mode" `<select>` on the add **and** edit project forms, plus a Code/Docs badge per row in the list.
+- **CLI** — `rag project dev-mode <id> on|off|inherit` and `rag project add --mode inherit|code|docs`.
+- **MCP tool** — `set_project_dev_mode(project, enabled, confirm_token)` (gated, default-on). Disabling purges code chunks, so it requires `confirm_token == project`; routes through the service HTTP API (single-process Qdrant).
+- **API** — `index_source_code` on project create/update; a dedicated `POST /api/projects/{id}/dev-mode`; `/api/projects/configured` returns the raw + effective mode.
+
+### Changed
+- The scanner and the file watcher resolve `include_code` **per project**. The watcher deepest-match-attributes nested projects, so a code child under a docs parent is watched with its own mode (not the parent's).
+- `_save_projects_to_toml` serializes via `model_dump(exclude_none=True)` so every `ProjectConfig` field persists (and a `None` override is omitted — `tomli_w` can't write `None`).
+
+### Fixed
+- Changing a project's effective dev mode triggers a **delete-aware** reindex (`reindex_project`), so disabling dev mode purges the project's now-excluded code chunks instead of leaving them stale.
+
+### Tests
+- +25 tests in `tests/test_dev_mode.py` across all layers (data model, persistence, pipeline, API/reindex, UI, CLI, MCP). Full suite **765 passed, 1 skipped**. Validated end-to-end against this repo's own code: index → search → toggle-off → purge.
 
 ---
 
