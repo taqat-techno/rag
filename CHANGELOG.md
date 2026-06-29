@@ -22,8 +22,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index, freshness, watcher, projects, checks, recommended_actions) so tooling no
   longer parses the human table. New Watcher / Index-freshness / Project-path rows.
 
+### Changed — Watcher autostart is lifecycle-owned (M3)
+
+- **The file watcher now starts from the service lifecycle** (the FastAPI
+  lifespan calls `autostart_watcher()`), replacing the delayed HTTP self-POST in
+  `run.py` that could miss the readiness window and leave the watcher silently
+  inactive. Startup is idempotent (no duplicate threads) and never fatal — a
+  construct/start failure is recorded and surfaced, not raised.
+- **An explicit user stop is respected.** A per-process desired-state flag means
+  lifecycle autostart and the project-edit restart never re-start a watcher the
+  user deliberately stopped. `/health` no longer flags a user-stopped watcher as
+  `degraded`, and `/api/system-health` reports it as "stopped by user".
+- **Richer watcher `state`** — adds `stopped` (user intent) and `autostart_failed`
+  (a lifecycle autostart that could not construct/start the thread) on
+  `/api/watcher/status`, `/api/system-health`, and `rag doctor`. All additive.
+
 ### Fixed
 
+- **Watcher restart no longer self-deadlocks.** `_restart_watcher_if_running`
+  (run after a project edit while the watcher is live) called the lock-acquiring
+  route handlers while already holding the watcher lock — a re-entrant acquire on
+  a non-reentrant `Lock` that hung the restart thread and every subsequent
+  `/api/watcher/status` reader. It now calls the lock-free internals.
 - **`/health` (and all routes) now return JSON on an uncaught 5xx** via a global
   exception handler, matching the documented contract (previously Starlette
   returned plain text).
