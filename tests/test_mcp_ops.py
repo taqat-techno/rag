@@ -1201,7 +1201,7 @@ def test_register_ops_tools_defaults_to_enabled_for_unknown_names(tmp_path, monk
 
     # With an empty dict the registrar's ``access.get(name, True)`` default
     # kicks in for every tool — so ALL optional tools should register.
-    expected_tool_count = 19  # 9 diagnostics + 5 project read + 5 project write
+    expected_tool_count = 20  # 9 diagnostics + 5 project read + 6 project write
     assert len(added) == expected_tool_count
 
 
@@ -1219,7 +1219,7 @@ def test_settings_default_mcp_tools_covers_all_optional_tools():
         "project_status", "project_summary", "list_project_files",
         "get_project_ignore_rules", "preview_ignore_effect",
         # project-scoped writes
-        "run_index", "reindex_project", "add_project",
+        "run_index", "reindex_project", "add_project", "set_project_dev_mode",
         "add_project_ignore_rule", "remove_project_ignore_rule",
     }
     assert set(s.mcp_tools.keys()) == expected
