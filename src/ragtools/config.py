@@ -314,6 +314,7 @@ class Settings(BaseSettings):
         "run_index":                True,
         "reindex_project":          True,
         "add_project":              True,
+        "set_project_dev_mode":     True,
         "add_project_ignore_rule":  True,
         "remove_project_ignore_rule": True,
         # Debugging / diagnostics — disabled by default (opt-in for operators)

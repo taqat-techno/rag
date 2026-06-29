@@ -250,6 +250,7 @@ def _register_ops_tools() -> None:
         ("run_index",                   run_index),
         ("reindex_project",             reindex_project),
         ("add_project",                 add_project),
+        ("set_project_dev_mode",        set_project_dev_mode),
         ("add_project_ignore_rule",     add_project_ignore_rule),
         ("remove_project_ignore_rule", remove_project_ignore_rule),
     ]
@@ -725,6 +726,56 @@ def reindex_project(project: str, confirm_token: str) -> dict:
     result = proxy_post(_ops_state, f"/api/projects/{project}/reindex")
     if result.get("ok"):
         _write_cooldown.mark("reindex_project")
+    return result
+
+
+def set_project_dev_mode(project: str, enabled: bool, confirm_token: str = "") -> dict:
+    """Turn a project's "dev mode" on/off — whether its SOURCE CODE & config
+    files are indexed (in addition to docs). Secret-bearing files are ALWAYS
+    excluded regardless.
+
+    USE WHEN: the user asks to index (or stop indexing) a project's code, e.g.
+              "index the code in project X" / "make X docs-only".
+    DO NOT USE: for content search (that's search_knowledge_base). This mutates
+                project config and triggers a reindex.
+
+    Args:
+        project: Project ID.
+        enabled: True = index this project's source code & config; False =
+                 docs-only (PURGES the project's existing code chunks).
+        confirm_token: Required ONLY when ``enabled`` is False (the destructive,
+                       chunk-purging direction). Must equal the project ID, so a
+                       prompt-injected call can't blindly strip a project's code.
+    """
+    if _ops_state is None or _ops_state.mode != "proxy":
+        return err(
+            _ops_state or _fallback_state(),
+            "set_project_dev_mode requires the service to be running — config "
+            "writes cannot be persisted in direct mode.",
+            code=_errcodes.SERVICE_DOWN,
+            hint="Start the service with: rag service start",
+        )
+    if not project or not project.strip():
+        return err(_ops_state, "project cannot be empty.", code=_errcodes.INVALID_ARG)
+    if not enabled and confirm_token != project:
+        return err(
+            _ops_state,
+            "Disabling dev mode purges the project's code chunks; confirm_token "
+            "must equal the project ID.",
+            code=_errcodes.CONFIRM_TOKEN_MISMATCH,
+            hint=f"Pass confirm_token={project!r} to proceed.",
+        )
+    gate = _cooldown_guard("set_project_dev_mode")
+    if gate is not None:
+        return gate
+    mode = "code" if enabled else "docs"
+    result = proxy_post(
+        _ops_state,
+        f"/api/projects/{project.strip()}/dev-mode",
+        json={"index_source_code": mode},
+    )
+    if result.get("ok"):
+        _write_cooldown.mark("set_project_dev_mode")
     return result
 
 

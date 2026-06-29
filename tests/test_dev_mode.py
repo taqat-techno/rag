@@ -371,3 +371,57 @@ def test_cli_project_add_mode_direct(tmp_path, monkeypatch):
     )
     assert res.exit_code == 0, res.stdout
     assert _load_toml(config_path)["projects"][0]["index_source_code"] is True
+
+
+# --- Phase 7: dedicated route + MCP tool (gated, confirm-token on disable) ---
+
+def test_route_dev_mode_sets_and_reindexes(monkeypatch, tmp_path):
+    from ragtools.service.routes import DevModeRequest
+    proj = ProjectConfig(id="p", path=str(tmp_path))
+    routes_mod, _ = _routes_env(monkeypatch, [proj])
+    reindexed = []
+    monkeypatch.setattr(routes_mod, "_schedule_reindex", lambda pid: reindexed.append(pid))
+    res = routes_mod.project_set_dev_mode("p", DevModeRequest(index_source_code="code"))
+    assert proj.index_source_code is True
+    assert res["effective"] is True
+    assert res["reindex_scheduled"] is True
+    assert reindexed == ["p"]
+
+
+def test_mcp_set_dev_mode_enable_proxies(monkeypatch):
+    import types
+    from ragtools.integration import mcp_server as mcp
+    monkeypatch.setattr(mcp, "_ops_state", types.SimpleNamespace(mode="proxy"))
+    monkeypatch.setattr(mcp, "_cooldown_guard", lambda name: None)
+    captured = {}
+    monkeypatch.setattr(mcp, "proxy_post",
+                        lambda state, path, json=None: captured.update(path=path, json=json) or {"ok": True})
+    res = mcp.set_project_dev_mode("myproj", True)
+    assert res["ok"] is True
+    assert captured["path"] == "/api/projects/myproj/dev-mode"
+    assert captured["json"] == {"index_source_code": "code"}
+
+
+def test_mcp_set_dev_mode_disable_requires_confirm(monkeypatch):
+    import types
+    from ragtools.integration import mcp_server as mcp
+    monkeypatch.setattr(mcp, "_ops_state", types.SimpleNamespace(mode="proxy"))
+    monkeypatch.setattr(mcp, "_cooldown_guard", lambda name: None)
+    posted = []
+    monkeypatch.setattr(mcp, "proxy_post", lambda *a, **k: posted.append(1) or {"ok": True})
+    # disable WITHOUT confirm_token -> rejected, no proxy call
+    res = mcp.set_project_dev_mode("myproj", False)
+    assert res.get("ok") is not True
+    assert posted == []
+    # disable WITH confirm_token -> proceeds, mode "docs"
+    captured = {}
+    monkeypatch.setattr(mcp, "proxy_post",
+                        lambda state, path, json=None: captured.update(path=path, json=json) or {"ok": True})
+    res = mcp.set_project_dev_mode("myproj", False, confirm_token="myproj")
+    assert res["ok"] is True
+    assert captured["json"] == {"index_source_code": "docs"}
+
+
+def test_mcp_set_dev_mode_is_gated_default_on():
+    from ragtools.config import Settings
+    assert Settings().mcp_tools.get("set_project_dev_mode") is True

@@ -485,6 +485,43 @@ def project_toggle(project_id: str):
     return {"status": "toggled", "project_id": project_id, "enabled": project.enabled}
 
 
+class DevModeRequest(BaseModel):
+    index_source_code: Literal["inherit", "code", "docs"]
+
+
+@router.post("/api/projects/{project_id}/dev-mode")
+def project_set_dev_mode(project_id: str, req: DevModeRequest):
+    """Set a project's dev mode (index_source_code) and reindex if it changed.
+
+    A single-purpose endpoint (vs PUT /api/projects/{id}) so the CLI/MCP can set
+    the mode without risking a stale name/path overwrite. Reindex is delete-aware
+    (G1) so disabling purges the project's code chunks.
+    """
+    settings = get_settings()
+    project = next((p for p in settings.projects if p.id == project_id), None)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    old_effective = project.resolve_index_code(settings.index_source_code)
+    project.index_source_code = _stored_index_code(req.index_source_code)
+    new_effective = project.resolve_index_code(settings.index_source_code)
+
+    from ragtools.service.pages import _save_projects_to_toml
+    _save_projects_to_toml(list(settings.projects))
+    get_owner().update_projects(list(settings.projects))
+
+    from ragtools.service.activity import log_activity
+    log_activity("info", "config", f"Project {project_id} dev-mode -> {req.index_source_code}")
+    _restart_watcher_if_running()
+    if new_effective != old_effective:
+        _schedule_reindex(project_id)
+    return {
+        "status": "dev_mode_set", "project_id": project_id,
+        "index_source_code": req.index_source_code, "effective": new_effective,
+        "reindex_scheduled": new_effective != old_effective,
+    }
+
+
 # --- Config ---
 
 @router.get("/api/config")
