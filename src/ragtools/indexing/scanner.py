@@ -64,7 +64,8 @@ def discover_markdown_files(
 def discover_indexable_files(
     directory: Path,
     ignore_rules: IgnoreRules | None = None,
-    include_code: bool = True,
+    mode: str = "general",
+    dep_spec=None,
 ) -> list[Path]:
     """Find all supported files in a directory recursively, respecting ignore rules.
 
@@ -75,12 +76,18 @@ def discover_indexable_files(
     Args:
         directory: Directory to scan.
         ignore_rules: Ignore rules engine. If None, uses default built-in rules.
-        include_code: When False, only documentation files are returned
-            (lets a deployment restrict the index to docs if desired).
+        mode: Project Mode — ``"docs"`` (documentation only), ``"code"``
+            (source/config/code only), or ``"general"`` (both). See
+            ``config.mode_indexes``.
+        dep_spec: Optional per-project dependency matcher (a ``pathspec`` from
+            ``source_class.dependency_spec``). Files matching it are external
+            dependency / co-located framework source and are excluded by default
+            (owned-only indexing).
 
     Returns: sorted list of absolute Paths to indexable files.
     """
     from ragtools.chunking.languages import classify_file, DOCUMENTATION
+    from ragtools.config import mode_indexes
 
     if ignore_rules is None:
         from ragtools.ignore import IgnoreRules as IR
@@ -93,11 +100,15 @@ def discover_indexable_files(
         fc = classify_file(path)
         if fc is None:
             continue
-        if not include_code and fc.chunk_type != DOCUMENTATION:
+        if not mode_indexes(mode, fc.chunk_type == DOCUMENTATION):
             continue
         if ignore_rules.is_secret(path):
             continue
         if ignore_rules.is_ignored(path, directory):
+            continue
+        # Owned-only default: skip external dependency / co-located framework
+        # source (declared dependency_paths + git submodules).
+        if dep_spec is not None and dep_spec.match_file(path.relative_to(directory).as_posix()):
             continue
         results.append(path)
     return sorted(results)
@@ -127,9 +138,12 @@ def scan_project(
             raise ValueError(f"Project '{project_id}' not found in {content_root}")
         projects = {project_id: projects[project_id]}
 
+    # v1 legacy path has no per-project Mode; map the global include_code bool:
+    # True -> "general" (index everything, the historical behavior), False -> "docs".
+    mode = "general" if include_code else "docs"
     results = []
     for pid, project_dir in projects.items():
-        for f in discover_indexable_files(project_dir, ignore_rules=ignore_rules, include_code=include_code):
+        for f in discover_indexable_files(project_dir, ignore_rules=ignore_rules, mode=mode):
             results.append((pid, f))
     return results
 
@@ -147,7 +161,6 @@ def scan_configured_projects(
     projects: list[ProjectConfig],
     global_ignore_patterns: list[str] | None = None,
     use_ragignore: bool = True,
-    include_code: bool = True,
     secret_allowlist: list[str] | None = None,
 ) -> list[tuple[str, Path]]:
     """Scan explicitly configured projects for markdown files (v2).
@@ -194,7 +207,15 @@ def scan_configured_projects(
             secret_allowlist=secret_allowlist,
         )
 
-        for found in discover_indexable_files(project_path, ignore_rules=ignore_rules, include_code=include_code):
+        # Owned-only default: external dependency / co-located framework roots
+        # (declared dependency_paths + git submodules) are excluded.
+        from ragtools.source_class import dependency_spec
+        proj_dep_spec = dependency_spec(project_path, project.dependency_paths)
+
+        # Per-project Mode (docs / code / general) governs what is indexed.
+        for found in discover_indexable_files(
+            project_path, ignore_rules=ignore_rules, mode=project.mode, dep_spec=proj_dep_spec
+        ):
             # Skip files that belong to a more specific child project
             if child_paths:
                 file_resolved = found.resolve()

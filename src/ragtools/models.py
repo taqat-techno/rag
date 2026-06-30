@@ -16,12 +16,15 @@ class Chunk(BaseModel):
     raw_text: str = Field(description="Original chunk text without context prefix")
     headings: list[str] = Field(default_factory=list, description="Heading/symbol hierarchy for this chunk")
     token_count: int = Field(default=0, description="Approximate token count")
+    line_start: int = Field(default=0, description="1-based start line in the source file (0 = unknown)")
+    line_end: int = Field(default=0, description="1-based end line in the source file (0 = unknown)")
 
     # --- Code/document metadata (Phase: code indexing) ---
     file_name: str = Field(default="", description="Base file name, e.g. 'searcher.py'")
     extension: str = Field(default="", description="File extension incl. dot, e.g. '.py'")
     language: str = Field(default="", description="Detected language, e.g. 'python', 'markdown'")
     chunk_type: str = Field(default="documentation", description="code | comment | config | documentation")
+    source_class: str = Field(default="owned", description="owned | dependency | generated | secret")
     module: str = Field(default="", description="Project/module name this chunk belongs to")
     class_name: str | None = Field(default=None, description="Enclosing class name, if any")
     function_name: str | None = Field(default=None, description="Enclosing function/method name, if any")
@@ -52,10 +55,13 @@ class SearchResult(BaseModel):
     project_id: str
     headings: list[str] = Field(default_factory=list)
     confidence: str = Field(description="HIGH (>=0.7), MODERATE (0.5-0.7), LOW (<0.5)")
+    line_start: int = Field(default=0)
+    line_end: int = Field(default=0)
 
     # --- Code/document metadata (mirrors Chunk; defaults keep old data working) ---
     language: str = Field(default="")
     chunk_type: str = Field(default="documentation")
+    source_class: str = Field(default="owned")
     class_name: str | None = Field(default=None)
     function_name: str | None = Field(default=None)
     symbols: list[str] = Field(default_factory=list)

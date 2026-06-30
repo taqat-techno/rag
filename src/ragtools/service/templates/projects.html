@@ -51,6 +51,15 @@
                     </div>
                 </div>
             </details>
+            <div class="form-group" style="margin-top: 12px;">
+                <label class="form-label">Mode</label>
+                <select name="mode" class="form-input">
+                    <option value="docs" selected>Docs — documentation / text / Markdown only</option>
+                    <option value="code">Code — source &amp; config files only</option>
+                    <option value="general">General — both docs and code</option>
+                </select>
+                <small style="color: var(--color-text-muted);">Choose what this project indexes. Secret-bearing files are always excluded.</small>
+            </div>
             <div style="margin-top: 12px;">
                 <button type="submit" class="btn btn-primary">Add Project</button>
             </div>

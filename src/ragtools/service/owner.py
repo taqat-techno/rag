@@ -240,6 +240,11 @@ class QdrantOwner:
                     "file_path": r.file_path,
                     "project_id": r.project_id,
                     "headings": r.headings,
+                    "source_class": r.source_class,
+                    "chunk_type": r.chunk_type,
+                    "language": r.language,
+                    "line_start": r.line_start,
+                    "line_end": r.line_end,
                 }
                 for r in results
             ],
@@ -274,14 +279,18 @@ class QdrantOwner:
                 project_id=project_id,
                 project_ids=project_ids,
                 top_k=top_k,
+                force_dev=True,  # the dev endpoint is always code-first
             )
-            formatted = format_dev_context(outcome.results, query, outcome.triggers)
+            formatted = format_dev_context(outcome.results, query, outcome.triggers,
+                                           outcome.warnings, outcome.code_indexed)
             return {
                 "query": query,
                 "count": len(outcome.results),
                 "is_dev_request": outcome.is_dev_request,
                 "triggers": outcome.triggers,
                 "layers": outcome.layers,
+                "warnings": outcome.warnings,
+                "code_indexed": outcome.code_indexed,
                 "results": [
                     {
                         "score": r.score,
@@ -290,16 +299,80 @@ class QdrantOwner:
                         "file_path": r.file_path,
                         "project_id": r.project_id,
                         "headings": r.headings,
+                        "source_class": r.source_class,
                         "language": r.language,
                         "chunk_type": r.chunk_type,
                         "class_name": r.class_name,
                         "function_name": r.function_name,
                         "symbols": r.symbols,
+                        "line_start": r.line_start,
+                        "line_end": r.line_end,
                     }
                     for r in outcome.results
                 ],
                 "formatted": formatted,
             }
+
+    def find_definitions(self, symbol: str, project_id: str | None = None, top_k: int = 25) -> list[dict]:
+        """Find likely definition sites for a symbol (cross-file code-graph v1)."""
+        with self._lock:
+            from ragtools.retrieval.codegraph import find_definitions as _find
+            searcher = Searcher(
+                client=self._client, encoder=self._encoder, settings=self._settings,
+            )
+            return _find(searcher, symbol, project_id=project_id, top_k=top_k)
+
+    def audit_secrets(self, project_id: str | None = None, limit: int = 5000) -> dict:
+        """Audit indexed chunk text for secret material — reports file:line + rule
+        names, NEVER the value. Catches live secrets in legacy (pre-redaction)
+        points and flags files whose secrets are already redaction-masked (rotate
+        them at the source)."""
+        with self._lock:
+            from qdrant_client.models import FieldCondition, Filter, MatchValue
+            from ragtools.secret_scan import scan
+            from ragtools.source_class import GENERATED, classify_source_class
+
+            flt = None
+            if project_id:
+                flt = Filter(must=[FieldCondition(key="project_id", match=MatchValue(value=project_id))])
+
+            _sev = {"high": 3, "medium": 2, "low": 1}
+            findings: list[dict] = []
+            offset = None
+            scanned = 0
+            while scanned < limit:
+                points, offset = self._client.scroll(
+                    collection_name=self._settings.collection_name,
+                    scroll_filter=flt, with_payload=True,
+                    limit=min(256, limit - scanned), offset=offset,
+                )
+                if not points:
+                    break
+                for p in points:
+                    scanned += 1
+                    payload = p.payload or {}
+                    fp = payload.get("file_path", "")
+                    # Don't audit generated mirrors (coverage/build) — they inflate
+                    # findings with copies of source and never hold a real secret.
+                    if classify_source_class(fp) == GENERATED:
+                        continue
+                    text = payload.get("text", "") or ""
+                    hits = scan(text)
+                    redacted = text.count("***REDACTED:")
+                    if hits or redacted:
+                        severity = max((h.get("severity", "low") for h in hits),
+                                       key=lambda s: _sev.get(s, 0), default="low")
+                        findings.append({
+                            "file_path": fp,
+                            "project_id": payload.get("project_id", ""),
+                            "line_start": payload.get("line_start", 0),
+                            "rules": sorted({h["rule"] for h in hits}),
+                            "severity": severity,
+                            "redacted_markers": redacted,
+                        })
+                if offset is None:
+                    break
+            return {"scanned": scanned, "files_with_secrets": len(findings), "findings": findings}
 
     def get_map_points(self, force_recompute: bool = False) -> list[dict]:
         """Get 2D map coordinates for all indexed files. Uses cache when valid. Thread-safe."""
@@ -730,7 +803,6 @@ class QdrantOwner:
             self._settings.projects,
             global_ignore_patterns=self._settings.ignore_patterns,
             use_ragignore=self._settings.use_ragignore_files,
-            include_code=getattr(self._settings, "index_source_code", False),
             secret_allowlist=self._settings.secret_allowlist,
         )
 

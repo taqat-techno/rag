@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Owner** | TBD (proposed: DX lead) |
-| **Last validated against version** | 2.5.1 |
+| **Last validated against version** | 2.5.2 |
 | **Last reviewed** | 2026-04-19 |
 | **Status** | Active |
 
@@ -50,10 +50,10 @@ The taqat-techno marketplace currently ships **7 plugins**. The one directly rel
 | Attribute | Value |
 |---|---|
 | Plugin path | [`rag-plugin/`](https://github.com/taqat-techno/plugins/tree/main/rag-plugin) |
-| Manifest version | `v0.6.0` |
+| Manifest version | `v0.7.0` |
 | Role | Operational console for ragtools — install, configure, diagnose, repair, upgrade. Never re-implements search. |
-| Commands | `/rag-doctor`, `/rag-setup`, `/rag-projects`, `/rag-reset`, `/rag-config`, `/rag-sync-docs` (maintainer) |
-| Skills | `ragtools-ops` (operator), `ragtools-release` (maintainer) |
+| Commands | `/rag-doctor`, `/rag-setup`, `/rag-projects`, `/rag-reset`, `/rag-config`, `/rag:md-rag-enhance` (v0.7.0+), `/rag-sync-docs` (maintainer) |
+| Skills | `ragtools-ops` (operator), `markdown-authoring` (v0.7.0+ — auto-activates on `.md` creation, enforces [Markdown for RAG](Standards-and-Governance-Markdown-for-RAG)), `ragtools-release` (maintainer) |
 | Agents | `rag-log-scanner` (Haiku-tier JSON-returning log pattern matcher) |
 | Hooks | `lock_conflict_check.py` (PreToolUse Bash guardrail — warns before commands that fight the Qdrant single-process lock); `UserPromptSubmit` retrieval-reminder hook |
 | Rules installed | `claude-md-retrieval-rule.md` → inserted into `~/.claude/CLAUDE.md` during `/rag-setup` |
@@ -64,6 +64,7 @@ The taqat-techno marketplace currently ships **7 plugins**. The one directly rel
 - **Never open the Qdrant file lock directly.** The service is the sole owner. Plugins interact with ragtools via the HTTP API, the MCP surface, or `rag <subcommand>` shell-outs.
 - **Never CWD-relative config writes.** All project writes go through `POST /api/projects`; config edits go through the server so `get_config_write_path()` is the only write target. (See Decision 2 and failure F-001 in the `rag-plugin` rules.)
 - **State-aware commands.** Every command probes install state (not-installed / packaged-Win / packaged-mac / dev / DOWN / UP-but-old / UP-and-current) and branches intelligently. The shared contract is in `rag-plugin/rules/state-detection.md`.
+- **Auto-improve content quality at source (v0.7.0+).** The `markdown-authoring` skill auto-activates whenever Claude is asked to create a `.md` file and enforces the 8 hard rules from [Markdown for RAG](Standards-and-Governance-Markdown-for-RAG). The `/rag:md-rag-enhance` command fixes safe issues in existing Markdown (bold-as-heading → real `##`, blank-line hygiene) and reports judgment-call issues (vague headings, oversized sections, code without prose intro, etc.) without touching code-fence interiors, commands, URLs, or numbers.
 
 ## Preconditions
 
@@ -214,5 +215,6 @@ The plugin is considered successfully added when:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-04-19 | 2.5.2 | Bumped `rag-plugin` reference to v0.7.0. Added `markdown-authoring` skill and `/rag:md-rag-enhance` command to the capability table, and a new "auto-improve content at source" convention for plugin authors. |
 | 2026-04-19 | 2.5.1 | Rewritten from a stub. Plugin system is now active — documents the Claude Code plugin + marketplace model, with `rag-plugin` v0.6.0 as the reference implementation. Resolves Q-5. |
 | 2026-04-18 | 2.4.2 | Initial stub; plugin system "not implemented" (blocked on Q-5). |

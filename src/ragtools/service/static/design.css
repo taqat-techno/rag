@@ -427,6 +427,24 @@ label {
   font-size: 12.5px;
 }
 
+/* Compact icon-only action buttons (Projects table actions). The visible glyph
+   is an inline SVG; the accessible name comes from the title + aria-label on the
+   button. Combine with .btn-secondary / .btn-danger for color. */
+.btn-icon {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+}
+.btn-icon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+.btn-icon-group {
+  display: inline-flex;
+  gap: 6px;
+}
+
 /* --- Button processing states --- */
 
 .btn[disabled] {

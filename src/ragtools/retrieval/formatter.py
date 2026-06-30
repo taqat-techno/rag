@@ -7,6 +7,22 @@ from ragtools.models import SearchResult
 _VERSION_SUFFIX_RE = re.compile(r"_v\d+")
 
 
+def _loc(r: SearchResult) -> str:
+    """Source path with a 1-based line span suffix (when known) for jump-to-source."""
+    src = f"{r.project_id}/{r.file_path}" if r.project_id else r.file_path
+    start = getattr(r, "line_start", 0) or 0
+    end = getattr(r, "line_end", 0) or 0
+    if start:
+        return f"{src}:L{start}-{end}" if end and end != start else f"{src}:L{start}"
+    return src
+
+
+def _class_tag(r: SearchResult) -> str:
+    """Short tag for non-owned content (vendor/generated) so the agent can discount it."""
+    sc = getattr(r, "source_class", "owned") or "owned"
+    return f" [{sc}]" if sc != "owned" else ""
+
+
 def format_context(results: list[SearchResult], query: str) -> str:
     """Format search results into a full context block for the admin UI.
 
@@ -37,7 +53,7 @@ def format_context(results: list[SearchResult], query: str) -> str:
 
     for i, r in enumerate(results, 1):
         source = (
-            f"[{i}] Source: {r.project_id}/{r.file_path}"
+            f"[{i}] Source: {_loc(r)}{_class_tag(r)}"
             f" | Section: {' > '.join(r.headings) if r.headings else 'N/A'}"
             f" | Score: {r.score:.3f} ({r.confidence})"
         )
@@ -76,14 +92,59 @@ def format_context_compact(results: list[SearchResult], query: str) -> str:
         lines.append("")
 
     for i, r in enumerate(results, 1):
-        # Compact header: [N] project/file.md > Heading (score):
+        # Compact header: [N] project/file.md:Lstart-end > Heading (score):
         heading = r.headings[-1] if r.headings else ""
-        source = f"{r.project_id}/{r.file_path}" if r.project_id else r.file_path
-        lines.append(f"[{i}] {source} > {heading} ({r.score:.2f}):")
+        lines.append(f"[{i}] {_loc(r)}{_class_tag(r)} > {heading} ({r.score:.2f}):")
         lines.append(_truncate(r.text))
         lines.append("")
 
     return "\n".join(lines).rstrip()
+
+
+def format_definitions(symbol: str, defs: list) -> str:
+    """Format symbol-definition leads (cross-file code graph) for agent output."""
+    if not defs:
+        return (
+            f"[CODE GRAPH] No definition found for '{symbol}'. It may not exist, may "
+            "live in an unindexed file (check the project's Mode/coverage), or be "
+            "defined dynamically. This is NOT proof of absence — confirm with grep/LSP."
+        )
+    lines = [
+        f"[CODE GRAPH] Definition leads for '{symbol}' ({len(defs)} found) — "
+        "discovery, not authority; verify exact definitions with an LSP:"
+    ]
+    for d in defs:
+        loc = f"{d.get('project_id', '')}/{d['file_path']}" if d.get("project_id") else d["file_path"]
+        if d.get("line_start"):
+            loc += f":L{d['line_start']}"
+        if d.get("function_name"):
+            kind = f"def {d['function_name']}"
+        elif d.get("class_name"):
+            kind = f"class {d['class_name']}"
+        else:
+            kind = d.get("signature") or "symbol"
+        lines.append(f"* {loc} — {kind} [{d.get('match', 'mention')}]")
+    return "\n".join(lines)
+
+
+def format_secret_audit(result: dict) -> str:
+    """Format a secret-audit result for agent output — file:line + rule, no values."""
+    findings = result.get("findings", [])
+    scanned = result.get("scanned", 0)
+    if not findings:
+        return f"[SECRET AUDIT] Scanned {scanned} chunks — no secrets detected in the index."
+    lines = [
+        f"[SECRET AUDIT] {len(findings)} file(s) contain (or had) secret material "
+        f"out of {scanned} chunks scanned. Rotate the credential and scrub the source:"
+    ]
+    for f in findings:
+        loc = f"{f.get('project_id', '')}/{f.get('file_path', '')}"
+        if f.get("line_start"):
+            loc += f":L{f['line_start']}"
+        rules = ", ".join(f.get("rules") or []) or "redacted"
+        marker = f" (+{f['redacted_markers']} already masked)" if f.get("redacted_markers") else ""
+        lines.append(f"* {loc} — {rules}{marker}")
+    return "\n".join(lines)
 
 
 def format_context_brief(results: list[SearchResult], query: str) -> str:
@@ -103,7 +164,8 @@ def format_context_brief(results: list[SearchResult], query: str) -> str:
     return "\n".join(lines)
 
 
-def format_dev_context(results: list[SearchResult], query: str, triggers: list[str] | None = None) -> str:
+def format_dev_context(results: list[SearchResult], query: str, triggers: list[str] | None = None,
+                       warnings: list[str] | None = None, code_indexed: "bool | None" = None) -> str:
     """Format retrieved project context for a development/feature request.
 
     Produces the required "Project Context Mode" response scaffold:
@@ -116,16 +178,42 @@ def format_dev_context(results: list[SearchResult], query: str, triggers: list[s
     The "Relevant Files" and "Existing Implementation" sections are grounded in
     the retrieved chunks so the generated answer references actual repository
     files. The latter two sections are scaffolds the assistant completes.
+
+    ``warnings`` (e.g. "this project is in Docs mode; source code is not indexed")
+    are surfaced at the very top so the agent reads them before the results.
     """
     trigger_note = f" (triggers: {', '.join(triggers)})" if triggers else ""
+    warn_block = ""
+    if warnings:
+        warn_block = "\n".join(f"[PROJECT CONTEXT — WARNING] {w}" for w in warnings) + "\n\n"
 
     if not results:
-        return (
-            f"[PROJECT CONTEXT — no matches]{trigger_note}\n"
-            f"No indexed project files matched: '{query}'. "
-            "State that no project-specific implementation was found, then proceed "
-            "with general guidance clearly labeled as not grounded in the repository."
-        )
+        # Separate "not indexed" (can't answer — wrong Mode) from "not found"
+        # (honest absence — code IS indexed) so the agent doesn't read an empty
+        # result as "the feature does not exist".
+        if code_indexed is False:
+            body = (
+                f"[PROJECT CONTEXT — code not indexed]{trigger_note}\n"
+                "This project indexes documentation only (Docs mode); its source "
+                "code is NOT indexed. An empty result here is NOT evidence the "
+                f"feature is absent for: '{query}'. Switch the project to Code or "
+                "General mode and re-index to search code, or use grep/LSP now."
+            )
+        elif code_indexed is True:
+            body = (
+                f"[PROJECT CONTEXT — not found]{trigger_note}\n"
+                f"Source code IS indexed for this project, and no code matched: "
+                f"'{query}'. Treat this as a genuine not-found — the symbol/feature "
+                "is likely absent (confirm with grep/LSP before concluding)."
+            )
+        else:
+            body = (
+                f"[PROJECT CONTEXT — no matches]{trigger_note}\n"
+                f"No indexed project files matched: '{query}'. "
+                "State that no project-specific implementation was found, then proceed "
+                "with general guidance clearly labeled as not grounded in the repository."
+            )
+        return warn_block + body
 
     # Unique files in priority-ranked order.
     files: list[str] = []
@@ -174,9 +262,8 @@ def format_dev_context(results: list[SearchResult], query: str, triggers: list[s
     lines.append("")
     lines.append("--- Retrieved chunks ---")
     for i, r in enumerate(results, 1):
-        source = f"{r.project_id}/{r.file_path}" if r.project_id else r.file_path
         sym = f" | {' > '.join(r.headings)}" if r.headings else ""
-        lines.append(f"[{i}] {source}{sym} ({r.chunk_type}, {_score_label(r)}):")
+        lines.append(f"[{i}] {_loc(r)}{_class_tag(r)}{sym} ({r.chunk_type}, {_score_label(r)}):")
         lines.append(_truncate(r.text, 800))
         lines.append("")
 
@@ -186,7 +273,7 @@ def format_dev_context(results: list[SearchResult], query: str, triggers: list[s
     lines.append("Sample Code:")
     lines.append("* (Assistant: provide an implementation example consistent with the existing patterns.)")
 
-    return "\n".join(lines).rstrip()
+    return warn_block + "\n".join(lines).rstrip()
 
 
 def _score_label(r: SearchResult) -> str:

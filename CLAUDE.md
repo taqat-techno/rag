@@ -132,6 +132,8 @@ at startup.
 
 - **search_knowledge_base(query, project?, top_k?)** — Search indexed content (docs + code)
 - **search_project_context(query, project?, top_k?)** — Codebase-first layered retrieval for development requests (Project Context Mode)
+- **find_definition(symbol, project?, top_k?)** — Cross-file code-graph v1: likely definition sites for a symbol (file:line leads). Semantic discovery, LSP-complementary — not authoritative.
+- **secret_audit(project?)** — Audit indexed content for secret material (file:line + rule names, never values). Requires the service.
 - **list_projects()** — Discover available project IDs
 - **index_status()** — Check if the knowledge base is ready
 
@@ -237,7 +239,7 @@ All settings in `config.py` via Pydantic Settings. Override with env vars prefix
 | `RAG_SCORE_THRESHOLD` | `0.3` | Minimum similarity score |
 | `RAG_CONTENT_ROOT` | `.` | Root for project discovery |
 | `RAG_STATE_DB` | `data/index_state.db` | SQLite state path |
-| `RAG_INDEX_SOURCE_CODE` | `false` | Opt-in: also index source code + config/data, not just docs |
+| `RAG_INDEX_SOURCE_CODE` | `false` | Global default: also index source code + config/data, not just docs. Overridable **per-project** ("dev mode") via the admin panel, `rag project dev-mode <id> on/off/inherit`, or the `set_project_dev_mode` MCP tool — stored as `ProjectConfig.index_source_code` (None=inherit / True=code / False=docs). |
 | `RAG_SECRET_ALLOWLIST` | `[]` | Globs to re-include specific secret-bearing files (default: none) |
 
 ## Upgrade notes (2.6)

@@ -70,6 +70,7 @@ _EXTENSION_MAP: dict[str, tuple[str, str]] = {
     ".cc": ("cpp", CODE),
     ".cxx": ("cpp", CODE),
     ".hpp": ("cpp", CODE),
+    ".prisma": ("prisma", CODE),  # Prisma schema (model/enum declarations)
     # --- Structured config / data ---
     ".json": ("json", CONFIG),
     ".yaml": ("yaml", CONFIG),

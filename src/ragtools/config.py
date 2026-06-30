@@ -19,15 +19,36 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Tuple, Type
+from typing import Any, Literal, Tuple, Type
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 logger = logging.getLogger("ragtools.config")
 
 
 # --- Project Configuration ---
+
+# Canonical project indexing modes (Project Mode, distinct from Project Status).
+PROJECT_MODES = ("docs", "code", "general")
+ProjectMode = Literal["docs", "code", "general"]
+
+
+def mode_indexes(mode: str, is_documentation: bool) -> bool:
+    """Whether a project in `mode` should index a file, given whether that file
+    is documentation (Markdown / text / README) vs source/config/code.
+
+      docs    -> documentation only
+      code    -> source / config / code only (NOT docs-only Markdown)
+      general -> both
+
+    Secret exclusion is a SEPARATE, always-on layer and is not decided here.
+    """
+    if mode == "docs":
+        return is_documentation
+    if mode == "code":
+        return not is_documentation
+    return True  # general
 
 
 class ProjectConfig(BaseModel):
@@ -36,12 +57,43 @@ class ProjectConfig(BaseModel):
     id: str                                          # unique identifier, used in storage keys
     name: str = ""                                   # display name (defaults to id)
     path: str                                        # absolute path to project folder
-    enabled: bool = True                             # skip if False
+    enabled: bool = True                             # Project Status: skip if False
     ignore_patterns: list[str] = Field(default_factory=list)  # per-project ignore patterns
+    # External-dependency / co-located framework roots (gitignore-style globs,
+    # relative to the project path) — classified as `source_class=dependency`
+    # and excluded from indexing by default (owned-only). Generic: a user or a
+    # profile declares these (e.g. a vendored framework core). Git submodules
+    # are detected automatically and need not be listed.
+    dependency_paths: list[str] = Field(default_factory=list)
+    # Project Mode — what this project indexes (secret-bearing files always excluded):
+    #   "docs"    = documentation / text / Markdown only (default)
+    #   "code"    = source / config / code only (no docs-only Markdown)
+    #   "general" = both docs and code/config
+    mode: ProjectMode = "docs"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_index_source_code(cls, data):
+        """Back-compat: derive `mode` from the legacy per-project
+        `index_source_code` when `mode` is absent, then drop the legacy key.
+          index_source_code True             -> "general" (old True indexed code AND docs)
+          index_source_code False/None/absent -> "docs"
+        """
+        if not isinstance(data, dict):
+            return data
+        if "index_source_code" in data:
+            data = dict(data)
+            legacy = data.pop("index_source_code")
+            data.setdefault("mode", "general" if legacy is True else "docs")
+        return data
 
     def model_post_init(self, __context: Any) -> None:
         if not self.name:
             self.name = self.id
+
+    def indexes(self, is_documentation: bool) -> bool:
+        """Whether this project indexes a file given whether it is documentation."""
+        return mode_indexes(self.mode, is_documentation)
 
 
 # --- Path Resolution ---
@@ -304,6 +356,7 @@ class Settings(BaseSettings):
         "run_index":                True,
         "reindex_project":          True,
         "add_project":              True,
+        "set_project_mode":         True,
         "add_project_ignore_rule":  True,
         "remove_project_ignore_rule": True,
         # Debugging / diagnostics — disabled by default (opt-in for operators)

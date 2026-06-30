@@ -23,6 +23,25 @@ from ragtools.service.owner import QdrantOwner
 logger = logging.getLogger("ragtools.watcher")
 
 
+def _deepest_matching_root(resolved: Path, roots) -> Path | None:
+    """Return the DEEPEST (longest-path) root that is an ancestor of ``resolved``,
+    or None if none match.
+
+    Deepest-match so a code-mode child project nested inside a docs-only parent
+    is attributed to the CHILD — mirroring the scanner's child-path ownership.
+    A first-match would filter the child's code edits with the parent's
+    docs-only decision and silently drop them (scan-vs-watch divergence)."""
+    best = None
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        if best is None or len(str(root)) > len(str(best)):
+            best = root
+    return best
+
+
 class WatcherThread(threading.Thread):
     """File watcher that runs as a daemon thread.
 
@@ -171,6 +190,7 @@ class WatcherThread(threading.Thread):
         # Build per-project ignore rules
         project_rules: dict[Path, IgnoreRules] = {}
         project_map: dict[Path, str] = {}  # resolved_path → project_id
+        project_include: dict[Path, str] = {}  # resolved_path → project Mode (docs/code/general)
         watch_paths = []
 
         for project in enabled:
@@ -189,6 +209,7 @@ class WatcherThread(threading.Thread):
                 secret_allowlist=self._settings.secret_allowlist,
             )
             project_map[resolved] = project.id
+            project_include[resolved] = project.mode
             watch_paths.append(project.path)
 
         if not watch_paths:
@@ -198,18 +219,15 @@ class WatcherThread(threading.Thread):
 
         from ragtools.watcher.observer import is_indexable_change
 
-        include_code = self._settings.index_source_code
-
         def _accept(path: str) -> bool:
-            # Honor index_source_code + secret exclusion + per-project ignore rules.
+            # Honor per-project Mode + secret exclusion + ignore rules.
+            # Deepest-match so a nested child project's mode wins over its parent's
+            # (consistent with the scanner's child-path ownership).
             resolved = Path(path).resolve()
-            for root, rules in project_rules.items():
-                try:
-                    resolved.relative_to(root)
-                    return is_indexable_change(path, rules, root, include_code)
-                except ValueError:
-                    continue
-            return False
+            root = _deepest_matching_root(resolved, project_rules.keys())
+            if root is None:
+                return False
+            return is_indexable_change(path, project_rules[root], root, project_include[root])
 
         def md_filter(change: Change, path: str) -> bool:
             if Path(path).name == RAGIGNORE_FILENAME:

@@ -38,6 +38,7 @@ class Searcher:
         top_k: int | None = None,
         score_threshold: float | None = None,
         chunk_types: list[str] | None = None,
+        exclude_generated: bool = True,
     ) -> list[SearchResult]:
         """Search for chunks relevant to the query.
 
@@ -90,30 +91,52 @@ class Searcher:
         if must or should:
             query_filter = Filter(must=must or None, should=should or None)
 
+        # Over-fetch when excluding generated artifacts so dropping them still
+        # leaves ``top_k`` real results (coverage/build mirrors otherwise displace
+        # owned source — and can outrank it on code-token queries).
+        fetch_limit = (top_k * 3 + 10) if exclude_generated else top_k
+
         points = self.client.query_points(
             collection_name=self.settings.collection_name,
             query=query_vector.tolist(),
             query_filter=query_filter,
-            limit=top_k,
+            limit=fetch_limit,
             score_threshold=threshold,
             with_payload=True,
         ).points
 
+        if exclude_generated:
+            from ragtools.source_class import GENERATED, classify_source_class
+            points = [
+                p for p in points
+                if classify_source_class((p.payload or {}).get("file_path", "")) != GENERATED
+            ][:top_k]
+        else:
+            points = points[:top_k]
+
+        from ragtools.secret_scan import redact_text
+
         results = []
         for point in points:
             payload = point.payload
+            # Serve-time secret redaction (defense in depth): masks secret values
+            # even in points indexed before content-redaction shipped.
+            served_text = redact_text(payload.get("text", "") or "")
             results.append(
                 SearchResult(
                     chunk_id=str(point.id),
                     score=point.score,
-                    text=payload.get("text", ""),
-                    raw_text=payload.get("text", ""),
+                    text=served_text,
+                    raw_text=served_text,
                     file_path=payload.get("file_path", ""),
                     project_id=payload.get("project_id", ""),
                     headings=payload.get("headings", []),
                     confidence=_score_to_confidence(point.score),
+                    line_start=payload.get("line_start", 0) or 0,
+                    line_end=payload.get("line_end", 0) or 0,
                     language=payload.get("language", "") or "",
                     chunk_type=payload.get("chunk_type", "documentation") or "documentation",
+                    source_class=payload.get("source_class", "owned") or "owned",
                     class_name=payload.get("class_name"),
                     function_name=payload.get("function_name"),
                     symbols=payload.get("symbols", []) or [],

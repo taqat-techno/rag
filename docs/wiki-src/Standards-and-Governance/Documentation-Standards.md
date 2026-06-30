@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | **Owner** | TBD (proposed: docs lead) |
-| **Last validated against version** | 2.4.2 |
-| **Last reviewed** | 2026-04-18 |
+| **Last validated against version** | 2.5.2 |
+| **Last reviewed** | 2026-04-19 |
 | **Status** | Active (replaces the Phase 1 stub) |
 
 ## Source of truth
@@ -129,6 +129,15 @@ After re-validation, bump the `Last validated against version` in the page's met
 - Do not embed screenshots. Text + Mermaid is the house style.
 - Do not add emojis.
 
+## Writing for the RAG chunker
+
+Every page in this wiki is also content that gets chunked, embedded, and retrieved by the ragtools MCP server. How you write matters for search quality.
+
+- Follow [Markdown for RAG](Standards-and-Governance-Markdown-for-RAG) — 8 hard rules derived from `src/ragtools/chunking/markdown.py`.
+- When authoring via Claude Code, the `rag-plugin` v0.7.0+ `markdown-authoring` skill auto-activates and enforces the standard.
+- For existing files, run `/rag:md-rag-enhance` to auto-fix the 100 %-safe issues (bold-as-heading, blank-line hygiene) and report the rest.
+- One-line heuristic: **one idea per heading, 150–250 words per leaf section, keyword-rich heading names, no knowledge before the first `#`**.
+
 ## PR process for wiki-src edits
 
 1. Branch off `main`.
@@ -140,6 +149,7 @@ After re-validation, bump the `Last validated against version` in the page's met
 
 ## Related
 
+- [Markdown for RAG](Standards-and-Governance-Markdown-for-RAG) — how to write wiki pages that chunk and retrieve well.
 - [Wiki Publishing Process](Development-SOPs-Documentation-Wiki-Publishing-Process).
 - [Templates](Templates-SOP-Template).
 - [Open Questions](Development-SOPs-Documentation-Open-Questions).

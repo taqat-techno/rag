@@ -382,6 +382,18 @@ def _classify_brace_unit(text: str, language: str) -> CodeUnit:
         symbols = _scan_symbols(text)
         return CodeUnit(text=text, kind="imports", name="imports", symbols=symbols)
 
+    # Prisma schema declarations (model / enum / type / view) — keyword isn't
+    # `class`, so handle it explicitly (gated on language to avoid false hits).
+    if language == "prisma":
+        pm = _PRISMA_RE.search(first)
+        if pm:
+            keyword, name = pm.group(1), pm.group(2)
+            return CodeUnit(
+                text=text, kind=keyword, name=name,
+                class_name=name if keyword in ("model", "view") else None,
+                symbols=[name], signature=first,
+            )
+
     m = _CLASS_RE.search(first)
     if m:
         keyword, name = m.group(1), m.group(2)
@@ -415,11 +427,17 @@ def _first_code_line(text: str) -> str:
     return text.strip().split("\n")[0] if text.strip() else ""
 
 
+_PRISMA_RE = re.compile(r"\b(model|enum|type|view)\s+([A-Za-z_]\w*)")
+
+
 def _scan_symbols(text: str) -> list[str]:
     symbols: list[str] = []
     for m in _CLASS_RE.finditer(text):
         symbols.append(m.group(2))
-    for pat in _FUNC_PATTERNS[:3]:
+    # Patterns [0..3]: function / go-func / const-arrow / modifier-method. The
+    # modifier-method pattern ([3]) is what surfaces class methods (e.g. an
+    # `async sendSMS(...)`) as symbols so find_definition can resolve them.
+    for pat in _FUNC_PATTERNS[:4]:
         for m in pat.finditer(text):
             symbols.append(m.group(1))
     # de-dup, preserve order
@@ -695,7 +713,7 @@ def _sql_extractor(source: str, language: str) -> list[CodeUnit]:
 register_language("python", _python_extractor)
 for _brace_lang in (
     "javascript", "typescript", "java", "go", "csharp", "php", "css", "scss",
-    "rust", "kotlin", "scala", "swift", "c", "cpp",
+    "rust", "kotlin", "scala", "swift", "c", "cpp", "prisma",
 ):
     register_language(_brace_lang, _extract_brace_units)
 register_language("sql", _sql_extractor)

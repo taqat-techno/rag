@@ -57,6 +57,14 @@ BUILTIN_PATTERNS = [
     "target/",
     "bin/",
     "obj/",
+    "coverage/",        # test-coverage output (lcov/istanbul HTML mirrors of source)
+    ".nyc_output/",
+    # Editor / VCS / file-sync conflict & patch artifacts — never authoritative,
+    # frequently duplicate a real file's content under a junk name.
+    "*.orig",          # merge leftovers
+    "*.rej",           # rejected patch hunks
+    "*.sync-conflict-*",  # Syncthing conflict copies
+    r"*\[conflicted\]*",  # OneDrive / generic "[conflicted]" copies
     # Files already read by Claude directly (no need to index)
     "CLAUDE.md",
 ]

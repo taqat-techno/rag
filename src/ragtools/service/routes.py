@@ -5,7 +5,7 @@ import os
 import re
 import signal
 import threading
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -180,6 +180,27 @@ def dev_search_endpoint(
     )
 
 
+@router.get("/api/definitions")
+def definitions_endpoint(
+    symbol: str = Query(..., description="Symbol to locate the definition of"),
+    project: Optional[str] = Query(None, description="Filter by a single project"),
+    top_k: int = Query(25, ge=1, le=100),
+):
+    """Cross-file code-graph v1: likely definition sites for a symbol (file:line)."""
+    owner = get_owner()
+    defs = owner.find_definitions(symbol, project_id=project, top_k=top_k)
+    return {"symbol": symbol, "project": project, "count": len(defs), "definitions": defs}
+
+
+@router.get("/api/secret-audit")
+def secret_audit_endpoint(
+    project: Optional[str] = Query(None, description="Filter by a single project"),
+    limit: int = Query(5000, ge=1, le=50000),
+):
+    """Audit indexed content for secret material (file:line + rule, never values)."""
+    return get_owner().audit_secrets(project_id=project, limit=limit)
+
+
 # --- Indexing ---
 
 @router.post("/api/index")
@@ -234,6 +255,8 @@ class ProjectCreateRequest(BaseModel):
     path: str
     enabled: bool = True
     ignore_patterns: list[str] = []
+    # Project Mode: docs (default) / code / general.
+    mode: Optional[Literal["docs", "code", "general"]] = None
 
 
 class ProjectUpdateRequest(BaseModel):
@@ -241,6 +264,8 @@ class ProjectUpdateRequest(BaseModel):
     path: Optional[str] = None
     enabled: Optional[bool] = None
     ignore_patterns: Optional[list[str]] = None
+    # None = field not provided (leave unchanged). docs/code/general set the Mode.
+    mode: Optional[Literal["docs", "code", "general"]] = None
 
 
 def _validate_project_id(pid: str) -> str | None:
@@ -272,6 +297,7 @@ def projects_configured():
         {
             "id": p.id, "name": p.name, "path": p.path,
             "enabled": p.enabled, "ignore_patterns": p.ignore_patterns,
+            "mode": p.mode,
             "files": index_data.get(p.id, {}).get("files", 0),
             "chunks": index_data.get(p.id, {}).get("chunks", 0),
         }
@@ -310,6 +336,33 @@ def _schedule_auto_index(project_id: str):
     timer.start()
 
 
+def _schedule_reindex(project_id: str):
+    """Background DELETE-AWARE reindex — used when a project's Mode changes.
+    Unlike _schedule_auto_index (run_full_index, which is upsert-only), this calls
+    reindex_project (delete_project_data + run_full_index) so narrowing the Mode
+    (e.g. general/code -> docs) PURGES the now-excluded chunks and widening it
+    backfills the newly-included files.
+    """
+    import threading
+    from ragtools.service.activity import log_activity
+
+    def _run():
+        try:
+            log_activity("info", "indexer", f"Reindexing {project_id} (mode change)...")
+            stats = get_owner().reindex_project(project_id)
+            files = stats.get("files_indexed", stats.get("files", 0))
+            chunks = stats.get("chunks_indexed", stats.get("chunks", 0))
+            log_activity("success", "indexer",
+                f"Reindexed {project_id}: {files} files, {chunks} chunks "
+                f"({stats.get('deleted_files', 0)} purged)")
+        except Exception as e:
+            log_activity("error", "indexer", f"Reindex failed for {project_id}: {e}")
+
+    timer = threading.Timer(3.0, _run)
+    timer.daemon = False
+    timer.start()
+
+
 @router.post("/api/projects")
 def project_create(req: ProjectCreateRequest):
     """Add a new project."""
@@ -339,6 +392,7 @@ def project_create(req: ProjectCreateRequest):
     new_project = ProjectConfig(
         id=req.id, name=req.name or req.id, path=path,
         enabled=req.enabled, ignore_patterns=req.ignore_patterns,
+        mode=req.mode or "docs",
     )
     updated = list(settings.projects) + [new_project]
 
@@ -376,6 +430,12 @@ def project_update(project_id: str, req: ProjectUpdateRequest):
         project.enabled = req.enabled
     if req.ignore_patterns is not None:
         project.ignore_patterns = req.ignore_patterns
+    # Project Mode: capture the value before the change so we reindex only when
+    # it actually flips (G1: delete-aware reindex below).
+    old_mode = project.mode
+    if req.mode is not None:
+        project.mode = req.mode
+    new_mode = project.mode
 
     from ragtools.service.pages import _save_projects_to_toml
     _save_projects_to_toml(list(settings.projects))
@@ -384,6 +444,8 @@ def project_update(project_id: str, req: ProjectUpdateRequest):
     from ragtools.service.activity import log_activity
     log_activity("info", "config", f"Project updated: {project_id}")
     _restart_watcher_if_running()
+    if new_mode != old_mode:
+        _schedule_reindex(project_id)
     return {"status": "updated", "project": {"id": project.id, "name": project.name, "path": project.path}}
 
 
@@ -427,6 +489,43 @@ def project_toggle(project_id: str):
     log_activity("info", "config", f"Project {project_id} {'enabled' if project.enabled else 'disabled'}")
     _restart_watcher_if_running()
     return {"status": "toggled", "project_id": project_id, "enabled": project.enabled}
+
+
+class ModeRequest(BaseModel):
+    mode: Literal["docs", "code", "general"]
+
+
+@router.post("/api/projects/{project_id}/mode")
+def project_set_mode(project_id: str, req: ModeRequest):
+    """Set a project's Mode (docs / code / general) and reindex if it changed.
+
+    A single-purpose endpoint (vs PUT /api/projects/{id}) so the CLI/MCP can set
+    the Mode without risking a stale name/path overwrite. Reindex is delete-aware
+    (G1) so narrowing the Mode purges the project's now-excluded chunks.
+    """
+    settings = get_settings()
+    project = next((p for p in settings.projects if p.id == project_id), None)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    old_mode = project.mode
+    project.mode = req.mode
+    new_mode = project.mode
+
+    from ragtools.service.pages import _save_projects_to_toml
+    _save_projects_to_toml(list(settings.projects))
+    get_owner().update_projects(list(settings.projects))
+
+    from ragtools.service.activity import log_activity
+    log_activity("info", "config", f"Project {project_id} mode -> {req.mode}")
+    _restart_watcher_if_running()
+    if new_mode != old_mode:
+        _schedule_reindex(project_id)
+    return {
+        "status": "mode_set", "project_id": project_id,
+        "mode": new_mode,
+        "reindex_scheduled": new_mode != old_mode,
+    }
 
 
 # --- Config ---
@@ -952,6 +1051,51 @@ def _resolve_project(project_id: str):
     return next((p for p in settings.projects if p.id == project_id), None)
 
 
+def _file_type_breakdown(rows) -> dict[str, int]:
+    """File-count breakdown by chunk_type (documentation / code / config / other)
+    for a project's indexed roster. Cheap — classify_file is extension/name-based
+    (no file IO). Lets the agent see at a glance whether a project holds docs,
+    code, or both, which lines up with its Mode."""
+    from ragtools.chunking.languages import classify_file
+    counts: dict[str, int] = {}
+    for r in rows:
+        fc = classify_file(r["file_path"])
+        bucket = fc.chunk_type if fc is not None else "other"
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return counts
+
+
+def _source_class_breakdown(rows) -> dict[str, int]:
+    """File-count breakdown by source_class (owned / generated / dependency ...)
+    for a project's indexed roster. Cheap — path-based, no file IO. Lets the agent
+    see how much of the index is project-owned vs vendored/generated noise."""
+    from ragtools.source_class import classify_source_class
+    counts: dict[str, int] = {}
+    for r in rows:
+        bucket = classify_source_class(r["file_path"])
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return counts
+
+
+def _is_stale(last_indexed, stale_hours: int, now=None) -> bool:
+    """True if ``last_indexed`` is older than ``stale_hours``. Never-indexed
+    (``None``) is not 'stale'. Accepts an ISO string or datetime."""
+    if not last_indexed:
+        return False
+    from datetime import datetime
+    now = now or datetime.now()
+    if isinstance(last_indexed, str):
+        try:
+            dt = datetime.fromisoformat(last_indexed)
+        except ValueError:
+            return False
+    elif isinstance(last_indexed, datetime):
+        dt = last_indexed
+    else:
+        return False
+    return (now - dt).total_seconds() > stale_hours * 3600
+
+
 @router.get("/api/projects/{project_id}/status")
 def project_status_endpoint(project_id: str):
     """Single-project state snapshot — the agent's 'orient me' call."""
@@ -965,13 +1109,26 @@ def project_status_endpoint(project_id: str):
 
     settings = get_settings()
     summary = {"files": 0, "chunks": 0, "last_indexed": None}
+    file_types: dict[str, int] = {}
+    source_class_breakdown: dict[str, int] = {}
     state_path = _P(settings.state_db)
     if state_path.exists():
         state = IndexState(settings.state_db)
         try:
             summary = state.get_project_summary(project_id)
+            roster = state.get_all_for_project(project_id)
+            file_types = _file_type_breakdown(roster)
+            source_class_breakdown = _source_class_breakdown(roster)
         finally:
             state.close()
+
+    # Mode note: in Docs mode an empty code result is "not indexed", NOT "absent".
+    mode_note = ""
+    if project.mode == "docs":
+        mode_note = (
+            "Docs mode — source code is not indexed for this project; a code "
+            "search returning nothing is not evidence the feature is absent."
+        )
 
     path = _P(project.path)
     return {
@@ -980,9 +1137,14 @@ def project_status_endpoint(project_id: str):
         "path":                 str(path),
         "path_exists":          path.is_dir(),
         "enabled":              project.enabled,
+        "mode":                 project.mode,
+        "mode_note":            mode_note,
         "files":                summary["files"],
         "chunks":               summary["chunks"],
+        "file_types":           file_types,
+        "source_class_breakdown": source_class_breakdown,
         "last_indexed":         summary["last_indexed"],
+        "stale":                _is_stale(summary["last_indexed"], settings.stale_index_hours),
         "ignore_patterns_count": len(project.ignore_patterns or []),
     }
 
