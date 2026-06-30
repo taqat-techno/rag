@@ -1219,7 +1219,7 @@ def test_settings_default_mcp_tools_covers_all_optional_tools():
         "project_status", "project_summary", "list_project_files",
         "get_project_ignore_rules", "preview_ignore_effect",
         # project-scoped writes
-        "run_index", "reindex_project", "add_project", "set_project_dev_mode",
+        "run_index", "reindex_project", "add_project", "set_project_mode",
         "add_project_ignore_rule", "remove_project_ignore_rule",
     }
     assert set(s.mcp_tools.keys()) == expected

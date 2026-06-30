@@ -13,7 +13,7 @@ _Nothing yet — `main` is at 2.7.0._
 
 ---
 
-## [2.7.0] — 2026-06-29 — Per-project "dev mode" (per-project source-code indexing)
+## [2.7.0] — 2026-06-30 — Per-project "dev mode" + retrieval & security hardening
 
 Source-code indexing is now a **per-project** toggle, not just the global `index_source_code`. Mark a project as a code/dev project (index its source code & config) or docs-only, independent of the global default — settable when adding a project, editable on existing ones, and via the CLI + an MCP tool. Secret-bearing files are always excluded regardless.
 
@@ -33,7 +33,26 @@ Source-code indexing is now a **per-project** toggle, not just the global `index
 - The project-list overlay spinner no longer gets stuck `active` and block the inline edit-form Save — an `outerHTML` swap (Edit button → edit form) detached the indicator's element so it was never cleared; the handler now clears all active section overlays after any htmx request.
 
 ### Tests
-- +25 tests in `tests/test_dev_mode.py` across all layers (data model, persistence, pipeline, API/reindex, UI, CLI, MCP). Full suite **765 passed, 1 skipped**. Validated end-to-end against this repo's own code: index → search → toggle-off → purge.
+- +25 tests in `tests/test_dev_mode.py` across all layers (data model, persistence, pipeline, API/reindex, UI, CLI, MCP). Validated end-to-end against this repo's own code: index → search → toggle-off → purge.
+
+### Added — retrieval & security hardening
+
+- **Content-level secret redaction** (`secret_scan.py`). File-name exclusion is insufficient — secrets get pasted into READMEs/configs/source. The secret **value** is now masked at **index time** (never reaches the embedding or stored payload) and at **serve time** (masks values in points indexed before this shipped), while the **key name** is preserved so "which key does X use?" still answers. Provider patterns (Google/AWS/GitHub/Slack/Stripe/JWT/PEM) plus contextual `key = value` and labeled `Default:` / `API Key:` rules, with hex/base64 entropy floors to avoid false positives.
+- **`secret_audit`** MCP tool + `GET /api/secret-audit` — reports `file:line` + rule name for secret material in the index, **never the value**, so you can locate and rotate.
+- **`find_definition`** (`codegraph.py`) — cross-file code-graph v1: a symbol → likely definition sites (`file:line`). MCP tool + `GET /api/definitions`. Generic, LSP-complementary **discovery** (leads, not authority).
+- **Source-class classification** (`source_class.py`) — orthogonal to Mode: tags each chunk **owned** / **vendored** / **generated**. `project_status` returns a `source_class_breakdown`; results carry the class so vendored/generated content can be visibly tagged and down-ranked.
+- **Line anchors** (`chunking/anchors.py`) — every chunk now carries 1-based `line_start`/`line_end`; provenance renders `path:Lstart-end` for jump-to-source.
+- **Chunk hygiene** (`chunking/hygiene.py`) — drops content-free chunks (separators, punctuation-only, near-empty) before embedding.
+- **Code-first dev pipeline signals** — `dev_search` exposes a `code_indexed` flag and emits an explicit **"Docs mode — code not indexed"** notice, so an empty Project-Context result reads as "not indexed", not "feature absent".
+
+### Changed — retrieval
+
+- `SearchResult` and the search payload carry `line_start`/`line_end`, `source_class`, `chunk_type`, and symbol metadata; the formatter shows line spans, source-class tags, and reranks code-first by context priority (source code > APIs > workflows > architecture > docs).
+- `project_status` adds `mode`, `mode_note`, `file_types`, `source_class_breakdown`, and a `stale` flag.
+
+### Tests — hardening
+
+- +11 test modules: `test_secret_scan`, `test_codegraph`, `test_source_class`, `test_chunk_hygiene`, `test_line_anchors`, `test_rerank_quality`, `test_search_metadata`, `test_failsafe_retrieval`, `test_generated_exclusion`, `test_dev_codefirst`, `test_coverage_status`. Full suite **868 passed, 1 skipped**.
 
 ---
 

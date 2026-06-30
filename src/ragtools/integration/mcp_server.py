@@ -250,7 +250,7 @@ def _register_ops_tools() -> None:
         ("run_index",                   run_index),
         ("reindex_project",             reindex_project),
         ("add_project",                 add_project),
-        ("set_project_dev_mode",        set_project_dev_mode),
+        ("set_project_mode",            set_project_mode),
         ("add_project_ignore_rule",     add_project_ignore_rule),
         ("remove_project_ignore_rule", remove_project_ignore_rule),
     ]
@@ -385,6 +385,50 @@ def search_project_context(
     if _mode == "proxy":
         return _proxy_dev_search(query.strip(), project, projects, top_k)
     return _direct_dev_search(query.strip(), project, projects, top_k)
+
+
+@mcp_app.tool()
+def find_definition(symbol: str, project: str | None = None, top_k: int = 25) -> str:
+    """Find where a symbol is likely DEFINED — file:line leads (cross-file code graph).
+
+    USE WHEN the user asks "where is X defined / where is the X model/class/function",
+    or you need to jump to a definition before editing it.
+
+    This is SEMANTIC DISCOVERY, NOT authority: it matches the symbol against the
+    code metadata already indexed (symbols / exports / function / class names) and
+    returns file:line leads. For exact definitions, references, or rename safety,
+    use the editor's language server (LSP) and read the cited file.
+
+    Returns leads ordered definition-first. An empty result is NOT proof the symbol
+    doesn't exist — it may live in an unindexed file (check the project's Mode via
+    ``project_status``). Pass ``project`` to scope to one project.
+
+    Args:
+        symbol: The identifier to locate (function/class/qualified name).
+        project: Optional project ID to scope the search.
+        top_k: Max candidate chunks to scan (default 25).
+    """
+    if not symbol or not symbol.strip():
+        return "[RAG ERROR] symbol cannot be empty."
+    if _mode == "proxy":
+        return _proxy_find_definition(symbol.strip(), project, top_k)
+    return _direct_find_definition(symbol.strip(), project, top_k)
+
+
+@mcp_app.tool()
+def secret_audit(project: str | None = None) -> str:
+    """Audit the indexed content for secret material — file:line + rule names,
+    NEVER the value.
+
+    USE WHEN verifying no credentials leaked into the index, or to find files to
+    rotate/scrub. Reports files with live secrets (legacy points) and files whose
+    secrets are already redaction-masked (rotate them at the source anyway).
+
+    Requires the service to be running. Pass ``project`` to scope to one project.
+    """
+    if _mode != "proxy":
+        return "[RAG ERROR] secret_audit requires the service to be running (rag service start)."
+    return _proxy_secret_audit(project)
 
 
 @mcp_app.tool()
@@ -729,53 +773,61 @@ def reindex_project(project: str, confirm_token: str) -> dict:
     return result
 
 
-def set_project_dev_mode(project: str, enabled: bool, confirm_token: str = "") -> dict:
-    """Turn a project's "dev mode" on/off — whether its SOURCE CODE & config
-    files are indexed (in addition to docs). Secret-bearing files are ALWAYS
-    excluded regardless.
+def set_project_mode(project: str, mode: str, confirm_token: str = "") -> dict:
+    """Set a project's Mode — what it indexes:
+      - "docs"    = documentation / text / Markdown only (default)
+      - "code"    = source & config files only (no docs-only Markdown)
+      - "general" = both docs and code/config
+    Secret-bearing files are ALWAYS excluded, regardless of Mode.
 
-    USE WHEN: the user asks to index (or stop indexing) a project's code, e.g.
-              "index the code in project X" / "make X docs-only".
+    USE WHEN: the user asks to change what a project indexes, e.g. "index the
+              code in project X" (-> code or general), "make X docs-only" (-> docs).
     DO NOT USE: for content search (that's search_knowledge_base). This mutates
-                project config and triggers a reindex.
+                project config and triggers a delete-aware reindex.
 
     Args:
         project: Project ID.
-        enabled: True = index this project's source code & config; False =
-                 docs-only (PURGES the project's existing code chunks).
-        confirm_token: Required ONLY when ``enabled`` is False (the destructive,
-                       chunk-purging direction). Must equal the project ID, so a
-                       prompt-injected call can't blindly strip a project's code.
+        mode: "docs", "code", or "general".
+        confirm_token: Required for any narrowing Mode ("docs" or "code"), which
+                       PURGES the now-excluded chunks. Must equal the project ID,
+                       so a prompt-injected call can't blindly strip a project's
+                       content. Not required for "general" (purely additive).
     """
     if _ops_state is None or _ops_state.mode != "proxy":
         return err(
             _ops_state or _fallback_state(),
-            "set_project_dev_mode requires the service to be running — config "
+            "set_project_mode requires the service to be running — config "
             "writes cannot be persisted in direct mode.",
             code=_errcodes.SERVICE_DOWN,
             hint="Start the service with: rag service start",
         )
     if not project or not project.strip():
         return err(_ops_state, "project cannot be empty.", code=_errcodes.INVALID_ARG)
-    if not enabled and confirm_token != project:
+    if mode not in ("docs", "code", "general"):
         return err(
             _ops_state,
-            "Disabling dev mode purges the project's code chunks; confirm_token "
-            "must equal the project ID.",
+            "mode must be one of: docs, code, general.",
+            code=_errcodes.INVALID_ARG,
+            hint="Use 'general' to index both docs and code.",
+        )
+    if mode != "general" and confirm_token != project:
+        return err(
+            _ops_state,
+            f"Setting mode to {mode!r} purges the project's now-excluded chunks; "
+            "confirm_token must equal the project ID.",
             code=_errcodes.CONFIRM_TOKEN_MISMATCH,
             hint=f"Pass confirm_token={project!r} to proceed.",
         )
-    gate = _cooldown_guard("set_project_dev_mode")
+    gate = _cooldown_guard("set_project_mode")
     if gate is not None:
         return gate
-    mode = "code" if enabled else "docs"
     result = proxy_post(
         _ops_state,
-        f"/api/projects/{project.strip()}/dev-mode",
-        json={"index_source_code": mode},
+        f"/api/projects/{project.strip()}/mode",
+        json={"mode": mode},
     )
     if result.get("ok"):
-        _write_cooldown.mark("set_project_dev_mode")
+        _write_cooldown.mark("set_project_mode")
     return result
 
 
@@ -827,10 +879,12 @@ def remove_project_ignore_rule(project: str, pattern: str) -> dict:
 
 
 def project_status(project: str) -> dict:
-    """Single-project orientation: enabled, path, file/chunk counts, last indexed.
+    """Single-project orientation: enabled, Mode (docs/code/general), path,
+    file/chunk counts, file-type breakdown, last indexed.
 
     USE WHEN: the user just said they're working on project X and you want a
-              one-call overview before searching or acting on it.
+              one-call overview before searching or acting on it. The ``mode``
+              field tells you whether code is even indexed (docs = it is not).
     DO NOT USE: for general knowledge queries — search the project directly.
     """
     if _ops_state is None or _ops_state.mode != "proxy":
@@ -1057,14 +1111,66 @@ def _direct_dev_search(
         outcome = dev_search(
             searcher, query,
             project_id=project, project_ids=projects, top_k=top_k,
+            force_dev=True,  # the dev tool is always code-first
         )
-        return format_dev_context(outcome.results, query, outcome.triggers)
+        return format_dev_context(outcome.results, query, outcome.triggers,
+                                  outcome.warnings, outcome.code_indexed)
     except Exception as e:
         logger.exception("dev-search failed")
         return f"[RAG ERROR] dev-search failed: {e}"
     finally:
         if client:
             del client
+
+
+def _proxy_find_definition(symbol: str, project: str | None, top_k: int) -> str:
+    try:
+        params: dict = {"symbol": symbol, "top_k": top_k}
+        if project:
+            params["project"] = project
+        r = _http_client.get("/api/definitions", params=params)
+        if r.status_code == 200:
+            from ragtools.retrieval.formatter import format_definitions
+            return format_definitions(symbol, r.json().get("definitions", []))
+        return f"[RAG ERROR] Service returned {r.status_code}: {r.text}"
+    except Exception as e:
+        return _proxy_error(e)
+
+
+def _direct_find_definition(symbol: str, project: str | None, top_k: int) -> str:
+    error = _check_ready()
+    if error:
+        return f"[RAG ERROR] {error}"
+    client = None
+    try:
+        from ragtools.retrieval.codegraph import find_definitions
+        from ragtools.retrieval.formatter import format_definitions
+        from ragtools.retrieval.searcher import Searcher
+
+        client = _get_direct_client()
+        searcher = Searcher(client=client, encoder=_encoder, settings=_settings)
+        defs = find_definitions(searcher, symbol, project_id=project, top_k=top_k)
+        return format_definitions(symbol, defs)
+    except Exception as e:
+        logger.exception("find_definition failed")
+        return f"[RAG ERROR] find_definition failed: {e}"
+    finally:
+        if client:
+            del client
+
+
+def _proxy_secret_audit(project: str | None) -> str:
+    try:
+        params: dict = {}
+        if project:
+            params["project"] = project
+        r = _http_client.get("/api/secret-audit", params=params)
+        if r.status_code == 200:
+            from ragtools.retrieval.formatter import format_secret_audit
+            return format_secret_audit(r.json())
+        return f"[RAG ERROR] Service returned {r.status_code}: {r.text}"
+    except Exception as e:
+        return _proxy_error(e)
 
 
 def _proxy_list_projects() -> str:

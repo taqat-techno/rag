@@ -83,7 +83,7 @@ def test_discover_excludes_secrets_keeps_source(tmp_path):
     (tmp_path / "secret_manager.py").write_text("def load():\n    return {}\n", encoding="utf-8")
     (tmp_path / "README.md").write_text("# Docs\n", encoding="utf-8")
 
-    found = {p.name for p in discover_indexable_files(tmp_path, include_code=True)}
+    found = {p.name for p in discover_indexable_files(tmp_path, mode="general")}
     assert found == {"app.py", "secret_manager.py", "README.md"}
 
 

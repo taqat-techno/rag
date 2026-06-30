@@ -132,6 +132,8 @@ at startup.
 
 - **search_knowledge_base(query, project?, top_k?)** — Search indexed content (docs + code)
 - **search_project_context(query, project?, top_k?)** — Codebase-first layered retrieval for development requests (Project Context Mode)
+- **find_definition(symbol, project?, top_k?)** — Cross-file code-graph v1: likely definition sites for a symbol (file:line leads). Semantic discovery, LSP-complementary — not authoritative.
+- **secret_audit(project?)** — Audit indexed content for secret material (file:line + rule names, never values). Requires the service.
 - **list_projects()** — Discover available project IDs
 - **index_status()** — Check if the knowledge base is ready
 

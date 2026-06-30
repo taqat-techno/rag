@@ -190,7 +190,7 @@ class WatcherThread(threading.Thread):
         # Build per-project ignore rules
         project_rules: dict[Path, IgnoreRules] = {}
         project_map: dict[Path, str] = {}  # resolved_path → project_id
-        project_include: dict[Path, bool] = {}  # resolved_path → effective index_source_code
+        project_include: dict[Path, str] = {}  # resolved_path → project Mode (docs/code/general)
         watch_paths = []
 
         for project in enabled:
@@ -209,7 +209,7 @@ class WatcherThread(threading.Thread):
                 secret_allowlist=self._settings.secret_allowlist,
             )
             project_map[resolved] = project.id
-            project_include[resolved] = project.resolve_index_code(self._settings.index_source_code)
+            project_include[resolved] = project.mode
             watch_paths.append(project.path)
 
         if not watch_paths:
@@ -220,7 +220,7 @@ class WatcherThread(threading.Thread):
         from ragtools.watcher.observer import is_indexable_change
 
         def _accept(path: str) -> bool:
-            # Honor per-project index_source_code + secret exclusion + ignore rules.
+            # Honor per-project Mode + secret exclusion + ignore rules.
             # Deepest-match so a nested child project's mode wins over its parent's
             # (consistent with the scanner's child-path ownership).
             resolved = Path(path).resolve()

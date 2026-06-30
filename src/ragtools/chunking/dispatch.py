@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ragtools.chunking.anchors import attribute_line_spans
 from ragtools.chunking.code import chunk_code_file
 from ragtools.chunking.config_files import chunk_config_file
+from ragtools.chunking.hygiene import filter_chunks
 from ragtools.chunking.languages import CODE, CONFIG, DOCUMENTATION, classify_file
 from ragtools.chunking.markdown import chunk_markdown_file
 from ragtools.models import Chunk
@@ -53,10 +55,8 @@ def chunk_file(
             c.file_name = file_path.name
             c.extension = fc.extension
             c.module = project_id
-        return chunks
-
-    if fc.chunk_type == CODE:
-        return chunk_code_file(
+    elif fc.chunk_type == CODE:
+        chunks = chunk_code_file(
             file_path=file_path,
             project_id=project_id,
             relative_path=relative_path,
@@ -65,9 +65,8 @@ def chunk_file(
             chunk_overlap=chunk_overlap,
             module=project_id,
         )
-
-    if fc.chunk_type == CONFIG:
-        return chunk_config_file(
+    elif fc.chunk_type == CONFIG:
+        chunks = chunk_config_file(
             file_path=file_path,
             project_id=project_id,
             relative_path=relative_path,
@@ -76,5 +75,12 @@ def chunk_file(
             chunk_overlap=chunk_overlap,
             module=project_id,
         )
+    else:
+        return []
 
-    return []
+    # Drop content-free chunks (separators, near-empty doc fragments) before
+    # they are embedded or stored — generic across all chunkers.
+    chunks = filter_chunks(chunks)
+    # Attach 1-based line spans for provenance (jump-to-file:line).
+    attribute_line_spans(chunks, file_path)
+    return chunks

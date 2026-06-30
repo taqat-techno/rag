@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}RAG Tools{% endblock %}</title>
     <link rel="icon" href="/static/favicon.png" type="image/png">
-    <link rel="stylesheet" href="/static/design.css">
-    <script src="/static/htmx.min.js"></script>
+    <link rel="stylesheet" href="{{ asset_url('/static/design.css') }}">
+    <script src="{{ asset_url('/static/htmx.min.js') }}"></script>
 </head>
 <body>
     <aside class="sidebar">

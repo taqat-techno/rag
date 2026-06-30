@@ -13,7 +13,24 @@ from ragtools.service.app import get_owner, get_settings
 logger = logging.getLogger("ragtools.service")
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
+STATIC_DIR = Path(__file__).parent / "static"
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
+
+
+def _asset_url(path: str) -> str:
+    """Cache-busting URL for a static asset: appends ``?v=<mtime>`` so browsers
+    refetch the file whenever it changes on disk (a CSS edit, or an upgrade)
+    instead of serving a stale cached copy. Falls back to the bare path if the
+    file can't be stat'd."""
+    rel = path.split("/static/", 1)[-1] if "/static/" in path else path.lstrip("/")
+    try:
+        mtime = int((STATIC_DIR / rel).stat().st_mtime)
+        return f"{path}?v={mtime}"
+    except OSError:
+        return path
+
+
+templates.env.globals["asset_url"] = _asset_url
 
 page_router = APIRouter()
 
@@ -360,6 +377,38 @@ def ui_config():
 
 # --- Project management fragments ---
 
+# Inline SVG glyphs for the compact Projects-table action buttons (feather-style,
+# 24x24 viewBox, currentColor stroke). aria-hidden so each button's own aria-label
+# is the accessible name.
+_ICON_EDIT = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<path d="M12 20h9"/>'
+    '<path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>'
+)
+_ICON_POWER = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>'
+    '<line x1="12" y1="2" x2="12" y2="12"/></svg>'
+)
+_ICON_TRASH = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<polyline points="3 6 5 6 21 6"/>'
+    '<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>'
+    '<line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>'
+)
+
+# Project Mode → display label. docs/code/general are the canonical stored values.
+_MODE_LABELS = {"docs": "Docs", "code": "Code", "general": "General"}
+
+
+def _mode_badge(mode: str) -> str:
+    """Render the Project Mode badge (Docs / Code / General)."""
+    label = _MODE_LABELS.get(mode, "Docs")
+    return f'<span class="badge badge-accent" title="Mode: {label}">{label}</span>'
+
 
 def _render_projects_list() -> str:
     """Render the projects table HTML. Shared by all mutating project fragments."""
@@ -375,11 +424,10 @@ def _render_projects_list() -> str:
     rows = ""
     for p in settings.projects:
         idx = index_data.get(p.id, {"files": 0, "chunks": 0})
-        badge = '<span class="badge badge-success">Enabled</span>' if p.enabled else '<span class="badge badge-muted">Disabled</span>'
-        # Effective dev-mode badge (Code = source code + config indexed; Docs = docs only).
-        effective = p.resolve_index_code(settings.index_source_code)
-        mode_src = "inherited from global" if p.index_source_code is None else "set on this project"
-        mode_badge = f'<span class="badge badge-muted" title="dev mode {mode_src}">{"Code" if effective else "Docs"}</span>'
+        # Status = Enabled/Disabled only. Mode (Docs/Code/General) is a separate column.
+        status_badge = ('<span class="badge badge-success">Enabled</span>' if p.enabled
+                        else '<span class="badge badge-muted">Disabled</span>')
+        mode_badge = _mode_badge(p.mode)
         files = str(idx["files"]) if idx["files"] > 0 else "--"
         chunks = str(idx["chunks"]) if idx["chunks"] > 0 else "--"
         toggle_label = "Disable" if p.enabled else "Enable"
@@ -390,26 +438,29 @@ def _render_projects_list() -> str:
         rows += f"""<tr id="project-row-{escape(p.id)}">
             <td><strong>{escape(p.name)}</strong><br><code style="font-size:11px;color:var(--color-text-muted)">{escape(p.id)}</code></td>
             <td title="{escape(p.path)}"><code style="font-size:12px">{path_display}</code></td>
-            <td>{badge} {mode_badge}</td>
+            <td>{status_badge}</td>
+            <td>{mode_badge}</td>
             <td>{files}</td>
             <td>{chunks}</td>
-            <td style="white-space:nowrap">
-                <button class="btn btn-secondary btn-sm"
+            <td>
+                <span class="btn-icon-group">
+                <button class="btn btn-icon btn-secondary" title="Edit" aria-label="Edit {escape(p.name)}"
                     hx-get="/ui/projects/{escape(p.id)}/edit" hx-target="#project-row-{escape(p.id)}" hx-swap="outerHTML"
-                    hx-disabled-elt="this" hx-indicator="#projects-overlay">Edit</button>
-                <button class="btn btn-secondary btn-sm"
+                    hx-disabled-elt="this" hx-indicator="#projects-overlay">{_ICON_EDIT}</button>
+                <button class="btn btn-icon btn-secondary" title="{toggle_label}" aria-label="{toggle_label} {escape(p.name)}"
                     hx-post="/ui/projects/{escape(p.id)}/toggle" hx-target="#projects-list" hx-swap="innerHTML"
-                    hx-disabled-elt="this" hx-indicator="#projects-overlay">{toggle_label}</button>
-                <button class="btn btn-danger btn-sm"
+                    hx-disabled-elt="this" hx-indicator="#projects-overlay">{_ICON_POWER}</button>
+                <button class="btn btn-icon btn-danger" title="Remove" aria-label="Remove {escape(p.name)}"
                     hx-delete="/ui/projects/{escape(p.id)}/remove" hx-target="#projects-list" hx-swap="innerHTML"
                     hx-confirm="Remove project '{escape(p.name)}' and its indexed data?"
-                    hx-disabled-elt="this" hx-indicator="#projects-overlay">Remove</button>
+                    hx-disabled-elt="this" hx-indicator="#projects-overlay">{_ICON_TRASH}</button>
+                </span>
             </td>
         </tr>"""
 
     return f"""
     <table class="table-clean">
-        <thead><tr><th>Name</th><th>Path</th><th>Status</th><th>Files</th><th>Chunks</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Name</th><th>Path</th><th>Status</th><th>Mode</th><th>Files</th><th>Chunks</th><th>Actions</th></tr></thead>
         <tbody>{rows}</tbody>
     </table>
     """
@@ -427,7 +478,7 @@ def ui_projects_add(
     name: str = Form(""),
     path: str = Form(""),
     ignore_patterns: str = Form(""),
-    index_source_code: str = Form("inherit"),
+    mode: str = Form("docs"),
 ):
     """Add a new project via UI form."""
     try:
@@ -435,7 +486,7 @@ def ui_projects_add(
         from ragtools.service.routes import project_create, ProjectCreateRequest
         patterns = [line.strip() for line in ignore_patterns.splitlines() if line.strip()]
         req = ProjectCreateRequest(id=id.strip().lower(), name=name.strip(), path=path.strip(),
-                                   ignore_patterns=patterns, index_source_code=index_source_code)
+                                   ignore_patterns=patterns, mode=mode)
         project_create(req)
         response = HR(content=_render_projects_list())
         response.headers["HX-Trigger"] = "projectAdded"
@@ -451,25 +502,25 @@ def ui_projects_edit(project_id: str):
     settings = get_settings()
     project = next((p for p in settings.projects if p.id == project_id), None)
     if not project:
-        return f'<tr><td colspan="6"><div class="flash flash-error">Project not found</div></td></tr>'
+        return f'<tr><td colspan="7"><div class="flash flash-error">Project not found</div></td></tr>'
 
     patterns_text = "\n".join(project.ignore_patterns)
-    from ragtools.service.routes import _index_code_enum
-    cur_mode = _index_code_enum(project.index_source_code)
+    cur_mode = project.mode
 
     def _sel(v):
         return " selected" if cur_mode == v else ""
 
     mode_select = f'''<div class="form-group" style="margin-top:8px;">
-                    <label class="form-label">Dev mode</label>
-                    <select name="index_source_code" class="form-input">
-                        <option value="inherit"{_sel('inherit')}>Inherit global default</option>
-                        <option value="code"{_sel('code')}>Index source code &amp; config</option>
-                        <option value="docs"{_sel('docs')}>Docs only (Markdown / text)</option>
+                    <label class="form-label">Mode</label>
+                    <select name="mode" class="form-input">
+                        <option value="docs"{_sel('docs')}>Docs — documentation / text / Markdown only</option>
+                        <option value="code"{_sel('code')}>Code — source &amp; config files only</option>
+                        <option value="general"{_sel('general')}>General — both docs and code</option>
                     </select>
+                    <div style="font-size:12px;color:var(--color-text-muted);margin-top:4px;">Choose what this project indexes. Secret-bearing files are always excluded.</div>
                 </div>'''
     return f"""<tr id="project-row-{escape(project_id)}">
-        <td colspan="6">
+        <td colspan="7">
             <form hx-put="/ui/projects/{escape(project_id)}/save" hx-target="#projects-list" hx-swap="innerHTML">
                 <div class="grid-2">
                     <div class="form-group">
@@ -506,14 +557,14 @@ def ui_projects_save(
     name: str = Form(""),
     path: str = Form(""),
     ignore_patterns: str = Form(""),
-    index_source_code: str = Form("inherit"),
+    mode: str = Form("docs"),
 ):
     """Save edited project via UI form."""
     try:
         from ragtools.service.routes import project_update, ProjectUpdateRequest
         patterns = [line.strip() for line in ignore_patterns.splitlines() if line.strip()]
         req = ProjectUpdateRequest(name=name.strip() or None, path=path.strip() or None,
-                                   ignore_patterns=patterns, index_source_code=index_source_code)
+                                   ignore_patterns=patterns, mode=mode)
         project_update(project_id, req)
         return _render_projects_list()
     except Exception as e:
@@ -811,10 +862,10 @@ def _save_projects_to_toml(projects: list) -> None:
 
     existing["version"] = 2
     # Serialize via model_dump so every ProjectConfig field round-trips (no
-    # hand-maintained key list to forget). exclude_none drops None values —
-    # required because tomli_w cannot serialize None (TOML has no null), and it
-    # is exactly the right semantics for the tri-state index_source_code (None =
-    # inherit -> omit the key so the project keeps inheriting the global).
+    # hand-maintained key list to forget). exclude_none drops any None values —
+    # required because tomli_w cannot serialize None (TOML has no null). The
+    # canonical `mode` field always has a value (default "docs"), so it always
+    # persists.
     existing["projects"] = [p.model_dump(exclude_none=True) for p in projects]
     # Remove legacy content_root if upgrading
     existing.pop("content_root", None)

@@ -100,12 +100,15 @@ def chunks_to_points(chunks: list[Chunk], embeddings, file_hash: str) -> list[Po
                 "text": chunk.raw_text,
                 "headings": chunk.headings,
                 "token_count": chunk.token_count,
+                "line_start": chunk.line_start,
+                "line_end": chunk.line_end,
                 "file_hash": file_hash,
                 # Code/document metadata (defaults keep older points compatible)
                 "file_name": chunk.file_name,
                 "extension": chunk.extension,
                 "language": chunk.language,
                 "chunk_type": chunk.chunk_type,
+                "source_class": chunk.source_class,
                 "module": chunk.module,
                 "class_name": chunk.class_name,
                 "function_name": chunk.function_name,
@@ -191,6 +194,20 @@ def index_file(
 
     if not chunks:
         return 0
+
+    # Tag every chunk with its source class (owned / generated / ...). Dependency
+    # files are already excluded at scan time, so indexed files are owned or
+    # generated; the label drives coverage reporting and ranking down-weight.
+    from ragtools.source_class import classify_source_class
+    from ragtools.secret_scan import redact_text
+    sc = classify_source_class(relative_path)
+    for chunk in chunks:
+        chunk.source_class = sc
+        # Content secret redaction: mask secret VALUES (keep key names) before the
+        # text is embedded or stored, so a key pasted into docs/source/config never
+        # reaches the vector or the Qdrant payload.
+        chunk.text = redact_text(chunk.text)
+        chunk.raw_text = redact_text(chunk.raw_text)
 
     # Encode the enriched text (with heading prefix) for embedding
     texts = [chunk.text for chunk in chunks]

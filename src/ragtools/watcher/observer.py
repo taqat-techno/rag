@@ -24,37 +24,38 @@ from ragtools.ignore import IgnoreRules, RAGIGNORE_FILENAME
 console = Console()
 
 
-def is_indexable_change(path: str, ignore_rules: IgnoreRules, content_root: Path, include_code: bool) -> bool:
+def is_indexable_change(path: str, ignore_rules: IgnoreRules, content_root: Path, mode: str) -> bool:
     """Shared watcher predicate: should a changed file be (re)indexed?
 
-    Honors index_source_code (docs-only when disabled), excludes secret-bearing
+    Honors the project Mode (docs / code / general), excludes secret-bearing
     files, and respects ignore rules. Used by both the CLI watcher (observer)
     and the service watcher thread so they behave identically.
     """
     from ragtools.chunking.languages import is_documentation, is_supported
+    from ragtools.config import mode_indexes
 
     p = Path(path)
     if not is_supported(path):
         return False
-    if not include_code and not is_documentation(path):
+    if not mode_indexes(mode, is_documentation(path)):
         return False
     if ignore_rules.is_secret(p):
         return False
     return not ignore_rules.is_ignored(p, content_root)
 
 
-def _make_md_filter(ignore_rules: IgnoreRules, content_root: Path, include_code: bool):
+def _make_md_filter(ignore_rules: IgnoreRules, content_root: Path, mode: str):
     """Create a watchfiles filter using ignore rules.
 
-    Accepts indexable files (Markdown always; source/config only when
-    ``include_code``), excludes secrets, plus ``.ragignore`` changes (to trigger
-    a rule reload). Returns a closure watchfiles can use as watch_filter.
+    Accepts indexable files per the project Mode (docs / code / general),
+    excludes secrets, plus ``.ragignore`` changes (to trigger a rule reload).
+    Returns a closure watchfiles can use as watch_filter.
     """
     def md_filter(change: Change, path: str) -> bool:
         # Accept .ragignore file changes (to trigger rule reload)
         if Path(path).name == RAGIGNORE_FILENAME:
             return True
-        return is_indexable_change(path, ignore_rules, content_root, include_code)
+        return is_indexable_change(path, ignore_rules, content_root, mode)
 
     return md_filter
 
@@ -91,10 +92,13 @@ def run_watch(
     console.print(f"  Debounce: {debounce_ms}ms")
     console.print(f"  Press Ctrl+C to stop.\n")
 
+    # v1 legacy CLI watcher (no per-project Mode): map the global flag.
+    watch_mode = "general" if getattr(settings, "index_source_code", False) else "docs"
+
     try:
         for changes in watch(
             content_root,
-            watch_filter=_make_md_filter(ignore_rules, root_path, settings.index_source_code),
+            watch_filter=_make_md_filter(ignore_rules, root_path, watch_mode),
             debounce=debounce_ms,
             recursive=True,
             raise_interrupt=False,
@@ -113,7 +117,7 @@ def run_watch(
             # Filter to only actual indexable-file changes (not .ragignore changes)
             md_changes = [
                 (c, p) for c, p in changes
-                if is_indexable_change(p, ignore_rules, root_path, settings.index_source_code)
+                if is_indexable_change(p, ignore_rules, root_path, watch_mode)
             ]
             if not md_changes:
                 continue

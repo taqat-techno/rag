@@ -925,7 +925,7 @@ def project_list():
                 files = len(records)
                 chunks = sum(r["chunk_count"] for r in records)
                 state.close()
-            data.append({"id": p.id, "name": p.name, "path": p.path, "enabled": p.enabled, "files": files, "chunks": chunks})
+            data.append({"id": p.id, "name": p.name, "path": p.path, "enabled": p.enabled, "mode": p.mode, "files": files, "chunks": chunks})
 
     if not data:
         console.print("[yellow]No projects configured.[/yellow]")
@@ -937,13 +937,16 @@ def project_list():
     table.add_column("Name")
     table.add_column("Path")
     table.add_column("Status")
+    table.add_column("Mode")
     table.add_column("Files", justify="right")
     table.add_column("Chunks", justify="right")
+    _mode_disp = {"docs": "Docs", "code": "Code", "general": "General"}
     for p in data:
         status = "[green]Enabled[/green]" if p["enabled"] else "[dim]Disabled[/dim]"
+        mode_disp = _mode_disp.get(p.get("mode", "docs"), "Docs")
         files = str(p["files"]) if p["files"] > 0 else "[dim]--[/dim]"
         chunks = str(p["chunks"]) if p["chunks"] > 0 else "[dim]--[/dim]"
-        table.add_row(p["id"], p["name"], p["path"], status, files, chunks)
+        table.add_row(p["id"], p["name"], p["path"], status, mode_disp, files, chunks)
     console.print(table)
 
 
@@ -952,13 +955,13 @@ def project_add(
     name: str = typer.Option(..., "--name", "-n", help="Display name for the project"),
     path: str = typer.Option(..., "--path", "-p", help="Path to project folder"),
     project_id: str = typer.Option("", "--id", help="Project ID (auto-generated from name if not provided)"),
-    mode: str = typer.Option("inherit", "--mode", help="Dev mode: inherit (global default), code (index source code & config), or docs (Markdown only)"),
+    mode: str = typer.Option("docs", "--mode", help="Project Mode: docs (documentation only), code (source & config only), or general (both)"),
 ):
     """Add a new project folder to the configuration."""
     import re
 
-    if mode not in ("inherit", "code", "docs"):
-        console.print("[red]--mode must be: inherit, code, or docs.[/red]")
+    if mode not in ("docs", "code", "general"):
+        console.print("[red]--mode must be: docs, code, or general.[/red]")
         raise typer.Exit(2)
 
     # Auto-generate ID from name if not provided
@@ -980,7 +983,7 @@ def project_add(
         try:
             r = httpx.post(f"{_service_url(settings)}/api/projects",
                           json={"id": project_id, "name": name, "path": resolved_path,
-                                "index_source_code": mode},
+                                "mode": mode},
                           timeout=10.0)
             r.raise_for_status()
             console.print(f"[green]Project added:[/green] {project_id} ({name}) → {resolved_path}")
@@ -995,7 +998,7 @@ def project_add(
             console.print(f"[red]Project ID '{project_id}' already exists.[/red]")
             raise typer.Exit(1)
         new_project = ProjectConfig(id=project_id, name=name, path=resolved_path,
-                                    index_source_code={"code": True, "docs": False}.get(mode))
+                                    mode=mode)
         updated = list(settings.projects) + [new_project]
         from ragtools.service.pages import _save_projects_to_toml
         _save_projects_to_toml(updated)
@@ -1223,15 +1226,15 @@ def _toggle_project(project_id: str, enable: bool):
     console.print(f"[green]Project {state}:[/green] {project_id}")
 
 
-@project_app.command("dev-mode")
-def project_dev_mode(
+@project_app.command("mode")
+def project_mode(
     project_id: str = typer.Argument(..., help="Project ID"),
-    state: str = typer.Argument(..., help="on = index source code & config, off = docs only, inherit = use the global default"),
+    mode: str = typer.Argument(..., help="docs = documentation only, code = source & config only, general = both"),
 ):
-    """Set a project's dev mode (whether its source code & config are indexed)."""
-    mode = {"on": "code", "off": "docs", "inherit": "inherit"}.get(state.lower())
-    if mode is None:
-        console.print("[red]state must be: on, off, or inherit.[/red]")
+    """Set a project's Mode (docs / code / general)."""
+    mode = mode.lower()
+    if mode not in ("docs", "code", "general"):
+        console.print("[red]mode must be: docs, code, or general.[/red]")
         raise typer.Exit(2)
 
     settings = _get_settings()
@@ -1243,19 +1246,19 @@ def project_dev_mode(
     if _probe_service(settings):
         import httpx
         try:
-            r = httpx.put(f"{_service_url(settings)}/api/projects/{project_id}",
-                          json={"index_source_code": mode}, timeout=10.0)
+            r = httpx.post(f"{_service_url(settings)}/api/projects/{project_id}/mode",
+                           json={"mode": mode}, timeout=10.0)
             r.raise_for_status()
         except Exception as e:
             console.print(f"[red]Failed:[/red] {e}")
             raise typer.Exit(1)
-        console.print(f"[green]Dev mode set:[/green] {project_id} → {mode} (reindex scheduled)")
+        console.print(f"[green]Mode set:[/green] {project_id} → {mode} (reindex scheduled)")
     else:
-        # Direct mode: write TOML. inherit -> None (omitted on save).
-        project.index_source_code = {"code": True, "docs": False}.get(mode)
+        # Direct mode: write TOML.
+        project.mode = mode  # type: ignore[assignment]  # validated above
         from ragtools.service.pages import _save_projects_to_toml
         _save_projects_to_toml(list(settings.projects))
-        console.print(f"[green]Dev mode set:[/green] {project_id} → {mode}. Run `rag index` to apply.")
+        console.print(f"[green]Mode set:[/green] {project_id} → {mode}. Run `rag index` to apply.")
 
 
 # --- Backup commands ---
