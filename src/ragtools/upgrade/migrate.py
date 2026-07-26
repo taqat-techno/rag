@@ -141,24 +141,43 @@ def fold_for_match(text: str) -> str:
     recognise a developer's isolated store — so the guard whose entire purpose
     is "never delete a dev environment" was inert on two of three platforms.
 
-    Kept separate from :func:`_key` deliberately. Identity ("are these the same
-    directory?") *should* follow the filesystem: ``/opt/RAGTools`` and
-    ``/opt/ragtools`` are two directories on Linux and one on Windows. Matching
-    ("does this name look like ours?") should not, and over-matching is the safe
-    direction for a protective check.
+    Kept separate from :func:`directory_identity` deliberately. Identity ("are
+    these the same directory?") is a filesystem question. Matching ("does this
+    name look like ours?") is not, and over-matching is the safe direction for a
+    protective check.
     """
     return str(text).replace("\\", "/").casefold()
 
 
-def _key(entry: str) -> str:
+def directory_identity(entry: str) -> str:
     """Identity of a directory, for de-duplication.
 
-    Uses ``normcase`` ON PURPOSE — unlike :func:`fold_for_match`. Two spellings
-    differing only in case name one directory on Windows and two on Linux, and
-    collapsing them there would drop a legitimate PATH entry.
+    Asks the **filesystem**, not the platform. Whether two spellings name one
+    directory is a property of the filesystem, and no ``sys.platform`` test gets
+    it right: NTFS and the default APFS are case-insensitive, ext4 is
+    case-sensitive, and a case-sensitive APFS volume on the same Mac is too.
+
+    ``os.path.normcase`` was the previous answer and is wrong twice over — it is
+    the identity on *both* Linux and macOS, so on macOS two casings of one
+    directory each kept their own PATH entry and the duplicate-entry bug this
+    function exists to fix went unfixed.
+
+    ``(st_dev, st_ino)`` is the filesystem's own answer and is exact on all
+    three platforms, including symlinks and junctions pointing at one target.
+    Paths that do not exist have no inode, so those fall back to a textual key —
+    which is right for them: nothing can prove two absent paths are one
+    directory.
     """
+    expanded = Path(entry).expanduser()
     try:
-        resolved = str(Path(entry).expanduser().resolve())
+        stat = expanded.stat()
+        if stat.st_ino:                       # 0 on filesystems with no inodes
+            return f"inode:{stat.st_dev}:{stat.st_ino}"
+    except (OSError, ValueError):
+        pass
+
+    try:
+        resolved = str(expanded.resolve())
     except OSError:
         resolved = entry
     return os.path.normcase(resolved.rstrip("\\/"))
@@ -179,7 +198,7 @@ def repair_path(path_value: str, *, keep: Optional[str] = None) -> PathRepair:
       to, rather than whichever casing happened to appear first.
     """
     repair = PathRepair(original=[e for e in path_value.split(os.pathsep)])
-    keep_key = _key(keep) if keep else None
+    keep_key = directory_identity(keep) if keep else None
     seen: set[str] = set()
     out: list[str] = []
 
@@ -190,7 +209,7 @@ def repair_path(path_value: str, *, keep: Optional[str] = None) -> PathRepair:
             # common and removing it is a visible, pointless change.
             out.append(entry)
             continue
-        key = _key(stripped)
+        key = directory_identity(stripped)
         is_product = "ragtools" in fold_for_match(stripped)
         if not is_product:
             out.append(entry)

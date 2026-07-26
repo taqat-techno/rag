@@ -382,3 +382,37 @@ def test_migration_never_writes(tmp_path):
     migrate_config(_v2_document(tmp_path))
 
     assert config.read_text(encoding="utf-8") == "version = 2\n"
+
+
+def test_directory_identity_asks_the_filesystem_not_the_platform(tmp_path):
+    """Why `os.path.normcase` cannot answer "are these one directory?".
+
+    normcase lowercases on Windows and is the IDENTITY on both Linux AND macOS.
+    That reads as "POSIX is case-sensitive", which is false: the default APFS is
+    case-insensitive, so on macOS two casings of one directory each kept their
+    own PATH entry — the duplicate-entry bug repair_path() exists to fix, going
+    unfixed on the platform whose CI reported it.
+
+    `(st_dev, st_ino)` is the filesystem's own answer and needs no platform
+    test. Asserted by mechanism here so the result holds on filesystems this
+    suite never runs on — including a case-sensitive APFS volume, where a
+    sys.platform check would be wrong in the other direction.
+    """
+    from ragtools.upgrade.migrate import directory_identity
+
+    real = tmp_path / "Programs" / "RAGTools"
+    real.mkdir(parents=True)
+
+    assert directory_identity(str(real)).startswith("inode:"), (
+        "an existing directory must be identified by inode, not by its spelling")
+
+    # Whatever this filesystem says about case, the key must agree with it.
+    upper = str(real).upper()
+    folds = Path(upper).exists()
+    assert (directory_identity(upper) == directory_identity(str(real))) is folds
+
+    # A path that does not exist has no inode and cannot be proven identical to
+    # anything — textual fallback, never a false match.
+    absent = directory_identity(str(real / "nope"))
+    assert not absent.startswith("inode:")
+    assert absent != directory_identity(str(real))
