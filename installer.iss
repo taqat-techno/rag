@@ -6,10 +6,19 @@
 ;   - Inno Setup 6+ installed
 ;
 ; Usage:
-;   iscc installer.iss
+;   iscc installer.iss                          ; uses the version below
+;   iscc /DMyAppVersion=3.0.0-rc.3 installer.iss ; CI overrides from the tag
 
 #define MyAppName "RAG Tools"
-#define MyAppVersion "3.0.0"
+; Overridable so the installer filename always tracks the TAG being built.
+; OutputBaseFilename derives from this, and the release workflow uploads
+; `RAGTools-Setup-<tag version>.exe`. With the version hardwired, a tag like
+; v3.0.0-rc.2 produced `RAGTools-Setup-3.0.0.exe`, the upload glob matched
+; nothing, and the release published WITHOUT its installer while every step
+; reported success.
+#ifndef MyAppVersion
+  #define MyAppVersion "3.0.0"
+#endif
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
 #define MyAppExeName "rag.exe"
