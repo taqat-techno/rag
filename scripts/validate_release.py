@@ -187,6 +187,22 @@ def _upgrade_rehearsal(ctx: dict) -> tuple[bool, str]:
     return failed == 0, f"{result.get('passed', 0)} passed, {failed} failed"
 
 
+def _reindex_reconciled(ctx: dict):
+    """Every reconciliation gate, run against the real migrated corpus."""
+    r = ctx.get("reindex")
+    if r is None:
+        return None, "not run — reconcile against the migrated corpus"
+    return r.get("failed", 0) == 0, f"{r.get('passed', 0)} gate(s) passed"
+
+
+def _uninstall_clean(ctx: dict):
+    """Install, uninstall, then sweep. "Uninstall returned 0" is not evidence."""
+    r = ctx.get("uninstall")
+    if r is None:
+        return None, "not run — see scripts/verify_uninstall_residue.py"
+    return r.get("failed", 0) == 0, f"{r.get('passed', 0)} check(s) passed"
+
+
 def _scale_matches_engine(ctx: dict) -> tuple[bool, str]:
     """The scale warning must describe the engine actually in use.
 
@@ -218,10 +234,10 @@ ROWS = [
     Row("V11", "scale warning matches the engine", _scale_matches_engine),
     Row("V12", "storage kill -> honest degraded -> recovery",
         manual_reason="destructive; run scripts/verify_storage_recovery.py"),
-    Row("V13", "complete re-index migration on a real corpus",
-        manual_reason="needs the production corpus", platforms=("windows",)),
+    Row("V13", "re-index reconciled on a real corpus", _reindex_reconciled,
+        platforms=("windows",)),
     Row("V14", "zero cross-project leakage", _no_cross_project_leakage),
-    Row("V15", "clean uninstall leaves zero residue", manual_reason="destructive"),
+    Row("V15", "clean uninstall leaves zero residue", _uninstall_clean),
     Row("V16", "signed and notarized artifact",
         manual_reason="needs a signing identity (D-3)", platforms=("darwin", "windows")),
 ]
@@ -284,6 +300,10 @@ def main(argv=None) -> int:
     parser.add_argument("--rehearsal-failed", type=int, default=None)
     parser.add_argument("--clean-install-passed", type=int, default=None)
     parser.add_argument("--clean-install-failed", type=int, default=None)
+    parser.add_argument("--reindex-passed", type=int, default=None)
+    parser.add_argument("--reindex-failed", type=int, default=None)
+    parser.add_argument("--uninstall-passed", type=int, default=None)
+    parser.add_argument("--uninstall-failed", type=int, default=None)
     args = parser.parse_args(argv)
 
     from ragtools.platform import current_platform
@@ -295,6 +315,11 @@ def main(argv=None) -> int:
     if args.clean_install_passed is not None:
         ctx["clean_install"] = {"passed": args.clean_install_passed,
                                 "failed": args.clean_install_failed or 0}
+    if args.reindex_passed is not None:
+        ctx["reindex"] = {"passed": args.reindex_passed, "failed": args.reindex_failed or 0}
+    if args.uninstall_passed is not None:
+        ctx["uninstall"] = {"passed": args.uninstall_passed,
+                            "failed": args.uninstall_failed or 0}
     if args.rehearsal_passed is not None:
         ctx["rehearsal"] = {"passed": args.rehearsal_passed,
                             "failed": args.rehearsal_failed or 0}

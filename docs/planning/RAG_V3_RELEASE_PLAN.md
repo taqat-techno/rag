@@ -547,7 +547,9 @@ Linux adapter (WSL2, real systemd)         22/22   incl. systemd-analyze verify
 Upgrade rehearsal (real v2.7.0 config)     16/16   detection, protection, PATH, migration
 Cross-project isolation (V14)              0 foreign documents across 4 probes
 Storage kill -> degraded -> recovery (V12) honest degraded; new Qdrant; 160,630 points intact
-Validation matrix                          9 pass / 0 fail / 6 manual
+Uninstall residue sweep (V15)              12/12   install -> uninstall -> scan finds nothing
+Re-index reconciliation (V13)              8/8     real corpus: 38,482 files / 160,642 points
+Validation matrix                          11 pass / 0 fail / 4 manual
 ```
 
 **The gate refuses to pass a row it did not run.** Twice this had to be fixed:
@@ -570,6 +572,15 @@ pinned by tests.
 | A test reached the live Windows scheduler | runtime | would have altered a developer's real login items |
 
 ### What is still genuinely blocked
+
+**Four rows remain, and each needs something this machine cannot supply:**
+
+| Row | Blocker |
+|---|---|
+| V03 reboot autostart · V04 tray registration | this account cannot create scheduled tasks — `schtasks` returns *Access is denied* |
+| V12 storage kill | executed by hand (honest degraded, recovery, 160,630 points intact); destructive to automate in the matrix |
+| V16 signing | Apple Developer ID + Windows Authenticode certificate |
+| macOS execution | no Mac; `.github/workflows/release-validation.yml` covers it the moment runners are enabled |
 
 | Blocked | Why | Decision |
 |---|---|---|
