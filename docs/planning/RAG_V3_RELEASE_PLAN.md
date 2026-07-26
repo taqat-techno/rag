@@ -525,47 +525,50 @@ Each phase: **entry → actions → tests → rollback boundary → exit gate.**
 
 ---
 
-## 13a. Execution status — all eight phases attempted
+## 13a. Execution status — every phase built; validation is where it stops
 
-| Phase | State | Evidence |
-|---|---|---|
-| **0** Close S1 | **done** | A3 and A6/B26 were already implemented; the tracker carried stale checkboxes |
-| **1** Platform seam | **done** | `ragtools.platform`; dispatch outside it **13 modules → 0**, enforced by a grep test; `watchdog.py` (462 lines) deleted |
-| **2** Linux + macOS adapters | **code done, unvalidated** | systemd-user, launchd, XDG; unit-tested — **never executed on Linux or macOS** (D-1) |
-| **3** Upgrade engine | **done** | `scan` + `migrate`; verified read-only against this machine |
-| **4** Migration gates | **done** | `preflight` (5 gates), `reconcile` (5 gates), `state` (resumable, boundary-aware) |
-| **5** Lifecycle | **done** | `service/maintenance.py` — service-owned schedule, no keepalive |
-| **6** Packaging | **partial** | systemd unit, launchd plist, XDG desktop entry, build stamp, SHA256SUMS, CycloneDX SBOM, 3 release guides. **Signing blocked on D-3** |
-| **7** RC validation | **runner done, matrix incomplete** | `scripts/validate_release.py`; 6 automated rows pass live, 9 manual rows correctly block the verdict |
+| Phase | State |
+|---|---|
+| **0** Close S1 and land the work | **done** — committed as `7f0f4d3` on `rag-v3-dev` (193 files). Not pushed; `master` untouched |
+| **1** Platform seam | **done** — dispatch outside it 13 modules → 0, grep-enforced; `watchdog.py` (462 lines) deleted |
+| **2** Linux + macOS adapters | **Linux VALIDATED on real systemd (22/22); macOS code + schema-validated, never executed** |
+| **3** Upgrade engine | **done** — rehearsed 16/16 against a copy of the real v2.7.0 install |
+| **4** Migration gates | **done** — preflight (5), reconcile (5), resumable boundary-aware state |
+| **5** Lifecycle | **done** — service-owned schedule; no keepalive anywhere |
+| **6** Packaging | **artifacts + metadata done; signing gate implemented and failing closed** (D-3) |
+| **7** RC validation | **8 rows automated and passing; 7 remain manual** |
 
-### Verified against real machine state (read-only)
+### Executed on this machine
 
 ```
-PATH            49 entries -> 15 product duplicates removed -> 1 kept
-dev protection  RAGTools-dev / rag-v3-dev / rag-v3-e2e   PROTECTED
-                RAGTools (installed)                     candidate
-config          v2 -> v3, 15 projects preserved, +2 keys, idempotent
-validator       6 automated rows PASS against the live service
-                VERDICT: NOT VALIDATED — 9 manual rows outstanding
+Linux adapter (WSL2, real systemd)         22/22   incl. systemd-analyze verify
+Upgrade rehearsal (real v2.7.0 config)     16/16   detection, protection, PATH, migration
+Cross-project isolation (V14)              0 foreign documents across 4 probes
+Storage kill -> degraded -> recovery (V12) honest degraded; new Qdrant; 160,630 points intact
+Validation matrix                          8 pass / 0 fail / 7 manual
+Suite                                      1806 passed, 13 skipped, 0 failures
 ```
 
-Nothing was written to the installed config, PATH, scheduler, Startup folder, or
-the live services on `:21420` / `:21422`.
+### Defects found by executing rather than reading
 
-### Defects found by writing the tests
-
-| Defect | Where | Consequence had it shipped |
+| Defect | Found by | Consequence had it shipped |
 |---|---|---|
-| `_process_alive` ignored the exit code | `service/process.py` | an exited service reported alive; stale PID files never cleaned |
-| `_terminate_pid` force-killed on Windows, SIGTERM on POSIX | `service/process.py` | the force path could not kill the hung process it exists to kill |
-| A non-startup maintenance task could never become due | `service/maintenance.py` | daily/weekly maintenance would never have run, ever |
-| Checksum manifest sorted by hash, not filename | `scripts/release_artifacts.py` | "reproducible" manifests that reorder every build |
-| `Matrix.validated` ignored MANUAL rows | `scripts/validate_release.py` | **the release gate reported VALIDATED with 9 required rows unrun** |
-| A test reached the live Windows scheduler | test suite | would have altered a developer's real login items; now guarded |
+| `StartLimitIntervalSec` in `[Service]` | **real systemd** | crash-loop protection silently discarded; a failing service restarts forever |
+| A zombie process reported as alive | **real Linux** | a dead service reads as running; stale PID files never cleaned |
+| `_process_alive` ignored the Windows exit code | Windows suite | same class, other OS |
+| `_terminate_pid` force-killed on Windows, SIGTERM on POSIX | review + tests | the force path could not kill a hung process |
+| A non-startup maintenance task could never become due | suite | daily and weekly maintenance would never have run once |
+| Checksum manifest sorted by hash | suite | "reproducible" manifests reordered every build |
+| `Matrix.validated` ignored MANUAL rows | suite | **the release gate reported VALIDATED with 9 required rows unrun** |
+| A test reached the live Windows scheduler | runtime | would have altered a developer's real login items |
 
-The last two matter most: a gate that can report success without running is
-worse than no gate, and a suite that can mutate the machine it runs on is not a
-suite.
+### What is still genuinely blocked
+
+| Blocked | Why | Decision |
+|---|---|---|
+| macOS execution | no Mac, and macOS cannot be virtualised here. The launchd plist is schema-validated against `launchd.plist(5)` so the *silently-ignored-key* class cannot ship, but nothing has ever run | **D-1** |
+| Signing / notarization | needs Apple Developer ID and a Windows certificate. The gate is implemented and **fails closed** — with no verifier configured every requirement reports UNSATISFIED | **D-3** |
+| V01 clean install · V03 reboot · V04 tray registration · V13 production re-index · V15 destructive uninstall | each needs a machine that can be broken, or would modify this user's working install | **D-1** |
 
 ---
 

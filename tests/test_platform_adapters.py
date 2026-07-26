@@ -434,3 +434,53 @@ def test_no_platform_branch_survives_outside_this_package():
     assert not offenders, (
         "platform dispatch outside ragtools.platform: " + ", ".join(sorted(offenders))
     )
+
+
+# --- macOS: the bug class real systemd caught, prevented without a Mac -----
+
+
+def test_darwin_plist_only_uses_keys_launchd_understands(tmp_path):
+    """launchd IGNORES an unrecognised key silently — the same way systemd
+    ignored `StartLimitIntervalSec` in the wrong section, discarding the
+    crash-loop protection without a word. No Mac is available to run `plutil`
+    here, so validating the key set is what stops that class shipping."""
+    from ragtools.platform.darwin import LAUNCHD_KEYS, validate_plist
+
+    adapter = DarwinAdapter(FakeRunner({"launchctl": OK}), home=tmp_path)
+    document = adapter.render_plist(AutostartSpec(
+        "svc", KIND_SERVICE, ["/usr/local/bin/rag", "service", "run"],
+        environment={"RAG_PROFILE": "installed"}, working_dir=Path("/opt/ragtools"),
+        delay_seconds=10))
+
+    assert set(document) <= LAUNCHD_KEYS, sorted(set(document) - LAUNCHD_KEYS)
+    validate_plist(document)
+
+
+def test_darwin_refuses_an_unknown_key():
+    from ragtools.platform.darwin import InvalidAgent, validate_plist
+
+    with pytest.raises(InvalidAgent, match="does not recognise"):
+        validate_plist({"Label": "x", "ProgramArguments": ["y"], "RestartSec": 5})
+
+
+def test_darwin_refuses_a_misspelt_keepalive_condition():
+    """`SuccessfulExist` loads fine and silently never restarts on crash."""
+    from ragtools.platform.darwin import InvalidAgent, validate_plist
+
+    with pytest.raises(InvalidAgent, match="KeepAlive does not accept"):
+        validate_plist({"Label": "x", "ProgramArguments": ["y"],
+                        "KeepAlive": {"SuccessfulExist": False}})
+
+
+def test_darwin_refuses_a_plist_with_nothing_to_run():
+    from ragtools.platform.darwin import InvalidAgent, validate_plist
+
+    with pytest.raises(InvalidAgent, match="ProgramArguments or Program"):
+        validate_plist({"Label": "com.ragtools.service"})
+
+
+def test_darwin_refuses_a_label_less_plist():
+    from ragtools.platform.darwin import InvalidAgent, validate_plist
+
+    with pytest.raises(InvalidAgent, match="Label is required"):
+        validate_plist({"ProgramArguments": ["/usr/local/bin/rag"]})

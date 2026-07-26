@@ -30,6 +30,60 @@ from ragtools.platform.base import (
     default_runner,
 )
 
+#: Keys launchd actually understands, from launchd.plist(5). launchd IGNORES an
+#: unrecognised key silently — exactly how `StartLimitIntervalSec` in the wrong
+#: systemd section discarded the crash-loop protection without a word. Since no
+#: Mac is available to run `plutil`/`launchctl` against, validating the key set
+#: is what stops that class of defect shipping here.
+LAUNCHD_KEYS = frozenset({
+    "Label", "Program", "ProgramArguments", "RunAtLoad", "KeepAlive",
+    "WorkingDirectory", "EnvironmentVariables", "StandardOutPath",
+    "StandardErrorPath", "ProcessType", "ThrottleInterval", "StartInterval",
+    "StartCalendarInterval", "WatchPaths", "QueueDirectories", "Disabled",
+    "UserName", "GroupName", "LimitLoadToSessionType", "ExitTimeOut",
+    "Nice", "LowPriorityIO", "AbandonProcessGroup", "SessionCreate",
+})
+
+#: `KeepAlive` accepts a bool or a dict; these are its documented sub-keys.
+KEEPALIVE_KEYS = frozenset({
+    "SuccessfulExit", "NetworkState", "PathState", "OtherJobEnabled", "Crashed",
+})
+
+
+class InvalidAgent(ValueError):
+    """A generated plist launchd would not fully understand."""
+
+
+def validate_plist(document: dict) -> None:
+    """Refuse a plist launchd would silently mis-read.
+
+    launchd does not report unknown keys; it ignores them. A typo therefore
+    produces an agent that loads, runs, and quietly lacks whatever the misspelt
+    key was meant to configure.
+    """
+    unknown = sorted(set(document) - LAUNCHD_KEYS)
+    if unknown:
+        raise InvalidAgent(
+            f"launchd does not recognise {', '.join(unknown)} — it would ignore "
+            "them silently. Check launchd.plist(5)."
+        )
+    if not document.get("Label"):
+        raise InvalidAgent("Label is required; launchd cannot address the job without it")
+    argv = document.get("ProgramArguments")
+    if not (argv or document.get("Program")):
+        raise InvalidAgent("ProgramArguments or Program is required")
+    if argv is not None and (not isinstance(argv, list) or not all(
+            isinstance(a, str) for a in argv)):
+        raise InvalidAgent("ProgramArguments must be a list of strings")
+    keep_alive = document.get("KeepAlive")
+    if isinstance(keep_alive, dict):
+        bad = sorted(set(keep_alive) - KEEPALIVE_KEYS)
+        if bad:
+            raise InvalidAgent(f"KeepAlive does not accept {', '.join(bad)}")
+    elif keep_alive is not None and not isinstance(keep_alive, bool):
+        raise InvalidAgent("KeepAlive must be a boolean or a dictionary")
+
+
 LABEL_SERVICE = "com.ragtools.service"
 LABEL_TRAY = "com.ragtools.tray"
 
@@ -125,7 +179,9 @@ class DarwinAdapter:
         label = self._label(spec.kind)
         self.agents_dir.mkdir(parents=True, exist_ok=True)
         path = self.agents_dir / f"{label}.plist"
-        path.write_bytes(plistlib.dumps(self.render_plist(spec)))
+        document = self.render_plist(spec)
+        validate_plist(document)      # never write one launchd would mis-read
+        path.write_bytes(plistlib.dumps(document))
 
         # bootout first: launchd keeps the OLD definition loaded otherwise, so
         # an upgrade would keep running the previous binary until next login.

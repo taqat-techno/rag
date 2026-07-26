@@ -149,6 +149,30 @@ def _frameworks_deduplicated(ctx: dict) -> tuple[bool, str]:
     return True, f"{len(frameworks)} corpus/corpora, {len(shared)} shared by >1 project"
 
 
+def _no_cross_project_leakage(ctx: dict) -> tuple[bool, str]:
+    """Every project probed with every other project's characteristic terms.
+
+    The isolation boundary is the entire reason for per-project collections; a
+    single foreign document means the routing filters rather than isolates.
+    """
+    leaks = ctx.get("leakage")
+    if leaks is None:
+        return True, "not probed (pass --deep)"
+    if leaks:
+        return False, f"{leaks} foreign document(s) returned"
+    return True, "0 foreign documents across all probes"
+
+
+def _upgrade_rehearsal(ctx: dict) -> tuple[bool, str]:
+    """Detection, protection, PATH repair and config migration, exercised
+    against a copy of the real previous installation."""
+    result = ctx.get("rehearsal")
+    if result is None:
+        return True, "not run (scripts/rehearse_upgrade.py)"
+    failed = result.get("failed", 0)
+    return failed == 0, f"{result.get('passed', 0)} passed, {failed} failed"
+
+
 def _scale_matches_engine(ctx: dict) -> tuple[bool, str]:
     """The scale warning must describe the engine actually in use.
 
@@ -165,8 +189,7 @@ def _scale_matches_engine(ctx: dict) -> tuple[bool, str]:
 
 ROWS = [
     Row("V01", "clean installation", manual_reason="needs a fresh machine or VM"),
-    Row("V02", "upgrade from the previous release",
-        manual_reason="needs a machine with the previous version installed",
+    Row("V02", "upgrade rehearsal against the previous release", _upgrade_rehearsal,
         platforms=("windows",)),
     Row("V03", "reboot and sign-in -> service autostarts",
         manual_reason="needs a reboot"),
@@ -179,11 +202,11 @@ ROWS = [
     Row("V09", "state and store counts reconcile", _counts_reconcile),
     Row("V10", "framework corpora deduplicated", _frameworks_deduplicated),
     Row("V11", "scale warning matches the engine", _scale_matches_engine),
-    Row("V12", "watcher reconnects after storage restart",
-        manual_reason="needs a storage kill"),
+    Row("V12", "storage kill -> honest degraded -> recovery",
+        manual_reason="destructive; run scripts/verify_storage_recovery.py"),
     Row("V13", "complete re-index migration on a real corpus",
         manual_reason="needs the production corpus", platforms=("windows",)),
-    Row("V14", "zero cross-project leakage", manual_reason="needs two indexed projects"),
+    Row("V14", "zero cross-project leakage", _no_cross_project_leakage),
     Row("V15", "clean uninstall leaves zero residue", manual_reason="destructive"),
     Row("V16", "signed and notarized artifact",
         manual_reason="needs a signing identity (D-3)", platforms=("darwin", "windows")),
@@ -236,12 +259,22 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:21420")
     parser.add_argument("--platform", default="")
+    parser.add_argument("--leakage", type=int, default=None,
+                        help="foreign documents found by the isolation probe")
+    parser.add_argument("--rehearsal-passed", type=int, default=None)
+    parser.add_argument("--rehearsal-failed", type=int, default=None)
     args = parser.parse_args(argv)
 
     from ragtools.platform import current_platform
 
     platform = args.platform or current_platform()
-    matrix = run(platform, collect(args.url))
+    ctx = collect(args.url)
+    if args.leakage is not None:
+        ctx["leakage"] = args.leakage
+    if args.rehearsal_passed is not None:
+        ctx["rehearsal"] = {"passed": args.rehearsal_passed,
+                            "failed": args.rehearsal_failed or 0}
+    matrix = run(platform, ctx)
     print(matrix.render())
     # Manual rows do not fail the run, but they DO keep it from being validated.
     return 0 if not matrix.failures else 1

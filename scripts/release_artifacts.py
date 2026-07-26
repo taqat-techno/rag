@@ -183,6 +183,55 @@ def installed_components(*, distributions=None) -> list[Component]:
     return out
 
 
+@dataclass(frozen=True)
+class SigningRequirement:
+    """What must be true of an artifact before it may ship."""
+
+    artifact: str
+    platform: str
+    required: bool
+    satisfied: bool
+    detail: str = ""
+
+
+def signing_requirements(artifacts: Iterable[Path], *, verifier=None) -> list[SigningRequirement]:
+    """Whether each artifact carries the signature its platform demands.
+
+    macOS is not optional: an unsigned, un-notarized build is refused by
+    Gatekeeper on any machine that did not create it, so shipping one is
+    shipping something nobody can install. Windows is required too — an
+    unsigned installer is a SmartScreen warning on every download.
+
+    ``verifier`` is injected; the real implementations are `codesign
+    --verify --deep --strict` plus `spctl -a -t install`, and `signtool
+    verify /pa`. With no verifier configured every requirement is UNSATISFIED
+    rather than assumed met — a signing gate that passes when it cannot check
+    is not a gate.
+    """
+    out: list[SigningRequirement] = []
+    for path in (Path(a) for a in artifacts):
+        suffix = path.suffix.lower()
+        if suffix in (".dmg", ".pkg", ".app"):
+            platform_name, required = "darwin", True
+        elif suffix in (".exe", ".msi"):
+            platform_name, required = "windows", True
+        else:
+            platform_name, required = "linux", False
+        if verifier is None:
+            satisfied, detail = (not required), (
+                "no signing identity configured" if required else "signature not required")
+        else:
+            satisfied, detail = verifier(path, platform_name)
+        out.append(SigningRequirement(path.name, platform_name, required,
+                                      satisfied, detail))
+    return out
+
+
+def unsigned_blockers(requirements: Iterable[SigningRequirement]) -> list[str]:
+    """Artifacts that may not ship. Empty means the signing gate is clear."""
+    return [r.artifact for r in requirements if r.required and not r.satisfied]
+
+
 def write_release_metadata(
     out_dir: Path,
     *,

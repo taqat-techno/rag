@@ -231,3 +231,66 @@ def test_no_signing_material_is_produced_or_expected(tmp_path):
 
     produced = {p.name for p in out.iterdir()}
     assert not any(p.endswith((".p12", ".pfx", ".key", ".pem")) for p in produced)
+
+
+# --- the signing gate -----------------------------------------------------
+
+
+def test_an_unsigned_macos_artifact_blocks_the_release(tmp_path):
+    """Gatekeeper refuses an unsigned, un-notarized build on any machine that
+    did not create it, so shipping one is shipping something nobody can
+    install."""
+    from scripts.release_artifacts import signing_requirements, unsigned_blockers
+
+    reqs = signing_requirements([tmp_path / "RAGTools-3.0.0.dmg"])
+    assert reqs[0].required is True
+    assert unsigned_blockers(reqs) == ["RAGTools-3.0.0.dmg"]
+
+
+def test_an_unsigned_windows_installer_blocks_the_release(tmp_path):
+    from scripts.release_artifacts import signing_requirements, unsigned_blockers
+
+    reqs = signing_requirements([tmp_path / "RAGTools-Setup-3.0.0-x64.exe"])
+    assert unsigned_blockers(reqs) == ["RAGTools-Setup-3.0.0-x64.exe"]
+
+
+def test_a_linux_tarball_needs_no_signature(tmp_path):
+    """Distribution packages are verified by the repository's own signing, and
+    demanding one here would block a release for no security gain."""
+    from scripts.release_artifacts import signing_requirements, unsigned_blockers
+
+    reqs = signing_requirements([tmp_path / "ragtools-3.0.0-linux-x86_64.tar.gz"])
+    assert reqs[0].required is False
+    assert unsigned_blockers(reqs) == []
+
+
+def test_the_gate_does_not_pass_when_it_cannot_check(tmp_path):
+    """A signing gate that reports success because no verifier is configured is
+    worse than none — it converts "unverified" into "verified"."""
+    from scripts.release_artifacts import signing_requirements
+
+    req = signing_requirements([tmp_path / "x.dmg"])[0]
+    assert req.satisfied is False
+    assert "no signing identity" in req.detail
+
+
+def test_a_verified_signature_clears_the_gate(tmp_path):
+    from scripts.release_artifacts import signing_requirements, unsigned_blockers
+
+    reqs = signing_requirements(
+        [tmp_path / "RAGTools-3.0.0.dmg"],
+        verifier=lambda path, platform: (True, "Developer ID Application; notarized"))
+    assert unsigned_blockers(reqs) == []
+
+
+def test_the_shipped_launch_agent_is_valid(tmp_path):
+    """The plist that actually ships must satisfy the same schema the adapter
+    enforces at write time."""
+    import plistlib
+    from pathlib import Path as _P
+
+    from ragtools.platform.darwin import validate_plist
+
+    shipped = _P(__file__).resolve().parents[1] / "packaging" / "macos" / \
+        "com.ragtools.service.plist"
+    validate_plist(plistlib.loads(shipped.read_bytes()))
