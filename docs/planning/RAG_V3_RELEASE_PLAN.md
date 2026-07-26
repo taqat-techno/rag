@@ -648,6 +648,39 @@ Two further defects surfaced while closing these rows, both in the same seam:
   manufactured pass this runner exists to prevent, caught by writing the test
   that asserts an unrun probe reports MANUAL.
 
+### The lifecycle gate's two manual boxes — accepted with a stated gap
+
+`RELEASING.md` step 5 requires the installer's **upgrade** path and its
+**uninstall** prompt to be exercised on a machine that already carries the
+previous version. Neither can be done safely here, and the reason is specific
+rather than squeamish:
+
+* the uninstaller's data path is **hardcoded** to `{localappdata}\RAGTools`,
+  independent of install directory, so a "sandbox" install still targets the
+  real knowledge base — the YES branch would `DelTree` it;
+* `ForceKillRagProcesses()` kills every `rag.exe` on the machine by image name,
+  so even a sandboxed uninstall stops the live services;
+* and v3 **rebuilds the index on upgrade** (the vector store is not
+  convertible). On the development machine that is 147,515 points across 15
+  projects, including a 37,637-file vendored Odoo core — hours of re-encoding
+  spent to observe an installer.
+
+**Decision: accept, and say so.** What *is* proven, against real data:
+
+| Evidence | Result |
+|---|---|
+| `rehearse_upgrade.py` against a **copy of the real v2.7.0 config** | 16/16 — detection, dev-path protection, PATH 16→1, v2→v3 migration with all 15 projects preserved, idempotent |
+| `verify_uninstall_residue.py` | 9/9 — install → uninstall → sweep, with the upgrade scanner confirming no installation, registrations or PATH entries survive |
+| `verify_autostart_lifecycle.py` | 20/20 — both concerns registered, fired and removed against the real Task Scheduler, unelevated |
+| Config migration | separately unit-tested; `CONFIG_VERSION = 3` with a real migration step |
+
+**What remains untested: Inno Setup's own behaviour on a machine carrying a
+previous install** — file replacement while services hold handles, the `[Run]`
+steps, and the uninstaller's data prompt answered both ways. That needs a
+Windows VM with v2.7.0 installed, and it should be done before anyone else is
+told to upgrade, because the forced re-index makes that path the highest-risk
+part of this release.
+
 ### What is still genuinely blocked
 
 **Two rows remain, and each needs something this machine cannot supply:**
@@ -655,7 +688,7 @@ Two further defects surfaced while closing these rows, both in the same seam:
 | Row | Blocker |
 |---|---|
 | V16 signing | Apple Developer ID + Windows Authenticode certificate |
-| macOS execution | no Mac; `.github/workflows/release-validation.yml` covers it the moment runners are enabled |
+| Installer upgrade / uninstall on a live machine | a disposable Windows VM carrying v2.7.0 |
 
 | Blocked | Why | Decision |
 |---|---|---|
