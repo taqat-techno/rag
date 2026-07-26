@@ -294,21 +294,31 @@ def test_project_update_reindexes_only_on_mode_change(monkeypatch, tmp_path):
 
 
 def test_schedule_reindex_is_delete_aware(monkeypatch):
-    # G1: a Mode change must use reindex_project (delete+full), NOT run_full_index
-    # (upsert-only) — else narrowing the Mode leaves stale chunks on disk.
+    # G1 (unchanged intent): a Mode change must be DELETE-AWARE, so narrowing the
+    # Mode cannot leave stale chunks on disk.
+    #
+    # The MECHANISM changed after a user report: it used to call reindex_project
+    # (= delete_project_data + run_full_index), which purged the project and
+    # re-embedded everything — so widening docs -> general threw away perfectly
+    # good documentation embeddings and paid to recompute them.
+    # run_incremental_index is delete-aware too (deleted_paths = tracked - current)
+    # AND skips unchanged files, so it satisfies G1 without the waste.
     import threading
     from ragtools.service import app as app_module, routes as routes_mod
     import ragtools.service.activity as activity_mod
 
-    calls = {"reindex_project": 0, "run_full_index": 0}
+    calls = {"reindex_project": 0, "run_full_index": 0, "run_incremental_index": 0}
 
     class _FakeOwner:
         def reindex_project(self, project_id):
             calls["reindex_project"] += 1
             return {}
-        def run_full_index(self, project_id=None):
+        def run_full_index(self, project_id=None, progress=None):
             calls["run_full_index"] += 1
             return {}
+        def run_incremental_index(self, project_id=None):
+            calls["run_incremental_index"] += 1
+            return {"indexed": 0, "deleted": 0, "skipped": 0}
 
     app_module._owner = _FakeOwner()
     monkeypatch.setattr(activity_mod, "log_activity", lambda *a, **k: None)
@@ -321,8 +331,12 @@ def test_schedule_reindex_is_delete_aware(monkeypatch):
             self._fn()
 
     monkeypatch.setattr(threading, "Timer", _ImmediateTimer)
+    # No job runtime in this test -> the thread fallback path runs.
     routes_mod._schedule_reindex("p")
-    assert calls["reindex_project"] == 1
+    # Delete-aware AND non-destructive: incremental, never a purge-and-rebuild,
+    # and never the upsert-only full index (which would leave stale chunks).
+    assert calls["run_incremental_index"] == 1
+    assert calls["reindex_project"] == 0, "mode change must not purge the project"
     assert calls["run_full_index"] == 0
 
 

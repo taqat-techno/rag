@@ -47,3 +47,8 @@ audit-*.png
 test-*.png
 flow-*.png
 final-*.png
+
+# Local runtime markers / config backups (never part of a release)
+.qdrant-initialized
+*.toml.bak
+.playwright-mcp/

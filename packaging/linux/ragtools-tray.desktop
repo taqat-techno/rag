@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=RAG Tools Tray
+Comment=RAG Tools status icon
+# Installed to ~/.config/autostart/ ONLY when a desktop session is detectable.
+# A headless install is fully supported without it; registering one there would
+# fail at every login instead of simply not existing.
+Exec=rag tray
+Icon=ragtools
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true

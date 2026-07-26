@@ -232,7 +232,12 @@ Add this to your `.mcp.json` (project-level or `~/.claude/.mcp.json` for global)
 }
 ```
 
-If using the installed `.exe` version, the admin panel shows the exact config at **Settings → Connect to Claude**.
+If using the installed `.exe` version, point `"command"` at that executable. The running service
+computes the exact config for its own install:
+
+```bash
+curl -s http://127.0.0.1:21420/api/mcp-config
+```
 
 ### How It Works
 

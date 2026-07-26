@@ -38,13 +38,30 @@ def test_owner_initializes(owner):
 
 
 def test_owner_search_returns_results(owner):
-    results = owner.search("backend architecture Python FastAPI")
+    from ragtools.retrieval.scope import ScopeUnresolvedError
+
+    # Fail-closed (S1/A2): an unscoped owner search is REFUSED, never widened.
+    with pytest.raises(ScopeUnresolvedError):
+        owner.search("backend architecture Python FastAPI")
+
+    # An explicit scope still returns results (indexing + retrieval work).
+    results = owner.search(
+        "backend architecture Python FastAPI",
+        project_ids=["project_a", "project_b"],
+    )
     assert len(results) > 0
     assert results[0].score > 0
 
 
 def test_owner_search_formatted(owner):
-    data = owner.search_formatted("backend architecture")
+    from ragtools.retrieval.scope import ScopeUnresolvedError
+
+    with pytest.raises(ScopeUnresolvedError):
+        owner.search_formatted("backend architecture")
+
+    data = owner.search_formatted(
+        "backend architecture", project_ids=["project_a", "project_b"]
+    )
     assert "query" in data
     assert "results" in data
     assert "formatted" in data
@@ -58,8 +75,17 @@ def test_owner_search_with_project_filter(owner):
 
 
 def test_owner_search_no_results(owner):
-    results = owner.search("xyznonexistent12345")
+    # A scoped search with a nonsense query returns no results (not a refusal).
+    results = owner.search(
+        "xyznonexistent12345", project_ids=["project_a", "project_b"]
+    )
     assert len(results) == 0
+
+
+def test_owner_unscoped_search_can_opt_in_to_global(owner):
+    """The single sanctioned global path: explicit allow_unscoped."""
+    results = owner.search("backend architecture", allow_unscoped=True)
+    assert isinstance(results, list)  # runs globally, does not refuse
 
 
 def test_owner_get_status(owner):

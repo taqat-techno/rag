@@ -2,81 +2,140 @@
 {% block title %}Projects — RAG Tools{% endblock %}
 {% block header %}
 <h1 class="page-title">Projects</h1>
+<div class="page-subtitle">Folders indexed into the knowledge base</div>
+{% endblock %}
+{% block actions %}
+<button type="button" id="add-project-toggle" class="btn btn-primary btn-sm"
+        aria-expanded="false" aria-controls="add-project-panel">Add project</button>
 {% endblock %}
 {% block content %}
 
-<div class="card">
-    <div class="card-header">Add Project</div>
-    <details id="add-project-form">
-        <summary style="font-size:13.5px; cursor:pointer; color:var(--color-accent); font-weight:500;">
-            + New Project
-        </summary>
+<div class="stack">
+
+    <!-- Add Project — hidden until requested, so the page opens on the
+         thing people came to look at: the projects they already have. -->
+    <div class="card" id="add-project-panel" hidden>
+        <div class="card-header">Add project</div>
+        <p class="card-desc">
+            Point RAG Tools at a folder. Files are indexed in place — nothing is copied or uploaded.
+        </p>
         <form hx-post="/ui/projects/add" hx-target="#projects-list" hx-swap="innerHTML"
-              hx-indicator="#projects-overlay" hx-disabled-elt="find .btn"
-              style="margin-top: 14px;">
+              hx-indicator="#projects-overlay" hx-disabled-elt="find .btn">
             <div class="grid-2">
                 <div class="form-group">
-                    <label class="form-label">Project ID</label>
-                    <input type="text" name="id" class="form-input"
-                           placeholder="e.g., company-wiki" required
-                           pattern="[a-z0-9][a-z0-9_-]*">
-                    <small style="color: var(--color-text-muted);">Lowercase, hyphens/underscores OK. Used as internal identifier.</small>
+                    <label class="form-label" for="np-id">Project ID</label>
+                    <input type="text" name="id" id="np-id" class="form-input"
+                           placeholder="company-wiki" required pattern="[a-z0-9][a-z0-9_-]*">
+                    <small class="hint">Lowercase letters, numbers, hyphens and underscores. Used internally and in search filters.</small>
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Display Name</label>
-                    <input type="text" name="name" class="form-input" placeholder="e.g., Company Wiki">
-                    <small style="color: var(--color-text-muted);">Optional. Defaults to ID.</small>
+                    <label class="form-label" for="np-name">Display name</label>
+                    <input type="text" name="name" id="np-name" class="form-input" placeholder="Company Wiki">
+                    <small class="hint">Optional. Defaults to the project ID.</small>
                 </div>
             </div>
             <div class="form-group">
-                <label class="form-label">Folder Path</label>
-                <input type="text" name="path" class="form-input"
+                <label class="form-label" for="np-path">Folder path</label>
+                <input type="text" name="path" id="np-path" class="form-input"
                        placeholder="C:\path\to\project\folder" required>
             </div>
-            <details style="margin-top: 4px;">
-                <summary style="font-size:13px; color:var(--color-text-secondary); cursor:pointer;">
-                    Ignore Patterns
-                </summary>
-                <div style="margin-top:8px;">
-                    <div style="font-size:12px; color:var(--color-text-muted); margin-bottom:6px;">
-                        <strong style="color:var(--color-text-secondary);">Always ignored:</strong>
-                        <span style="font-family:monospace; font-size:11px;">
-                            .git/ &middot; .venv/ &middot; node_modules/ &middot; __pycache__/ &middot; dist/ &middot; build/ &middot; .cache/ &middot; .claude/ &middot; CLAUDE.md &middot; *.pyc
-                        </span>
-                    </div>
-                    <div class="form-group" style="margin-top:4px;">
-                        <label class="form-label" style="font-size:12px;">Additional patterns for this project</label>
-                        <textarea name="ignore_patterns" rows="3" class="form-textarea"
+            <div class="form-group">
+                <label class="form-label" for="np-mode">Mode</label>
+                <select name="mode" id="np-mode" class="form-select">
+                    <option value="docs" selected>Docs — Markdown, text and README files</option>
+                    <option value="code">Code — source and config files</option>
+                    <option value="general">General — both docs and code</option>
+                </select>
+                <small class="hint">Files that carry secrets (.env, keys, credentials) are never indexed, whichever you pick.</small>
+            </div>
+            <details class="disclosure-action">
+                <summary>Ignore patterns</summary>
+                <div>
+                    <p class="hint">
+                        Always ignored:
+                        <code>.git/</code> <code>.venv/</code> <code>node_modules/</code>
+                        <code>__pycache__/</code> <code>dist/</code> <code>build/</code>
+                        <code>.cache/</code> <code>.claude/</code> <code>CLAUDE.md</code> <code>*.pyc</code>
+                    </p>
+                    <div class="form-group">
+                        <label class="form-label" for="np-ignore">Additional patterns for this project</label>
+                        <textarea name="ignore_patterns" id="np-ignore" rows="3" class="form-textarea"
                                   placeholder="One pattern per line (gitignore syntax)"></textarea>
                     </div>
                 </div>
             </details>
-            <div class="form-group" style="margin-top: 12px;">
-                <label class="form-label">Mode</label>
-                <select name="mode" class="form-input">
-                    <option value="docs" selected>Docs — documentation / text / Markdown only</option>
-                    <option value="code">Code — source &amp; config files only</option>
-                    <option value="general">General — both docs and code</option>
-                </select>
-                <small style="color: var(--color-text-muted);">Choose what this project indexes. Secret-bearing files are always excluded.</small>
-            </div>
-            <div style="margin-top: 12px;">
-                <button type="submit" class="btn btn-primary">Add Project</button>
+            <p class="hint">
+                Uses a vendored framework? Add the project first, then pick its
+                <strong>shared dependencies</strong> from the catalog when you edit it —
+                that way you select from what already exists instead of retyping a path,
+                and two projects on the same framework share one copy.
+            </p>
+            <div class="card-footer">
+                <button type="submit" class="btn btn-primary btn-sm">Add project</button>
+                <button type="button" id="add-project-cancel" class="btn btn-ghost btn-sm">Cancel</button>
             </div>
         </form>
-    </details>
-</div>
+    </div>
 
-<div class="card">
-    <div class="card-header">Configured Projects</div>
-    <div style="position: relative;">
-        <div id="projects-list" hx-get="/ui/projects/list" hx-trigger="load" hx-swap="innerHTML">
-            <span class="loading-placeholder">Loading projects...</span>
-        </div>
-        <div id="projects-overlay" class="section-overlay">
-            <span class="overlay-spinner"></span>
+    <div class="card">
+        <div class="card-header">Shared dependencies</div>
+        <p class="card-desc">
+            Vendored frameworks indexed once and shared by every project that declares them.
+            Search returns them alongside your own code, labelled <code>framework</code>.
+        </p>
+        <div id="frameworks-list"
+             hx-get="/ui/frameworks"
+             hx-trigger="load, every 15s, rag-invalidate from:body, rag-job-done from:body"
+             hx-swap="innerHTML">
+            <span class="loading-placeholder">Loading shared dependencies…</span>
         </div>
     </div>
+
+    <div class="card">
+        <div class="card-header">Configured projects</div>
+        <div class="overlay-host">
+            <div id="projects-list" hx-get="/ui/projects/list" hx-trigger="load" hx-swap="innerHTML">
+                <span class="loading-placeholder">Loading projects…</span>
+            </div>
+            <div id="projects-overlay" class="section-overlay">
+                <span class="overlay-spinner"></span>
+            </div>
+        </div>
+    </div>
+
 </div>
+
+<script>
+// The "Add project" affordance lives in the page header, where every page
+// keeps its primary action. It reveals the panel below.
+(function () {
+    var toggle = document.getElementById('add-project-toggle');
+    var panel  = document.getElementById('add-project-panel');
+    var cancel = document.getElementById('add-project-cancel');
+    if (!toggle || !panel) return;
+
+    function setOpen(open) {
+        panel.hidden = !open;
+        toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (open) {
+            var first = panel.querySelector('input, select, textarea');
+            if (first) first.focus();
+        } else {
+            toggle.focus();
+        }
+    }
+    toggle.addEventListener('click', function () { setOpen(panel.hidden); });
+    if (cancel) cancel.addEventListener('click', function () { setOpen(false); });
+
+    // A successful add closes the panel — the new row is already on screen.
+    document.body.addEventListener('htmx:afterRequest', function (e) {
+        var path = (e.detail.pathInfo && e.detail.pathInfo.requestPath) || '';
+        if (path === '/ui/projects/add' && e.detail.successful && !panel.hidden) {
+            panel.querySelector('form').reset();
+            setOpen(false);
+        }
+    });
+})();
+</script>
 
 {% endblock %}

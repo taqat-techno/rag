@@ -440,7 +440,7 @@ For dev mode (source install with `pip install -e .`):
 }
 ```
 
-For packaged install, the admin panel at **Settings → Connect to Claude** displays the exact config pointing to the installed `rag.exe`. This is computed dynamically in `routes.py` → `mcp_config()` using `sys.frozen` detection.
+For a packaged install, `GET /api/mcp-config` returns the exact config pointing at the installed `rag.exe`. It is computed dynamically in `routes.py` → `mcp_config()` using `sys.frozen` detection. (The admin panel no longer renders this snippet — the endpoint remains the source of truth.)
 
 Valid locations for `.mcp.json`:
 

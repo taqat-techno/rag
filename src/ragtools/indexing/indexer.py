@@ -15,6 +15,7 @@ from qdrant_client.models import (
     Distance,
     Filter,
     FieldCondition,
+    MatchAny,
     MatchValue,
     PointStruct,
     VectorParams,
@@ -34,14 +35,41 @@ if TYPE_CHECKING:
     from ragtools.ignore import IgnoreRules
 
 
-def ensure_collection(client: QdrantClient, name: str, dim: int) -> None:
-    """Create the collection if it doesn't exist.
+def assert_collection_model_compatible(client: QdrantClient, name: str, expected_dim: int) -> None:
+    """Refuse an existing collection whose vector dimension != the current model's.
 
-    Uses cosine distance and the specified vector dimension.
-    Skips creation if the collection already exists.
+    A5 / §11.4: model metadata is enforced on every open. Qdrant records the
+    vector dimension, so a collection built under a different model is caught
+    here — before it returns silently-meaningless cosine scores — rather than
+    discovered later. Best-effort: if the dimension can't be read (missing
+    collection, unexpected shape), never raise a FALSE refusal.
+    """
+    try:
+        vectors = client.get_collection(name).config.params.vectors
+        actual_dim = getattr(vectors, "size", None)
+    except Exception:
+        return
+    if actual_dim is not None and actual_dim != expected_dim:
+        from ragtools.embedding.backend import ModelMismatchError
+
+        raise ModelMismatchError(
+            f"collection {name!r} was built with vector dimension {actual_dim}, "
+            f"but the current model produces {expected_dim}. Re-index under the "
+            "current model or open the correct collection — the stored vectors "
+            "are not comparable."
+        )
+
+
+def ensure_collection(client: QdrantClient, name: str, dim: int) -> None:
+    """Create the collection if it doesn't exist; else verify it's compatible.
+
+    Uses cosine distance and the specified vector dimension. If the collection
+    already exists, its stored dimension must match ``dim`` (A5 refusal on a
+    model mismatch) — it is not silently reused under the wrong model.
     """
     existing = [c.name for c in client.get_collections().collections]
     if name in existing:
+        assert_collection_model_compatible(client, name, dim)
         return
 
     client.create_collection(
@@ -154,9 +182,62 @@ def delete_file_points(
     )
 
 
+#: Paths per delete request. Each `client.delete` is one HTTP round-trip to a
+#: managed/external server, and Windows' default dynamic port range is only
+#: 16,384 with sockets held in TIME_WAIT afterwards — so deleting one file per
+#: request exhausts the range on a large project. Chunked (rather than one
+#: unbounded request) to keep the filter body a sane size.
+_DELETE_BATCH = 256
+
+
+def delete_files_points(
+    client: QdrantClient,
+    collection_name: str,
+    file_paths,
+) -> int:
+    """Delete every point belonging to ANY of ``file_paths``. Returns the count.
+
+    The batched form of :func:`delete_file_points`. Re-indexing 38,286 files
+    made 38,286 delete calls and died with ``WinError 10048`` (and, once the
+    range was under pressure, ``WinError 10053``); this turns the same work into
+    roughly ``len(paths) / 256`` requests.
+    """
+    paths = [p for p in dict.fromkeys(file_paths) if p]   # de-dupe, keep order
+    if not paths:
+        return 0
+    for i in range(0, len(paths), _DELETE_BATCH):
+        window = paths[i : i + _DELETE_BATCH]
+        client.delete(
+            collection_name=collection_name,
+            points_selector=Filter(
+                must=[FieldCondition(key="file_path", match=MatchAny(any=window))]
+            ),
+        )
+    return len(paths)
+
+
 def hash_file(file_path: Path) -> str:
     """Compute SHA256 hash of a file."""
     return hashlib.sha256(file_path.read_bytes()).hexdigest()
+
+
+def apply_source_class_and_redaction(chunks, relative_path: str):
+    """Assign ``source_class`` and redact secret VALUES in-place — the ONE
+    authoritative indexing hygiene step (S1/A1).
+
+    ``index_file`` (CLI / watcher / rebuild) and ``QdrantOwner`` (service) both
+    call this, so a secret value can never be embedded or stored, and every
+    point carries a real source class rather than the model default ``owned``.
+    """
+    from ragtools.source_class import classify_source_class
+    from ragtools.secret_scan import redact_text
+
+    sc = classify_source_class(relative_path)
+    for chunk in chunks:
+        chunk.source_class = sc
+        chunk.text = redact_text(chunk.text)
+        chunk.raw_text = redact_text(chunk.raw_text)
+    return chunks
 
 
 def index_file(
@@ -195,19 +276,9 @@ def index_file(
     if not chunks:
         return 0
 
-    # Tag every chunk with its source class (owned / generated / ...). Dependency
-    # files are already excluded at scan time, so indexed files are owned or
-    # generated; the label drives coverage reporting and ranking down-weight.
-    from ragtools.source_class import classify_source_class
-    from ragtools.secret_scan import redact_text
-    sc = classify_source_class(relative_path)
-    for chunk in chunks:
-        chunk.source_class = sc
-        # Content secret redaction: mask secret VALUES (keep key names) before the
-        # text is embedded or stored, so a key pasted into docs/source/config never
-        # reaches the vector or the Qdrant payload.
-        chunk.text = redact_text(chunk.text)
-        chunk.raw_text = redact_text(chunk.raw_text)
+    # Source-class + secret redaction — the ONE authoritative hygiene step,
+    # shared with the service (owner) index path so neither can be bypassed.
+    apply_source_class_and_redaction(chunks, relative_path)
 
     # Encode the enriched text (with heading prefix) for embedding
     texts = [chunk.text for chunk in chunks]
@@ -223,12 +294,16 @@ def run_full_index(
     settings: Settings | None = None,
     project_id: str | None = None,
     ignore_rules: IgnoreRules | None = None,
+    *,
+    client=None,
+    encoder=None,
 ) -> dict:
     """Run a full indexing pipeline (no state tracking, re-indexes everything).
 
     Args:
         settings: Configuration. Uses defaults if None.
         project_id: If provided, only index this project.
+        client/encoder: Injected for testing / dispatch reuse; created if None.
 
     Returns:
         dict with indexing statistics.
@@ -236,48 +311,74 @@ def run_full_index(
     if settings is None:
         settings = Settings()
 
-    client = settings.get_qdrant_client()
-    encoder = Encoder(settings.embedding_model)
+    from ragtools.collection_router import build_router
 
-    ensure_collection(client, settings.collection_name, encoder.dimension)
+    if client is None:
+        client = settings.get_qdrant_client()
+    if encoder is None:
+        encoder = Encoder(settings.embedding_model)
 
-    if ignore_rules is None:
-        from ragtools.ignore import IgnoreRules
-        ignore_rules = IgnoreRules(
-            content_root=settings.content_root,
-            global_patterns=settings.ignore_patterns,
-            use_ragignore=settings.use_ragignore_files,
-            secret_allowlist=settings.secret_allowlist,
-        )
+    router, _registry, _frameworks = build_router(settings)
+    try:
+        for name in router.all_collections():
+            ensure_collection(client, name, encoder.dimension)
 
-    files = scan_project(settings.content_root, project_id=project_id, ignore_rules=ignore_rules,
-                         include_code=getattr(settings, "index_source_code", False))
+        if ignore_rules is None:
+            from ragtools.ignore import IgnoreRules
+            ignore_rules = IgnoreRules(
+                content_root=settings.content_root,
+                global_patterns=settings.ignore_patterns,
+                use_ragignore=settings.use_ragignore_files,
+                secret_allowlist=settings.secret_allowlist,
+            )
 
-    stats = {
-        "files_indexed": 0,
-        "chunks_indexed": 0,
-        "projects": set(),
-    }
+        files = scan_project(settings.content_root, project_id=project_id,
+                             ignore_rules=ignore_rules,
+                             include_code=getattr(settings, "index_source_code", False))
 
-    for pid, file_path in files:
-        relative_path = get_relative_path(file_path, settings.content_root)
-        count = index_file(
-            client=client,
-            encoder=encoder,
-            collection_name=settings.collection_name,
-            project_id=pid,
-            file_path=file_path,
-            relative_path=relative_path,
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
-            secret_allowlist=tuple(settings.secret_allowlist),
-        )
-        stats["files_indexed"] += 1
-        stats["chunks_indexed"] += count
-        stats["projects"].add(pid)
+        stats = {
+            "files_indexed": 0,
+            "chunks_indexed": 0,
+            "projects": set(),
+        }
 
-    stats["projects"] = sorted(stats["projects"])
-    return stats
+        for pid, file_path in files:
+            relative_path = get_relative_path(file_path, settings.content_root)
+            collection = router.write_collection(pid)
+            ensure_collection(client, collection, encoder.dimension)
+            count = index_file(
+                client=client,
+                encoder=encoder,
+                collection_name=collection,
+                project_id=pid,
+                file_path=file_path,
+                relative_path=relative_path,
+                chunk_size=settings.chunk_size,
+                chunk_overlap=settings.chunk_overlap,
+                secret_allowlist=tuple(settings.secret_allowlist),
+            )
+            stats["files_indexed"] += 1
+            stats["chunks_indexed"] += count
+            stats["projects"].add(pid)
+
+        stats["projects"] = sorted(stats["projects"])
+        return stats
+    finally:
+        # The router owns SQLite handles; a leaked one keeps the .db locked.
+        router.close()
+
+
+# NOTE: ``index_by_strategy`` and ``run_per_project_index`` lived here as the
+# opt-in cutover seam. They are gone: both `run_full_index` and
+# `run_incremental_index` now resolve collections through
+# :class:`~ragtools.collection_router.CollectionRouter`, so per-project indexing
+# is not a separate pipeline to dispatch to — it is the same pipeline with a
+# different router answer.
+#
+# Keeping them would have meant two per-project indexers, and the second one was
+# strictly weaker: no state tracking (so no incremental and no delete
+# detection), no progress/cancellation, and no redaction or source-class
+# tagging. Anything that reached it silently lost those guarantees.
 
 
 def run_incremental_index(
@@ -304,11 +405,18 @@ def run_incremental_index(
     if settings is None:
         settings = Settings()
 
+    from ragtools.collection_router import build_router
+
     client = settings.get_qdrant_client()
     encoder = Encoder(settings.embedding_model)
     state = IndexState(settings.state_db)
 
-    ensure_collection(client, settings.collection_name, encoder.dimension)
+    # The CLI writes vectors too, so it resolves collections exactly the way the
+    # service does. Without this, `rag index` under a per-project config wrote
+    # everything into the shared collection and the results were invisible.
+    router, _registry, _frameworks = build_router(settings)
+    for name in router.all_collections():
+        ensure_collection(client, name, encoder.dimension)
 
     if ignore_rules is None:
         from ragtools.ignore import IgnoreRules
@@ -341,9 +449,23 @@ def run_incremental_index(
         "projects": set(),
     }
 
-    # Handle deleted files
+    # Handle deleted files. The state row names the owning project — and so the
+    # collection — so read it before `state.remove` drops the row.
+    # Group by destination first, so this is a handful of requests rather than
+    # one per removed file (see delete_files_points on why that matters).
+    _drop: dict[str, list[str]] = {}
     for del_path in deleted_paths:
-        delete_file_points(client, settings.collection_name, del_path)
+        record = state.get(del_path) or {}
+        del_pid = record.get("project_id")
+        try:
+            targets = [router.write_collection(del_pid)] if del_pid else router.all_collections()
+        except Exception:  # noqa: BLE001 — project deregistered: sweep everything
+            targets = router.all_collections()
+        for coll in targets:
+            _drop.setdefault(coll, []).append(del_path)
+    for coll, paths in _drop.items():
+        delete_files_points(client, coll, paths)
+    for del_path in deleted_paths:
         state.remove(del_path)
         stats["deleted"] += 1
 
@@ -356,13 +478,15 @@ def run_incremental_index(
             stats["skipped"] += 1
             continue
 
+        collection = router.write_collection(pid)
+        ensure_collection(client, collection, encoder.dimension)
         # File is new or changed — delete old chunks (if any), then re-index
-        delete_file_points(client, settings.collection_name, relative_path)
+        delete_file_points(client, collection, relative_path)
 
         count = index_file(
             client=client,
             encoder=encoder,
-            collection_name=settings.collection_name,
+            collection_name=collection,
             project_id=pid,
             file_path=file_path,
             relative_path=relative_path,
@@ -384,4 +508,6 @@ def run_incremental_index(
 
     stats["projects"] = sorted(stats["projects"])
     state.close()
+    # The router owns SQLite handles; a leaked one keeps the .db file locked.
+    router.close()
     return stats

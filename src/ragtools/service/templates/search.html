@@ -5,70 +5,102 @@
 {% endblock %}
 {% block content %}
 
-<div class="card">
-    <form hx-get="/ui/search" hx-target="#results" hx-swap="innerHTML" hx-indicator="#search-spinner">
-        <div class="form-row">
-            <div style="flex: 1 1 200px; min-width: 200px;">
-                <input type="text" name="query" class="form-input" placeholder="Enter your search query..." required autofocus>
+<div class="stack">
+
+    <div class="card">
+        <form hx-get="/ui/search" hx-target="#results" hx-swap="innerHTML" hx-indicator="#search-spinner">
+            <div class="form-row">
+                <div>
+                    <label class="sr-only" for="q">Search query</label>
+                    <input type="text" name="query" id="q" class="form-input"
+                           placeholder="What are you looking for?" required autofocus>
+                </div>
+                <div class="search-field">
+                    <label class="form-label" for="q-project">Project</label>
+                    <select name="project" id="q-project" class="form-select">
+                        <!-- Populated below. Deliberately no "All projects"
+                             option: scope resolution is fail-closed, so that
+                             choice was a dead end that always returned nothing. -->
+                        <option value="">Loading…</option>
+                    </select>
+                </div>
+                <div class="search-field search-field-sm">
+                    <label class="form-label" for="q-topk">Results</label>
+                    <input type="number" name="top_k" id="q-topk" class="form-input" value="10" min="1" max="50">
+                </div>
+                <button type="submit" class="btn btn-primary" hx-disabled-elt="this">Search</button>
             </div>
-            <div style="width: 160px; flex-shrink: 0;">
-                <select name="project" class="form-select">
-                    <option value="">All projects</option>
-                </select>
-            </div>
-            <div style="width: 80px; flex-shrink: 0;">
-                <input type="number" name="top_k" class="form-input" value="10" min="1" max="50">
-            </div>
-            <button type="submit" class="btn btn-primary" hx-disabled-elt="this" style="flex-shrink: 0;">Search</button>
+            <span id="search-spinner" class="htmx-indicator">Searching…</span>
+        </form>
+    </div>
+
+    <div id="results">
+        <div class="empty-state">
+            <p class="empty-state-title">Search your knowledge base</p>
+            <p class="empty-state-body">
+                Enter a search query above to find relevant content in an indexed project.
+            </p>
         </div>
-        <span id="search-spinner" class="htmx-indicator" style="margin-top: 10px;">Searching...</span>
-    </form>
+    </div>
+
 </div>
 
 <script>
-    // Populate project dropdown from configured projects (v2) with v1 fallback
-    fetch('/api/projects/configured').then(r => {
-        if (!r.ok) throw new Error('Not available');
-        return r.json();
-    }).then(data => {
-        const sel = document.querySelector('select[name=project]');
-        (data.projects || []).filter(p => p.enabled).forEach(p => {
-            const opt = document.createElement('option');
-            opt.value = p.id;
-            opt.textContent = p.name || p.id;
+// Populate the project selector from configured projects (v2), falling back
+// to indexed projects (v1) if the configured endpoint isn't available.
+//
+// Search scope is fail-closed: a query with no project resolves to nothing.
+// So the selector never offers an "all" option — it offers the projects that
+// can actually answer, and says so plainly when there are none.
+(function () {
+    var sel = document.querySelector('select[name=project]');
+
+    function fill(options) {
+        while (sel.firstChild) sel.removeChild(sel.firstChild);
+        if (!options.length) {
+            var none = document.createElement('option');
+            none.value = '';
+            none.textContent = 'No projects indexed yet';
+            sel.appendChild(none);
+            sel.disabled = true;
+            return;
+        }
+        options.forEach(function (o) {
+            var opt = document.createElement('option');
+            opt.value = o.value;
+            opt.textContent = o.label;
             sel.appendChild(opt);
         });
-    }).catch(() => {
-        // Fallback for v1 or service not running
-        fetch('/api/projects').then(r => r.json()).then(data => {
-            const sel = document.querySelector('select[name=project]');
-            (data.projects || []).forEach(p => {
-                const opt = document.createElement('option');
-                opt.value = p.project_id;
-                opt.textContent = p.project_id;
-                sel.appendChild(opt);
-            });
-        }).catch(() => {});
-    });
-</script>
-
-<div id="results">
-    <div style="text-align:center; padding:48px 20px; color:var(--color-text-muted);">
-        <p style="font-size:18px; margin-bottom:6px;">Search your knowledge base</p>
-        <p style="font-size:13px;">Enter a query above to find relevant content across all indexed projects.</p>
-    </div>
-</div>
-
-<script>
-    // Auto-fill and search if query parameter is in URL (from dashboard quick search)
-    var params = new URLSearchParams(window.location.search);
-    var q = params.get('query');
-    if (q) {
-        var input = document.querySelector('input[name=query]');
-        input.value = q;
-        // Trigger htmx search after a short delay (let project dropdown populate)
-        setTimeout(function() { htmx.trigger(input.closest('form'), 'submit'); }, 300);
+        sel.disabled = false;
+        maybeAutoSearch();
     }
+
+    fetch('/api/projects/configured').then(function (r) {
+        if (!r.ok) throw new Error('Not available');
+        return r.json();
+    }).then(function (data) {
+        fill((data.projects || []).filter(function (p) { return p.enabled; })
+            .map(function (p) { return {value: p.id, label: p.name || p.id}; }));
+    }).catch(function () {
+        // Fallback for v1 or a service that is still starting.
+        fetch('/api/projects').then(function (r) { return r.json(); }).then(function (data) {
+            fill((data.projects || []).map(function (p) {
+                return {value: p.project_id, label: p.project_id};
+            }));
+        }).catch(function () { fill([]); });
+    });
+
+    // Arriving from the dashboard quick-search: run it once the selector is
+    // populated, so the request carries a resolvable scope.
+    var pending = new URLSearchParams(window.location.search).get('query');
+    function maybeAutoSearch() {
+        if (!pending) return;
+        var input = document.getElementById('q');
+        input.value = pending;
+        pending = null;
+        htmx.trigger(input.closest('form'), 'submit');
+    }
+})();
 </script>
 
 {% endblock %}

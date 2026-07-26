@@ -86,8 +86,10 @@ def ensure_aumid_registered() -> bool:
     global _AUMID_REGISTERED
     if _AUMID_REGISTERED:
         return True
-    if sys.platform != "win32":
-        _AUMID_REGISTERED = True  # avoid re-entry on non-Windows
+    from ragtools.platform import current_platform
+
+    if current_platform() != "windows":
+        _AUMID_REGISTERED = True  # avoid re-entry off Windows
         return True
 
     try:
@@ -190,10 +192,21 @@ class _MacBackend:
 
 
 def default_backend() -> ToastBackend:
-    """Pick the backend appropriate for the current platform."""
-    if sys.platform == "win32":
+    """Pick the backend appropriate for the current platform.
+
+    Linux has no single notification mechanism worth depending on here, so it
+    lands on the logging backend: a message in the log beats a hard dependency
+    on a desktop stack the machine may not have.
+    """
+    from ragtools.platform import PlatformUnsupported, current_platform
+
+    try:
+        name = current_platform()
+    except PlatformUnsupported:
+        return _LoggingBackend()
+    if name == "windows":
         return _WindowsBackend()
-    if sys.platform == "darwin":
+    if name == "darwin":
         return _MacBackend()
     return _LoggingBackend()
 
@@ -420,7 +433,7 @@ def _boot_marker_path(settings: Settings) -> Path:
     Lives under the data dir so it survives service restarts but is wiped
     by ``rag reset --data`` and by full uninstall.
     """
-    return Path(settings.qdrant_path).parent / "boot_marker.json"
+    return Path(settings.data_dir) / "boot_marker.json"
 
 
 def _read_last_boot(settings: Settings) -> float:

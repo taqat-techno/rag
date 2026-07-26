@@ -13,10 +13,34 @@ Local-first RAG system over documentation, with **opt-in** source-code and confi
 ## Architecture Decisions (Non-Negotiable)
 
 ### Storage
-- **Qdrant local mode only** — `QdrantClient(path="./data/qdrant")`, never `host=`/`port=`
-- **One collection** named `markdown_kb` for all projects
-- **Project isolation via payload filter** — `project_id` field on every point, keyword index
-- **SQLite for state tracking** — `data/index_state.db`, not JSON files
+- **`storage_backend`** selects the engine: `embedded` (default) | `managed` | `external`.
+  - `embedded` — `QdrantClient(path=...)`. An in-process **pure-Python** engine:
+    brute-force scan (no HNSW), payload indexes are a silent no-op, snapshots
+    raise, one exclusive process lock. Qdrant's own guidance caps it at ~20,000
+    points, and that ceiling is a property of *this engine*.
+  - `managed` — ragtools supervises a **pinned native `qdrant.exe`** (1.15.5) on
+    127.0.0.1, no Docker. Real HNSW, real payload indexes, concurrent readers.
+    Set `qdrant_binary` or drop the executable in `<data_dir>/bin`.
+  - `external` — a server you run yourself (`storage_url`).
+  Never guess: an unknown mode raises rather than downgrading silently, and a
+  missing managed binary falls back to embedded **with the reason surfaced** on
+  `/health`.
+- **`collection_strategy`** selects the layout: `shared` (default) | `per_project`.
+  - `shared` — one collection named `markdown_kb`, project isolation by payload
+    filter (`project_id` on every point). The v2 model, unchanged.
+  - `per_project` — one collection per project, named from the project's
+    **immutable UUID** (`proj_<uuid>`) so it survives rename *and* path moves,
+    plus one shared corpus per framework build (`fw_<slug>_<digest>`). A scoped
+    query reads only that project's collection and the framework corpora it
+    links — another project's vectors are **never queried**, which makes
+    isolation a boundary rather than a filter.
+- **Which collection(s) a call touches is decided in ONE place** —
+  `collection_router.CollectionRouter`. Never read `settings.collection_name`
+  directly in new code; ask the router. (Before it existed, that decision was
+  re-made at 38 sites across 11 files.)
+- **SQLite for state tracking** — `data/index_state.db`, not JSON files.
+  Project/framework identity lives in `data/registry.db` and
+  `data/frameworks.db`, opened only in `per_project` mode.
 - **All persistent state in `data/`** — delete it to start fresh
 
 ### Embeddings
@@ -114,7 +138,15 @@ python scripts/eval_retrieval.py --questions tests/fixtures/eval_questions.json 
 
 - Do NOT add LangChain or LlamaIndex — we use libraries directly
 - Do NOT use JSON files for state — use SQLite
-- Do NOT create multiple Qdrant collections — one collection, payload filtering
+- Do NOT hard-code a collection name — resolve it through `CollectionRouter`.
+  (Multiple collections are now a supported layout under
+  `collection_strategy="per_project"`; `shared` remains the default and behaves
+  exactly as before.)
+- Do NOT add a second indexing pipeline for a new layout. `run_full_index` /
+  `run_incremental_index` are the only indexers; a layout changes the router's
+  answer, not the pipeline. (A parallel per-project indexer existed briefly and
+  was removed: it silently lacked state tracking, incremental runs, delete
+  detection, progress/cancellation, and secret redaction.)
 - Do NOT change the embedding model without planning a full rebuild
 - Do NOT suggest Docker, containers, server-mode Qdrant, cloud services, or hosted solutions
 - Do NOT add cross-encoder reranking, hybrid search, or SPLADE — these are post-MVP. (The lightweight **priority reranker** in `retrieval/rerank.py` is allowed — it only adds a small additive bonus by `chunk_type`; it does not re-embed or call a second model.)
@@ -241,6 +273,71 @@ All settings in `config.py` via Pydantic Settings. Override with env vars prefix
 | `RAG_STATE_DB` | `data/index_state.db` | SQLite state path |
 | `RAG_INDEX_SOURCE_CODE` | `false` | Global default: also index source code + config/data, not just docs. Overridable **per-project** ("dev mode") via the admin panel, `rag project dev-mode <id> on/off/inherit`, or the `set_project_dev_mode` MCP tool — stored as `ProjectConfig.index_source_code` (None=inherit / True=code / False=docs). |
 | `RAG_SECRET_ALLOWLIST` | `[]` | Globs to re-include specific secret-bearing files (default: none) |
+
+### Shared dependencies (catalog + per-project links)
+
+A project that vendors a framework is mostly not its own code. A **shared
+dependency** is a first-class object: declare the folder **once** in the
+catalog, then **select** it from every project that uses it. It is indexed once
+into a shared collection instead of copied into each project.
+
+Manage it on the **Shared dependencies** page (`/dependencies`); select entries
+per project under Projects → edit → *Shared dependencies*. In config:
+
+```toml
+[[dependencies]]                       # the catalog — declared once
+id = "odoo-18"
+name = "Odoo 18 core"
+path = "C:\\TQ-WorkSpace\\odoo\\pearl-pixels-18\\odoo"   # absolute
+
+[[projects]]
+id = "khayrgate"
+dependencies = ["odoo-18"]             # links, by id — many projects, one entry
+```
+
+**Two kinds of validity, deliberately separate.** *Catalog* validity (is it a
+folder; is it already registered under another id?) is project-independent.
+*Link* validity (may THIS project use it?) is not — a folder that is one
+project's own root, or a parent of it, is a legal catalog entry and an illegal
+link for that project. The project form shows those entries disabled **with the
+reason** rather than hiding them.
+
+**`dependency_paths` is a legacy input.** It still loads, and is adopted into
+catalog entries + links at load time — then *consumed* (like
+`index_source_code` → `mode`), so it never becomes a dead control whose
+clearing silently does nothing. Two projects that declared the same folder
+collapse to one entry: the dedup the old model reached only by luck.
+
+**Indexed once means once.** A corpus that any project already links is reused,
+not re-imported — `sync_frameworks(refresh=True)` forces a fresh import. The
+completeness signal is the *link*, not a point count: linking happens strictly
+after a successful import, so an interrupted run (points present, no link) is
+correctly re-imported rather than stranded half-indexed.
+
+**MCP:** `list_dependencies`, `add_dependency`, `set_project_dependencies`
+(REPLACES the list), `remove_dependency` (confirm token + `cascade`). All are in
+the `framework_management` capability group.
+
+* **Off unless declared.** Empty for every project by default; nothing changes
+  until someone opts in.
+* **Requires `collection_strategy = "per_project"`** — a no-op in `shared` mode.
+* **Declaring is a three-part move, all or nothing** (`owner.sync_frameworks`):
+  the tree is excluded from the project scan, indexed into its own collection,
+  and purged from the project's. The scanner excludes it *first*, so skipping
+  the sync would delete the content from search entirely — every write path that
+  touches `dependency_paths` must schedule `sync_frameworks`.
+* **Un-declaring reconciles in reverse**: unlink, drop the corpus once no
+  project links it (refused while one still does), re-index the project so the
+  files return.
+* **Identity.** Deduped by build identity — `build_id` when a detector finds one
+  (Odoo `repos_heads`, git HEAD, npm, Python), otherwise by **resolved path**.
+  Never by directory name: two projects each vendoring `<project>/odoo` would
+  otherwise share one collection and read each other's code.
+* **Rejected declarations:** the project root, any ancestor of it, and missing
+  paths. Nested declarations collapse to the outermost.
+* Search spans the project's own collection plus its linked corpora, and every
+  result carries `scope` (`project` | `framework`) and `scope_source`.
+* Framework corpora are **not** watcher-refreshed — they update on the next sync.
 
 ## Upgrade notes (2.6)
 

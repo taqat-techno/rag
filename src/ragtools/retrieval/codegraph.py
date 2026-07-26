@@ -76,12 +76,23 @@ def _lexical_definitions(searcher, sym: str, project_id: str | None, top_k: int)
         FieldCondition(key="exports", match=MatchAny(any=[sym])),
     ]
     flt = Filter(must=must or None, should=should)
-    try:
-        points, _ = searcher.client.scroll(
-            collection_name=searcher.settings.collection_name,
-            scroll_filter=flt, with_payload=True, limit=max(top_k, 50),
-        )
-    except Exception:
+    # `collections` is supplied by the owner under the per-project model; a
+    # symbol may be defined in the project OR in a framework it references, so
+    # both are scrolled.
+    targets = getattr(searcher, "definition_collections", None) or [
+        searcher.settings.collection_name
+    ]
+    points = []
+    for collection in targets:
+        try:
+            found, _ = searcher.client.scroll(
+                collection_name=collection,
+                scroll_filter=flt, with_payload=True, limit=max(top_k, 50),
+            )
+        except Exception:
+            continue
+        points.extend(found)
+    if not points:
         return []
 
     out = [_def_dict(p.payload or {}, _classify_match(p.payload or {}, sym)) for p in points]

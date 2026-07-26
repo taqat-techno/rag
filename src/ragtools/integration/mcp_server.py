@@ -66,6 +66,7 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from ragtools.config import Settings
+from ragtools.retrieval.scope import ScopeUnresolvedError, resolve_scope
 from ragtools.integration.mcp_common import (
     McpState,
     WriteCooldown,
@@ -73,6 +74,7 @@ from ragtools.integration.mcp_common import (
     ok,
     proxy_delete,
     proxy_get,
+    proxy_put,
     proxy_post,
     require_proxy,
 )
@@ -183,10 +185,18 @@ def _initialize() -> None:
             else:
                 client = _settings.get_qdrant_client()
                 try:
-                    collections = [c.name for c in client.get_collections().collections]
-                    if _settings.collection_name not in collections:
+                    present = {c.name for c in client.get_collections().collections}
+                    # Under the per-project model there is no single collection
+                    # to look for: readiness means at least one of the routed
+                    # collections exists. Checking only `collection_name` would
+                    # report a fully indexed per-project install as "not found".
+                    from ragtools.collection_router import build_router
+                    router, _reg, _fw = build_router(_settings)
+                    expected = router.all_collections()
+                    if expected and not (present & set(expected)):
+                        missing = ", ".join(expected[:3]) + ("…" if len(expected) > 3 else "")
                         _init_error = (
-                            f"Collection '{_settings.collection_name}' not found. "
+                            f"No indexed collection found (expected {missing}). "
                             "Run `rag index <path>` to create the index."
                         )
                 finally:
@@ -253,6 +263,11 @@ def _register_ops_tools() -> None:
         ("set_project_mode",            set_project_mode),
         ("add_project_ignore_rule",     add_project_ignore_rule),
         ("remove_project_ignore_rule", remove_project_ignore_rule),
+        # Phase 4 — shared dependencies (catalog + per-project links)
+        ("list_dependencies",           list_dependencies),
+        ("add_dependency",              add_dependency),
+        ("set_project_dependencies",    set_project_dependencies),
+        ("remove_dependency",           remove_dependency),
     ]
     registered = []
     for name, fn in tools:
@@ -622,7 +637,7 @@ def get_paths() -> dict:
     from pathlib import Path
     state = _ops_state or _fallback_state()
     s = state.settings
-    data_dir = Path(s.qdrant_path).parent.resolve()
+    data_dir = Path(s.data_dir).resolve()
     return ok(state, {
         "data_dir":       str(data_dir),
         "qdrant_path":    str(Path(s.qdrant_path).resolve()),
@@ -648,6 +663,70 @@ def system_health() -> dict:
                "system_health requires the service to be running.",
                code=_errcodes.SERVICE_DOWN,
                hint="Start the service with: rag service start")
+
+
+_profile_store_cache = None
+
+
+def _get_profile_store():
+    """The client-profile store (cached), or ``None`` if settings are unavailable.
+
+    Located at ``{data_dir}/profiles.db``. Only consulted when a client profile
+    is actually named (see :func:`_active_profile`), so the single-owner default
+    never creates or opens it.
+    """
+    global _profile_store_cache
+    if _profile_store_cache is not None:
+        return _profile_store_cache
+    try:
+        from pathlib import Path
+
+        from ragtools.profile_store import ProfileStore
+
+        settings = _settings or (getattr(_ops_state, "settings", None) if _ops_state else None)
+        if settings is None:
+            return None
+        _profile_store_cache = ProfileStore(str(Path(settings.data_dir) / "profiles.db"))
+        return _profile_store_cache
+    except Exception:
+        return None
+
+
+def _active_profile():
+    """Resolve the profile this MCP process serves.
+
+    ``RAG_CLIENT_PROFILE`` unset → the owner (all tools); set → that profile
+    loaded from the store (a named-but-absent id fails closed). Only opens the
+    store when a profile is actually named, so the default path is side-effect
+    free.
+    """
+    import os
+
+    from ragtools.integration.mcp_authz import resolve_active_profile
+
+    store = _get_profile_store() if os.environ.get("RAG_CLIENT_PROFILE") else None
+    return resolve_active_profile(store=store)
+
+
+def _ops_capability_error(tool: str):
+    """Server-side capability re-check for a dict-returning ops tool (S12/S13).
+
+    Returns an ``err(...)`` envelope if the active client profile may not use
+    ``tool``, else ``None``. Owner-default grants everything, so this is a no-op
+    for the single-owner setup; a retrieval-only profile is refused here before
+    any mutation.
+    """
+    from ragtools.authz import CapabilityDenied
+    from ragtools.integration.mcp_authz import require_capability
+
+    state = _ops_state or _fallback_state()
+    try:
+        require_capability(_active_profile(), tool)
+        return None
+    except CapabilityDenied as e:
+        return err(state, str(e), code=_errcodes.CAPABILITY_DENIED)
+    except ValueError as e:
+        return err(state, str(e), code=_errcodes.UNAUTHORIZED)
 
 
 def add_project(
@@ -681,6 +760,9 @@ def add_project(
         name:       Display name (defaults to ``project_id``).
         enabled:    Whether the project is immediately active (default True).
     """
+    _cap = _ops_capability_error("add_project")
+    if _cap is not None:
+        return _cap
     if _ops_state is None or _ops_state.mode != "proxy":
         return err(
             _ops_state or _fallback_state(),
@@ -732,6 +814,9 @@ def run_index(project: str) -> dict:
     Args:
         project: Project ID.
     """
+    _cap = _ops_capability_error("run_index")
+    if _cap is not None:
+        return _cap
     gate = _cooldown_guard("run_index")
     if gate is not None:
         return gate
@@ -757,6 +842,9 @@ def reindex_project(project: str, confirm_token: str) -> dict:
                        doesn't know the specific project name the user
                        is working on.
     """
+    _cap = _ops_capability_error("reindex_project")
+    if _cap is not None:
+        return _cap
     if confirm_token != project:
         return err(
             _ops_state or _fallback_state(),
@@ -793,6 +881,9 @@ def set_project_mode(project: str, mode: str, confirm_token: str = "") -> dict:
                        so a prompt-injected call can't blindly strip a project's
                        content. Not required for "general" (purely additive).
     """
+    _cap = _ops_capability_error("set_project_mode")
+    if _cap is not None:
+        return _cap
     if _ops_state is None or _ops_state.mode != "proxy":
         return err(
             _ops_state or _fallback_state(),
@@ -875,6 +966,164 @@ def remove_project_ignore_rule(project: str, pattern: str) -> dict:
                          params={"pattern": pattern})
     if result.get("ok"):
         _write_cooldown.mark("remove_project_ignore_rule")
+    return result
+
+
+# --- Shared dependencies (catalog + per-project links) ---------------------
+
+
+def list_dependencies() -> dict:
+    """List the shared-dependency catalog and which projects use each entry.
+
+    USE WHEN: before adding a dependency (it may already exist), before
+              linking one to a project, or to answer "is this framework
+              indexed and who shares it".
+    DO NOT USE: for content queries — this describes configuration, not
+                knowledge. To search a framework's code, just search the
+                project that links it.
+    """
+    _cap = _ops_capability_error("list_dependencies")
+    if _cap is not None:
+        return _cap
+    if _ops_state is None or _ops_state.mode != "proxy":
+        return err(_ops_state or _fallback_state(),
+                   "list_dependencies requires the service to be running.",
+                   code=_errcodes.SERVICE_DOWN,
+                   hint="Start the service with: rag service start")
+    return proxy_get(_ops_state, "/api/dependencies")
+
+
+def add_dependency(dependency_id: str, path: str, name: str | None = None) -> dict:
+    """Register a shared dependency (a vendored framework) in the catalog.
+
+    USE WHEN: the user names a folder that several projects share — a vendored
+              Odoo core, a checked-in SDK — and wants it indexed once rather
+              than once per project.
+    DO NOT USE: to add a PROJECT (use ``add_project``), or to make a project
+                use this (adding only registers it; call
+                ``set_project_dependencies`` to link it).
+
+    Adding indexes nothing on its own: a catalog entry is a declaration. The
+    corpus is built when the first project links it.
+
+    Args:
+        dependency_id: Short lowercase id projects will select by. Must be unique.
+        path:          ABSOLUTE path to the dependency's root folder. Never
+                       guess it — a catalog entry is shared by many projects,
+                       so it has no project to be relative to.
+        name:          Display name (defaults to the folder name).
+    """
+    _cap = _ops_capability_error("add_dependency")
+    if _cap is not None:
+        return _cap
+    if _ops_state is None or _ops_state.mode != "proxy":
+        return err(_ops_state or _fallback_state(),
+                   "add_dependency requires the service to be running — config "
+                   "writes cannot be persisted in direct mode.",
+                   code=_errcodes.SERVICE_DOWN,
+                   hint="Start the service with: rag service start")
+    if not (dependency_id or "").strip():
+        return err(_ops_state, "dependency_id cannot be empty.",
+                   code=_errcodes.INVALID_ARG)
+    if not (path or "").strip():
+        return err(_ops_state,
+                   "path cannot be empty. Pass the absolute folder path the "
+                   "user specified.",
+                   code=_errcodes.INVALID_ARG)
+    gate = _cooldown_guard("add_dependency")
+    if gate is not None:
+        return gate
+    result = proxy_post(_ops_state, "/api/dependencies", json={
+        "id": dependency_id.strip().lower(),
+        "path": path.strip(),
+        "name": (name or "").strip(),
+    })
+    if result.get("ok"):
+        _write_cooldown.mark("add_dependency")
+    return result
+
+
+def set_project_dependencies(project: str, dependencies: list[str]) -> dict:
+    """Set which catalog dependencies a project uses. REPLACES the whole list.
+
+    USE WHEN: the user wants a project to use (or stop using) shared
+              dependencies. Call ``list_dependencies`` first to get valid ids.
+    DO NOT USE: with a partial list intending to add one — this is a
+                REPLACEMENT. Pass every id the project should keep, or you
+                will unlink the rest.
+
+    Effects: linked folders are indexed once into a shared collection and left
+    out of the project's own; unlinking releases the corpus (dropping it when
+    no project uses it) and re-indexes the project so its files return.
+
+    Args:
+        project:      Project ID.
+        dependencies: Catalog ids the project should use. Pass ``[]`` to use none.
+    """
+    _cap = _ops_capability_error("set_project_dependencies")
+    if _cap is not None:
+        return _cap
+    if _ops_state is None or _ops_state.mode != "proxy":
+        return err(_ops_state or _fallback_state(),
+                   "set_project_dependencies requires the service to be running.",
+                   code=_errcodes.SERVICE_DOWN,
+                   hint="Start the service with: rag service start")
+    if not (project or "").strip():
+        return err(_ops_state, "project cannot be empty.", code=_errcodes.INVALID_ARG)
+    if dependencies is None:
+        return err(_ops_state,
+                   "dependencies must be a list of catalog ids — pass [] to "
+                   "clear them, never omit it.",
+                   code=_errcodes.INVALID_ARG)
+    gate = _cooldown_guard("set_project_dependencies")
+    if gate is not None:
+        return gate
+    result = proxy_put(_ops_state, f"/api/projects/{project.strip()}/dependencies",
+                       json={"dependencies": [str(d).strip() for d in dependencies if str(d).strip()]})
+    if result.get("ok"):
+        _write_cooldown.mark("set_project_dependencies")
+    return result
+
+
+def remove_dependency(dependency_id: str, confirm_token: str, cascade: bool = False) -> dict:
+    """Delete a catalog entry. Refused while projects use it unless cascade.
+
+    USE WHEN: the user no longer wants a shared dependency indexed at all.
+    DO NOT USE: to stop ONE project using it — that is
+                ``set_project_dependencies`` with the id omitted. Deleting the
+                entry affects every project that links it.
+
+    Args:
+        dependency_id: Catalog id to remove.
+        confirm_token: Must equal ``dependency_id`` exactly. Defeats a blind
+                       call, since this changes what several projects search.
+        cascade:       Unlink from every project first. Without it, a linked
+                       entry is refused so the effect is never a surprise.
+    """
+    _cap = _ops_capability_error("remove_dependency")
+    if _cap is not None:
+        return _cap
+    if _ops_state is None or _ops_state.mode != "proxy":
+        return err(_ops_state or _fallback_state(),
+                   "remove_dependency requires the service to be running.",
+                   code=_errcodes.SERVICE_DOWN,
+                   hint="Start the service with: rag service start")
+    if confirm_token != dependency_id:
+        return err(_ops_state,
+                   "remove_dependency requires confirm_token to equal the "
+                   "dependency id.",
+                   code=_errcodes.INVALID_ARG,
+                   hint=f"Pass confirm_token={dependency_id!r} to proceed.")
+    gate = _cooldown_guard("remove_dependency")
+    if gate is not None:
+        return gate
+    result = proxy_delete(
+        _ops_state,
+        f"/api/dependencies/{dependency_id.strip()}"
+        + ("?cascade=true" if cascade else ""),
+    )
+    if result.get("ok"):
+        _write_cooldown.mark("remove_dependency")
     return result
 
 
@@ -1100,8 +1349,16 @@ def _direct_dev_search(
     if error:
         return f"[RAG ERROR] {error}"
 
+    cap = _capability_error("search_project_context", False, query)
+    if cap is not None:
+        return cap
+
     client = None
     try:
+        # Fail-closed (S1/A2): dev-search bypasses the owner, so enforce scope
+        # here too — an unscoped/empty scope is refused, never widened.
+        resolve_scope(project, projects, allow_unscoped=False)
+
         from ragtools.retrieval.dev_pipeline import dev_search
         from ragtools.retrieval.formatter import format_dev_context
         from ragtools.retrieval.searcher import Searcher
@@ -1115,6 +1372,8 @@ def _direct_dev_search(
         )
         return format_dev_context(outcome.results, query, outcome.triggers,
                                   outcome.warnings, outcome.code_indexed)
+    except ScopeUnresolvedError as e:
+        return f"[RAG ERROR] SCOPE_UNRESOLVED: {e}"
     except Exception as e:
         logger.exception("dev-search failed")
         return f"[RAG ERROR] dev-search failed: {e}"
@@ -1141,6 +1400,11 @@ def _direct_find_definition(symbol: str, project: str | None, top_k: int) -> str
     error = _check_ready()
     if error:
         return f"[RAG ERROR] {error}"
+
+    cap = _capability_error("find_definition", False, symbol)
+    if cap is not None:
+        return cap
+
     client = None
     try:
         from ragtools.retrieval.codegraph import find_definitions
@@ -1231,6 +1495,34 @@ def _get_direct_client():
     return _settings.get_qdrant_client()
 
 
+def _capability_error(tool: str, structured: bool, query: str):
+    """Return an error envelope if the active profile may not use ``tool``, else ``None``.
+
+    Resolves the active client profile (owner by default — see
+    :func:`ragtools.integration.mcp_authz.resolve_active_profile`) and re-checks
+    the capability server-side. A refusal or a misconfigured profile becomes the
+    standard ``{context, results, meta.error_code}`` envelope.
+    """
+    from ragtools.authz import CapabilityDenied
+    from ragtools.integration.mcp_authz import require_capability
+
+    try:
+        require_capability(_active_profile(), tool)
+        return None
+    except CapabilityDenied as e:
+        code, detail = _errcodes.CAPABILITY_DENIED, str(e)
+    except ValueError as e:
+        code, detail = _errcodes.UNAUTHORIZED, str(e)
+    msg = f"[RAG ERROR] {code}: {detail}"
+    if structured:
+        return {
+            "context": msg,
+            "results": [],
+            "meta": {"query": query, "count": 0, "error_code": code},
+        }
+    return msg
+
+
 def _direct_search(
     query: str,
     project: str | None,
@@ -1249,6 +1541,14 @@ def _direct_search(
             }
         return f"[RAG ERROR] {error}"
 
+    # Server-side capability re-check (S12/S13 §24.2). With no profile configured
+    # the active profile is the owner (grants every tool), so this is a no-op for
+    # the single-owner default; a configured restricted profile is refused here
+    # regardless of what its tool list showed.
+    cap_err = _capability_error("search_knowledge_base", structured, query)
+    if cap_err is not None:
+        return cap_err
+
     client = None
     try:
         from ragtools.retrieval.formatter import format_context_compact
@@ -1263,6 +1563,9 @@ def _direct_search(
             project_ids=projects,
             top_k=top_k,
             score_threshold=_settings.score_threshold,
+            # Fail-closed (S1/A2): MCP-direct refuses an unscoped/empty scope
+            # just like the service path — no silent global search.
+            allow_unscoped=False,
         )
         context = format_context_compact(results, query)
         if structured:
@@ -1289,6 +1592,15 @@ def _direct_search(
                 },
             }
         return context
+    except ScopeUnresolvedError as e:
+        if structured:
+            return {
+                "context": f"[RAG ERROR] {e}",
+                "results": [],
+                "meta": {"query": query, "count": 0,
+                          "error_code": _errcodes.SCOPE_UNRESOLVED},
+            }
+        return f"[RAG ERROR] SCOPE_UNRESOLVED: {e}"
     except Exception as e:
         logger.exception("Search failed")
         if structured:
@@ -1312,29 +1624,39 @@ def _direct_list_projects() -> str:
     client = None
     try:
         client = _get_direct_client()
-        collection_name = _settings.collection_name
+        from ragtools.collection_router import build_router
+        router, _reg, _fw = build_router(_settings)
 
         # Count chunks per project so the output matches proxy-mode shape:
         # "Indexed projects (N):\n  - pid (F files, C chunks)".
+        # Every routed collection is scrolled: on a per-project install the
+        # projects live in separate collections, so scrolling only the shared
+        # one would list none of them.
         project_counts: dict[str, int] = {}
         project_files: dict[str, set[str]] = {}
-        offset = None
-        while True:
-            results, offset = client.scroll(
-                collection_name=collection_name,
-                limit=256,
-                offset=offset,
-                with_payload=["project_id", "file_path"],
-                with_vectors=False,
-            )
-            for point in results:
-                pid = point.payload.get("project_id")
-                if not pid:
-                    continue
-                project_counts[pid] = project_counts.get(pid, 0) + 1
-                fp = point.payload.get("file_path")
-                if fp:
-                    project_files.setdefault(pid, set()).add(fp)
+        for collection_name in router.all_collections():
+            offset = None
+            while True:
+                try:
+                    results, offset = client.scroll(
+                        collection_name=collection_name,
+                        limit=256,
+                        offset=offset,
+                        with_payload=["project_id", "file_path"],
+                        with_vectors=False,
+                    )
+                except Exception:  # noqa: BLE001 — collection not created yet
+                    break
+                for point in results:
+                    pid = point.payload.get("project_id")
+                    if not pid:
+                        continue
+                    project_counts[pid] = project_counts.get(pid, 0) + 1
+                    fp = point.payload.get("file_path")
+                    if fp:
+                        project_files.setdefault(pid, set()).add(fp)
+                if offset is None:
+                    break
             if offset is None:
                 break
 
@@ -1364,9 +1686,19 @@ def _direct_index_status() -> str:
     client = None
     try:
         client = _get_direct_client()
-        collection_name = _settings.collection_name
-        info = client.get_collection(collection_name)
-        count = info.points_count
+        from ragtools.collection_router import build_router
+        router, _reg, _fw = build_router(_settings)
+        names = router.all_collections()
+        # Aggregate across every routed collection — reading only the shared
+        # one reports 0 chunks on a per-project install.
+        count = 0
+        for name in names:
+            try:
+                count += int(client.get_collection(name).points_count or 0)
+            except Exception:  # noqa: BLE001 — a not-yet-created collection is 0
+                continue
+        collection_name = ", ".join(names) if len(names) > 1 else (
+            names[0] if names else _settings.collection_name)
 
         if count == 0:
             return (

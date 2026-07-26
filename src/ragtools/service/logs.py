@@ -35,7 +35,8 @@ def available_sources() -> list[str]:
 
 
 def _logs_dir(settings: Settings) -> Path:
-    return Path(settings.qdrant_path).parent / "logs"
+    # S2/A9: single authoritative anchor, not Path(qdrant_path).parent.
+    return Path(settings.data_dir) / "logs"
 
 
 def tail(settings: Settings, source: str, limit: int = 50) -> dict:

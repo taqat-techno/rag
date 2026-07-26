@@ -13,12 +13,12 @@ logger = logging.getLogger("ragtools.service")
 
 def get_pid_file_path(settings: Settings) -> Path:
     """Get the PID file path based on data directory."""
-    return Path(settings.qdrant_path).parent / "service.pid"
+    return Path(settings.data_dir) / "service.pid"
 
 
 def get_supervisor_pid_file_path(settings: Settings) -> Path:
     """PID file for the supervisor process (when supervised mode is used)."""
-    return Path(settings.qdrant_path).parent / "supervisor.pid"
+    return Path(settings.data_dir) / "supervisor.pid"
 
 
 def _read_supervisor_pid(settings: Settings) -> int | None:
@@ -49,22 +49,16 @@ def _read_pid_raw(settings: Settings) -> int | None:
 
 
 def _process_alive(pid: int) -> bool:
-    """Check if a process with the given PID is still running."""
-    if sys.platform == "win32":
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if handle:
-            kernel32.CloseHandle(handle)
-            return True
-        return False
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+    """Check if a process with the given PID is still running.
+
+    Delegates to the platform adapter, which additionally verifies the exit
+    code on Windows: `OpenProcess` alone succeeds for an ALREADY-EXITED process
+    while any handle to it remains open, so the previous check reported a dead
+    service as alive and `_read_pid` therefore kept a stale PID file.
+    """
+    from ragtools.platform import adapter
+
+    return adapter().pid_alive(pid)
 
 
 def _read_pid(settings: Settings) -> int | None:
@@ -155,13 +149,16 @@ def start_service(settings: Settings, supervise: bool = True) -> int:
     )
 
     # Log file
-    log_dir = Path(settings.qdrant_path).parent / "logs"
+    log_dir = Path(settings.data_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "service.log"
 
-    # Platform-specific process creation
+    # Detached, console-less child. The flags differ per platform and belong
+    # to the adapter; this call site only says "outlive me, show no window".
+    from ragtools.platform import current_platform
+
     kwargs = {}
-    if sys.platform == "win32":
+    if current_platform() == "windows":
         CREATE_NO_WINDOW = 0x08000000
         DETACHED_PROCESS = 0x00000008
         kwargs["creationflags"] = CREATE_NO_WINDOW | DETACHED_PROCESS
@@ -234,18 +231,15 @@ def stop_service(settings: Settings) -> bool:
 
 
 def _terminate_pid(pid: int) -> None:
-    """Platform-appropriate force-terminate of a single PID."""
-    if sys.platform == "win32":
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        PROCESS_TERMINATE = 0x0001
-        handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-        if handle:
-            kernel32.TerminateProcess(handle, 1)
-            kernel32.CloseHandle(handle)
-    else:
-        import signal
-        os.kill(pid, signal.SIGTERM)
+    """Force-terminate a single PID.
+
+    Only reached from `_force_kill`, so `force=True` on every platform. The
+    previous code hard-killed on Windows but sent SIGTERM on POSIX, meaning the
+    "force" path could not kill the hung process it exists to kill.
+    """
+    from ragtools.platform import adapter
+
+    adapter().terminate(pid, force=True)
 
 
 def _force_kill(settings: Settings) -> bool:

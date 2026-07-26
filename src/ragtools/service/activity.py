@@ -72,7 +72,25 @@ class ActivityLog:
 # Global singleton
 activity_log = ActivityLog()
 
+# Optional durable sink. The ring buffer above is explicitly ephemeral ("lost on
+# service restart"); registering a sink makes every EXISTING call site — indexer,
+# watcher, config, service, startup — also produce a durable event, with no
+# change at any call site. Registered by the service at startup.
+_event_sink = None
+
+
+def set_event_sink(sink) -> None:
+    """Register a durable sink: ``sink(level, source, message, details)``."""
+    global _event_sink
+    _event_sink = sink
+
 
 def log_activity(level: str, source: str, message: str, details: str | None = None) -> None:
     """Convenience function to emit an activity event from anywhere."""
     activity_log.emit(level, source, message, details)
+    if _event_sink is not None:
+        try:
+            _event_sink(level, source, message, details)
+        except Exception:  # noqa: BLE001 — logging must never break its caller
+            logging.getLogger("ragtools.activity").debug(
+                "durable event sink failed", exc_info=True)

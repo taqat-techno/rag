@@ -18,13 +18,13 @@ endpoint in the service.
 from __future__ import annotations
 
 import glob
-import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
 from ragtools.config import ProjectConfig
+from ragtools.identity import slugify_project_id
 
 
 class PlanKind(str, Enum):
@@ -96,21 +96,14 @@ def expand_glob(
 # ---------------------------------------------------------------------------
 
 
-_SLUG_INVALID = re.compile(r"[^a-z0-9-]")
-_SLUG_COLLAPSE = re.compile(r"-+")
-
-
 def slugify_id(text: str) -> str:
     """Turn a folder basename or display name into a project id.
 
-    Matches the same rules `rag project add` uses (lowercase, hyphen-only).
-    Returns "" if the text has no alphanumerics — the caller decides what
-    to do with an empty id.
+    Thin alias for the shared generator (:func:`ragtools.identity.slugify_project_id`)
+    so there is one slug rule, not a private copy. Same behavior: lowercase,
+    hyphen-only, collapse runs, strip edges; ``""`` when no alphanumerics.
     """
-    lowered = text.lower()
-    hyphenated = _SLUG_INVALID.sub("-", lowered)
-    collapsed = _SLUG_COLLAPSE.sub("-", hyphenated).strip("-")
-    return collapsed
+    return slugify_project_id(text)
 
 
 def _disambiguate(candidate: str, taken: Iterable[str]) -> str:

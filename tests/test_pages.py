@@ -94,9 +94,20 @@ def test_ui_search_empty(client):
 
 
 def test_ui_search_with_results(client):
-    r = client.get("/ui/search", params={"query": "backend architecture"})
+    r = client.get(
+        "/ui/search",
+        params={"query": "backend architecture", "project": "project_a"},
+    )
     assert r.status_code == 200
     assert "result" in r.text.lower()
+
+
+def test_ui_search_unscoped_prompts_for_project(client):
+    # Fail-closed (S1/A2): the panel guides the user to pick a project rather
+    # than silently searching every one.
+    r = client.get("/ui/search", params={"query": "backend architecture"})
+    assert r.status_code == 200
+    assert "select a project" in r.text.lower()
 
 
 def test_ui_index_incremental(client):
@@ -125,7 +136,9 @@ def test_projects_page_renders(client):
     r = client.get("/projects")
     assert r.status_code == 200
     assert "Projects" in r.text
-    assert "Add Project" in r.text
+    # Case-insensitive: the intent is "the page offers a way to add a project",
+    # not a particular capitalisation. Labels are sentence case product-wide.
+    assert "add project" in r.text.lower()
 
 
 def test_ui_projects_list_fragment(client):
@@ -140,7 +153,7 @@ def test_map_page_renders(client):
     r = client.get("/map")
     assert r.status_code == 200
     assert "map-canvas" in r.text
-    assert "Semantic Map" in r.text
+    assert "semantic map" in r.text.lower()
 
 
 def test_static_css(client):

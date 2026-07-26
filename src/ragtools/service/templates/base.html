@@ -9,6 +9,8 @@
     <script src="{{ asset_url('/static/htmx.min.js') }}"></script>
 </head>
 <body>
+    <a href="#main-content" class="skip-link">Skip to content</a>
+
     <aside class="sidebar">
         <div class="sidebar-brand">
             <img src="/static/logo.png" alt="TaqaTechno" class="brand-logo">
@@ -17,7 +19,7 @@
                 <span class="brand-product">RAG Tools</span>
             </div>
         </div>
-        <nav class="sidebar-nav">
+        <nav class="sidebar-nav" aria-label="Main">
             <div class="sidebar-group-label">Overview</div>
             <a href="/" class="sidebar-link {% if page == 'dashboard' %}active{% endif %}">Dashboard</a>
             <a href="/map" class="sidebar-link {% if page == 'map' %}active{% endif %}">Map</a>
@@ -25,32 +27,61 @@
 
             <div class="sidebar-group-label">Management</div>
             <a href="/projects" class="sidebar-link {% if page == 'projects' %}active{% endif %}">Projects</a>
+            <a href="/dependencies" class="sidebar-link {% if page == 'dependencies' %}active{% endif %}">Shared dependencies</a>
             <a href="/config" class="sidebar-link {% if page == 'config' %}active{% endif %}">Settings</a>
+            <a href="/diagnostics" class="sidebar-link {% if page == 'diagnostics' %}active{% endif %}">Diagnostics</a>
         </nav>
     </aside>
 
     <div class="main-content">
-        <!-- Crash banner: populated on every page load from /api/crash-history.
-             Stays hidden if there are no unreviewed crash markers. -->
+        <!-- Crash banner: refreshes so a crash occurring mid-session becomes
+             visible without a manual reload. -->
         <div id="crash-banner-slot"
              hx-get="/ui/crash-banner"
-             hx-trigger="load"
+             hx-trigger="load, every 60s, rag-invalidate from:body"
              hx-swap="innerHTML"></div>
 
-        <div class="content-header">
-            {% block header %}{% endblock %}
-        </div>
-        <div class="content-body">
-            {% block content %}{% endblock %}
+        <!-- Connection state: shown only when the service is unreachable. -->
+        <div id="rag-connection" class="conn-banner" role="status" aria-live="polite" hidden>
+            <span class="conn-dot"></span>
+            <span id="rag-connection-msg">Reconnecting to the RAG service…</span>
         </div>
 
-        <div id="activity-drawer" class="activity-drawer">
-            <div class="activity-bar" onclick="document.getElementById('activity-drawer').classList.toggle('open')">
-                <span>Activity</span>
-                <span class="activity-chevron">&#9650;</span>
+        <!-- Running background work. The service already emitted `job.progress`
+             over SSE and the client already re-dispatched it as a DOM event —
+             but nothing listened, so a 32,782-file dependency index looked
+             identical to nothing happening at all. -->
+        <div id="job-strip" class="job-strip" role="status" aria-live="polite" hidden>
+            <span class="job-strip-label" id="job-strip-label">Working…</span>
+            <div class="job-strip-track" role="progressbar"
+                 aria-valuemin="0" aria-valuemax="100" id="job-strip-track">
+                <div class="job-strip-bar" id="job-strip-bar"></div>
             </div>
+            <span class="job-strip-count" id="job-strip-count"></span>
+        </div>
+
+        <!-- Page header: title on the left, page-level actions on the right.
+             Sticky, so the reader keeps their anchor on long pages. -->
+        <header class="content-header">
+            <div>{% block header %}{% endblock %}</div>
+            <div class="page-actions">{% block actions %}{% endblock %}</div>
+        </header>
+        <main id="main-content" class="content-body">
+            {% block content %}{% endblock %}
+        </main>
+
+        <div id="activity-drawer" class="activity-drawer">
+            <button type="button" class="activity-bar" id="activity-toggle"
+                    aria-expanded="false" aria-controls="activity-panel">
+                <span>Activity log</span>
+                <span class="activity-chevron" aria-hidden="true">&#9650;</span>
+            </button>
             <div class="activity-panel" id="activity-panel"
-                 hx-get="/ui/activity" hx-trigger="every 15s" hx-swap="innerHTML">
+                 role="log" aria-live="polite" aria-label="Recent activity"
+                 hx-get="/ui/activity"
+                 hx-trigger="load, every 60s, rag-invalidate from:body"
+                 hx-vals='js:{after: window.ragActivityCursor || 0}'
+                 hx-swap="afterbegin">
             </div>
         </div>
     </div>
@@ -60,7 +91,11 @@
         <span id="global-processing-msg">Processing...</span>
     </div>
 
-    <div id="confirm-modal" class="confirm-overlay">
+    <!-- Toasts: the single visible surface for every failure. -->
+    <div id="rag-toasts" class="toast-stack" role="alert" aria-live="assertive" aria-atomic="true"></div>
+
+    <div id="confirm-modal" class="confirm-overlay" role="dialog" aria-modal="true"
+         aria-labelledby="confirm-msg" hidden>
         <div class="confirm-dialog">
             <p id="confirm-msg" class="confirm-message"></p>
             <div class="confirm-actions">
@@ -69,15 +104,53 @@
             </div>
         </div>
     </div>
+
     <script>
-    // Global processing guard for long operations
+    // ---------------------------------------------------------------
+    // Toasts — every failure becomes visible exactly once, here.
+    // ---------------------------------------------------------------
+    function ragToast(message, kind, sticky) {
+        var stack = document.getElementById('rag-toasts');
+        if (!stack) return;
+        var el = document.createElement('div');
+        el.className = 'toast toast-' + (kind || 'info');
+        var txt = document.createElement('span');
+        txt.className = 'toast-msg';
+        txt.textContent = message;
+        var close = document.createElement('button');
+        close.type = 'button';
+        close.className = 'toast-close';
+        close.setAttribute('aria-label', 'Dismiss');
+        close.textContent = '×';
+        close.onclick = function () { el.remove(); };
+        el.appendChild(txt);
+        el.appendChild(close);
+        stack.appendChild(el);
+        if (!sticky) setTimeout(function () { el.remove(); }, 8000);
+        return el;
+    }
+    window.ragToast = ragToast;
+
+    // Pull the server's error detail out of a JSON or HTML error body.
+    function ragErrorDetail(xhr) {
+        try {
+            var body = JSON.parse(xhr.responseText);
+            if (body && body.detail) {
+                return typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail);
+            }
+        } catch (e) { /* not JSON */ }
+        return '';
+    }
+
+    // ---------------------------------------------------------------
+    // Loading state
+    // ---------------------------------------------------------------
     document.body.addEventListener('htmx:beforeRequest', function(e) {
         var msg = e.detail.elt.getAttribute('data-processing-msg');
         if (msg) {
             document.getElementById('global-processing-msg').textContent = msg;
             document.getElementById('global-processing').classList.add('active');
         }
-        // Section overlay: show when hx-indicator points to a .section-overlay
         var indId = e.detail.elt.getAttribute('hx-indicator') || e.detail.elt.closest('[hx-indicator]')?.getAttribute('hx-indicator');
         if (indId) {
             var overlay = document.querySelector(indId);
@@ -88,30 +161,325 @@
         if (e.detail.elt.getAttribute('data-processing-msg')) {
             document.getElementById('global-processing').classList.remove('active');
         }
-        // Clear ALL active section overlays. Resolving the overlay from the
-        // triggering element's hx-indicator fails when that element was removed
-        // by an outerHTML swap (e.g. the Edit button replaced by the inline edit
-        // form), which left the overlay stuck 'active' and blocking later clicks.
+        // Clear ALL active section overlays — the triggering element may have
+        // been removed by an outerHTML swap, which used to leave the overlay
+        // stuck 'active' and blocking later clicks.
         document.querySelectorAll('.section-overlay.active').forEach(function(o) {
             o.classList.remove('active');
         });
+        if (e.detail.successful) ragConnected();
     });
 
-    // Custom confirm modal
-    document.body.addEventListener('htmx:confirm', function(e) {
-        if (!e.detail.question) return;
-        e.preventDefault();
-        var modal = document.getElementById('confirm-modal');
-        document.getElementById('confirm-msg').textContent = e.detail.question;
-        modal.classList.add('open');
-        document.getElementById('confirm-ok').onclick = function() {
-            modal.classList.remove('open');
-            e.detail.issueRequest(true);
-        };
-        document.getElementById('confirm-cancel').onclick = function() {
-            modal.classList.remove('open');
-        };
+    // ---------------------------------------------------------------
+    // NOTHING FAILS SILENTLY.
+    // htmx 2.x does not swap on 4xx/5xx; without these two listeners the
+    // target is left untouched and the user sees no change at all.
+    // ---------------------------------------------------------------
+    document.body.addEventListener('htmx:responseError', function(e) {
+        var xhr = e.detail.xhr || {};
+        var detail = ragErrorDetail(xhr);
+        var path = (e.detail.pathInfo && e.detail.pathInfo.requestPath) || '';
+        ragToast('Request failed (' + xhr.status + ')' + (path ? ' — ' + path : '') +
+                 (detail ? ': ' + detail : ''), 'error', true);
     });
+    document.body.addEventListener('htmx:sendError', function(e) {
+        ragDisconnected();
+        ragToast('Cannot reach the RAG service. It may be restarting.', 'error', true);
+    });
+    document.body.addEventListener('htmx:timeout', function() {
+        ragToast('The request timed out.', 'error', true);
+    });
+
+    // ---------------------------------------------------------------
+    // Connection state machine: connected / reconnecting / disconnected
+    // ---------------------------------------------------------------
+    var ragConnState = 'connected';
+    function ragSetConn(state, msg) {
+        if (ragConnState === state) return;
+        ragConnState = state;
+        var el = document.getElementById('rag-connection');
+        if (!el) return;
+        if (state === 'connected') {
+            el.hidden = true;
+        } else {
+            document.getElementById('rag-connection-msg').textContent = msg;
+            el.hidden = false;
+        }
+    }
+    function ragDisconnected() { ragSetConn('disconnected', 'Lost contact with the RAG service. Retrying…'); }
+    function ragConnected() {
+        if (ragConnState !== 'connected') {
+            ragSetConn('connected');
+            // We cannot know what changed while we were away — reconcile all.
+            ragInvalidate();
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Invalidation: one event, every registered region reacts.
+    // Regions opt in with:  hx-trigger="... rag-invalidate from:body"
+    // ---------------------------------------------------------------
+    // Debounced: during indexing the server emits events in bursts, and each
+    // one would otherwise refetch every registered region.
+    var _ragInvalidateTimer = null;
+    function ragInvalidate(immediate) {
+        if (immediate) {
+            document.body.dispatchEvent(new CustomEvent('rag-invalidate'));
+            return;
+        }
+        if (_ragInvalidateTimer) return;
+        _ragInvalidateTimer = setTimeout(function () {
+            _ragInvalidateTimer = null;
+            document.body.dispatchEvent(new CustomEvent('rag-invalidate'));
+        }, 1200);
+    }
+    window.ragInvalidate = ragInvalidate;
+
+    // Server-driven invalidation via  HX-Trigger: {"rag-invalidate": {...}}
+    document.body.addEventListener('rag-invalidate', function() { /* regions listen directly */ });
+
+    // Come back to the window (e.g. after using the CLI) -> reconcile.
+    document.addEventListener('visibilitychange', function() {
+        if (document.visibilityState === 'visible') ragInvalidate();
+    });
+    window.addEventListener('focus', function() { ragInvalidate(); });
+    window.addEventListener('online', function() { ragConnected(); });
+    window.addEventListener('offline', function() { ragDisconnected(); });
+
+    // ---------------------------------------------------------------
+    // Activity log cursor — the server has always accepted `after=`.
+    // ---------------------------------------------------------------
+    window.ragActivityCursor = 0;
+    document.body.addEventListener('rag-activity-cursor', function(e) {
+        var id = e.detail && (e.detail.id !== undefined ? e.detail.id : e.detail.value);
+        if (typeof id === 'number' && id > window.ragActivityCursor) window.ragActivityCursor = id;
+    });
+
+    // ---------------------------------------------------------------
+    // Event stream. The server pushes typed domain events over SSE; the
+    // client turns them into targeted invalidation. This is what makes a
+    // change from the CLI, an MCP client, the watcher, or another tab show
+    // up here without anyone pressing refresh.
+    //
+    // EventSource reconnects on its own and replays via Last-Event-ID, which
+    // the server maps onto the durable event cursor.
+    // ---------------------------------------------------------------
+    (function () {
+        if (!window.EventSource) return;          // fall back to polling
+        var es = null, retry = 0;
+
+        // Events that mean "visible state changed somewhere".
+        var INVALIDATING = /^(job\.completed|project\.changed|config\.changed|activity\.(warning|error|success))$/;
+
+        // A toast means "this just happened". On reconnect the durable log
+        // legitimately replays events this tab missed — but raising a failure
+        // from hours ago as a sticky red toast is not news, it is archaeology.
+        // Observed: three job failures from 1-3 hours earlier stacking up on a
+        // reconnect after a service restart, all long since diagnosed.
+        // Replayed events still INVALIDATE (the data really did change); they
+        // just do not shout.
+        var PAGE_OPENED_AT = Date.now();
+        var TOAST_GRACE_MS = 60000;   // tolerate clock skew / a slow first paint
+
+        function isLive(data) {
+            var ts = Date.parse((data && data.ts) || '');
+            if (isNaN(ts)) return true;          // no timestamp: assume live
+            return ts >= PAGE_OPENED_AT - TOAST_GRACE_MS;
+        }
+
+        function onEvent(evt) {
+            try {
+                var data = JSON.parse(evt.data);
+                var type = data.type || evt.type;
+                if (type === 'job.progress') {
+                    document.body.dispatchEvent(new CustomEvent('rag-job-progress', {detail: data.payload}));
+                    return;
+                }
+                if (type === 'job.completed' && isLive(data)) {
+                    var p = data.payload || {};
+                    document.body.dispatchEvent(new CustomEvent('rag-job-done', {detail: p}));
+                    if (p.state === 'failed') {
+                        ragToast('Job failed: ' + (p.kind || '') + (p.error ? ' — ' + p.error : ''), 'error', true);
+                    } else if (p.state === 'interrupted') {
+                        ragToast('A ' + (p.kind || 'job') + ' was interrupted by a restart.', 'warn', true);
+                    } else if (p.state === 'succeeded' && p.verified === false) {
+                        ragToast('A ' + (p.kind || 'job') + ' finished but could NOT be verified.', 'warn', true);
+                    }
+                }
+                if (INVALIDATING.test(type)) ragInvalidate();
+            } catch (e) { /* malformed frame — ignore */ }
+        }
+
+        function connect() {
+            try { es = new EventSource('/events'); } catch (e) { return; }
+            es.onopen = function () { retry = 0; ragConnected(); };
+            es.onmessage = onEvent;                  // unnamed frames
+            ['job.submitted','job.started','job.progress','job.completed',
+             'project.changed','config.changed','service.state',
+             'activity.info','activity.success','activity.warning','activity.error'
+            ].forEach(function (t) { es.addEventListener(t, onEvent); });
+            es.onerror = function () {
+                // EventSource retries by itself; surface the state meanwhile.
+                if (es.readyState === EventSource.CLOSED) {
+                    retry = Math.min(retry + 1, 6);
+                    setTimeout(connect, 1000 * retry);
+                }
+                ragDisconnected();
+            };
+        }
+        connect();
+        window.addEventListener('beforeunload', function () { if (es) es.close(); });
+    })();
+
+    // ---------------------------------------------------------------
+    // Running-job strip. Long background work (a dependency corpus can be
+    // 30,000+ files) was completely invisible: the progress existed, reached
+    // the browser, and was dropped on the floor.
+    // ---------------------------------------------------------------
+    (function () {
+        var strip = document.getElementById('job-strip');
+        if (!strip) return;
+        var label = document.getElementById('job-strip-label');
+        var bar   = document.getElementById('job-strip-bar');
+        var track = document.getElementById('job-strip-track');
+        var count = document.getElementById('job-strip-count');
+
+        // `job.progress` carries no `kind` — resolve it once per job and cache.
+        var KINDS = {
+            index: 'Indexing',
+            reindex: 'Re-indexing',
+            rebuild: 'Rebuilding the index',
+            purge: 'Removing indexed data',
+            map_recompute: 'Recomputing the map',
+            sync_frameworks: 'Indexing shared dependencies'
+        };
+        var kindFor = {};
+        var asking = false;
+
+        function resolveKind(jobId) {
+            if (kindFor[jobId] || asking) return;
+            asking = true;
+            fetch('/api/jobs?limit=5', {headers: {'Accept': 'application/json'}})
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (d) {
+                    (d && d.jobs || []).forEach(function (j) { kindFor[j.job_id] = j.kind; });
+                    if (kindFor[jobId]) label.textContent = KINDS[kindFor[jobId]] || 'Working';
+                })
+                .catch(function () {})
+                .finally(function () { asking = false; });
+        }
+
+        function render(p) {
+            if (!p || !p.job_id) return;
+            var known = kindFor[p.job_id];
+            label.textContent = known ? (KINDS[known] || 'Working') : 'Working';
+            if (!known) resolveKind(p.job_id);
+
+            var done = p.done || 0, total = p.total || 0;
+            if (total > 0) {
+                var pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+                bar.style.width = pct + '%';
+                strip.classList.remove('job-strip-indeterminate');
+                track.setAttribute('aria-valuenow', String(pct));
+                count.textContent = done.toLocaleString() + ' / ' + total.toLocaleString()
+                                  + '  (' + pct + '%)';
+            } else {
+                // Total unknown: an honest indeterminate bar beats a fake number.
+                strip.classList.add('job-strip-indeterminate');
+                track.removeAttribute('aria-valuenow');
+                count.textContent = done ? done.toLocaleString() + ' done' : '';
+            }
+            strip.hidden = false;
+        }
+
+        document.body.addEventListener('rag-job-progress', function (e) { render(e.detail); });
+        document.body.addEventListener('rag-job-done', function () {
+            strip.hidden = true;
+            bar.style.width = '0%';
+        });
+
+        // A page opened while work is already running must show it immediately
+        // rather than wait for the next tick — which for a slow phase can be
+        // tens of seconds of apparently-idle UI.
+        fetch('/api/jobs?limit=5', {headers: {'Accept': 'application/json'}})
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                var jobs = (d && d.jobs) || [];
+                jobs.forEach(function (j) { kindFor[j.job_id] = j.kind; });
+                var live = jobs.filter(function (j) { return j.state === 'running'; })[0];
+                if (live) {
+                    render({job_id: live.job_id,
+                            done: (live.progress || {}).done,
+                            total: (live.progress || {}).total});
+                }
+            })
+            .catch(function () {});
+    })();
+
+    // ---------------------------------------------------------------
+    // Activity drawer (keyboard operable)
+    // ---------------------------------------------------------------
+    (function () {
+        var toggle = document.getElementById('activity-toggle');
+        var drawer = document.getElementById('activity-drawer');
+        if (!toggle || !drawer) return;
+        toggle.addEventListener('click', function () {
+            var open = drawer.classList.toggle('open');
+            toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        });
+    })();
+
+    // ---------------------------------------------------------------
+    // Confirm dialog: real dialog semantics, focus trap, Escape.
+    // ---------------------------------------------------------------
+    (function () {
+        var modal = document.getElementById('confirm-modal');
+        var okBtn = document.getElementById('confirm-ok');
+        var cancelBtn = document.getElementById('confirm-cancel');
+        var lastFocus = null;
+        var pending = null;
+
+        function closeModal() {
+            modal.classList.remove('open');
+            modal.hidden = true;
+            pending = null;
+            if (lastFocus && lastFocus.focus) lastFocus.focus();
+        }
+        function openModal(question, issue) {
+            lastFocus = document.activeElement;
+            pending = issue;
+            document.getElementById('confirm-msg').textContent = question;
+            modal.hidden = false;
+            modal.classList.add('open');
+            okBtn.focus();
+        }
+
+        document.body.addEventListener('htmx:confirm', function(e) {
+            if (!e.detail.question) return;
+            e.preventDefault();
+            openModal(e.detail.question, e.detail.issueRequest);
+        });
+
+        okBtn.addEventListener('click', function () {
+            var issue = pending;
+            closeModal();
+            if (issue) issue(true);
+        });
+        cancelBtn.addEventListener('click', closeModal);
+
+        modal.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') { e.preventDefault(); closeModal(); return; }
+            if (e.key !== 'Tab') return;
+            // Focus trap — only two focusable controls in this dialog.
+            var focusables = [cancelBtn, okBtn];
+            var i = focusables.indexOf(document.activeElement);
+            e.preventDefault();
+            var next = e.shiftKey ? (i <= 0 ? focusables.length - 1 : i - 1)
+                                  : (i === focusables.length - 1 ? 0 : i + 1);
+            focusables[next].focus();
+        });
+    })();
     </script>
+    {% block scripts %}{% endblock %}
 </body>
 </html>

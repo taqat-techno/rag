@@ -84,6 +84,11 @@ class WriteCooldown:
         "add_project":                 2.0,
         "add_project_ignore_rule":     1.0,
         "remove_project_ignore_rule":  1.0,
+        # Linking a dependency can kick off a 30k-file corpus index, so a
+        # retry loop here is far more expensive than an ignore-rule edit.
+        "add_dependency":              2.0,
+        "set_project_dependencies":    5.0,
+        "remove_dependency":          10.0,
     }
 
     def __init__(
@@ -307,6 +312,36 @@ def proxy_post(state: McpState, path: str, **kwargs: Any) -> dict:
         )
     except Exception as e:
         return err(state, f"Proxy POST failed: {e}", code=BACKEND_ERROR)
+
+
+def proxy_put(state: McpState, path: str, **kwargs: Any) -> dict:
+    """Proxy a PUT and return ok/err envelope. Never raises.
+
+    PUT is the verb for replace-the-whole-resource operations (a project's
+    dependency link list), where a POST would read as "add one more".
+    """
+    from ragtools.integration.mcp_errors import PROXY_CONNECT_FAILED, BACKEND_ERROR
+    gate = require_proxy(state, f"PUT {path}")
+    if gate is not None:
+        return gate
+    try:
+        r = state.http.put(path, **kwargs)
+        if 200 <= r.status_code < 300:
+            try:
+                body = r.json()
+            except Exception:
+                body = {"status": "ok"}
+            return ok(state, body)
+        return err(state, f"Service returned HTTP {r.status_code}: {r.text[:200]}",
+                   code=_http_status_code(r.status_code))
+    except httpx.ConnectError:
+        return err(
+            state, "Could not connect to the RAG service.",
+            code=PROXY_CONNECT_FAILED,
+            hint="Start the service with: rag service start",
+        )
+    except Exception as e:
+        return err(state, f"Proxy PUT failed: {e}", code=BACKEND_ERROR)
 
 
 def proxy_delete(state: McpState, path: str, **kwargs: Any) -> dict:

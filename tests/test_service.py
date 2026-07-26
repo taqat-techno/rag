@@ -183,12 +183,37 @@ def test_watcher_status_includes_observability_fields(test_client):
 
 # --- Search ---
 
-def test_search(test_client):
+def test_search_rejects_unscoped(test_client):
+    # Fail-closed (S1/A2): an unscoped /api/search returns 422 SCOPE_UNRESOLVED
+    # rather than silently searching every project.
     r = test_client.get("/api/search", params={"query": "backend architecture"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["error_code"] == "SCOPE_UNRESOLVED"
+
+
+def test_search(test_client):
+    r = test_client.get(
+        "/api/search",
+        params={"query": "backend architecture", "projects": "project_a,project_b"},
+    )
     assert r.status_code == 200
     data = r.json()
     assert data["count"] > 0
     assert len(data["results"]) > 0
+
+
+def test_search_repeated_projects_param_unions(test_client):
+    # A3: repeated projects= must union (v2.7.0 silently kept only the last value).
+    r = test_client.get(
+        "/api/search",
+        params=[
+            ("query", "backend architecture"),
+            ("projects", "project_a"),
+            ("projects", "project_b"),
+        ],
+    )
+    assert r.status_code == 200
+    assert r.json()["count"] > 0
 
 
 def test_search_with_project(test_client):
@@ -199,7 +224,10 @@ def test_search_with_project(test_client):
 
 
 def test_search_no_results(test_client):
-    r = test_client.get("/api/search", params={"query": "xyznonexistent12345"})
+    r = test_client.get(
+        "/api/search",
+        params={"query": "xyznonexistent12345", "projects": "project_a,project_b"},
+    )
     assert r.status_code == 200
     assert r.json()["count"] == 0
 

@@ -68,5 +68,13 @@ class SearchResult(BaseModel):
     imports: list[str] = Field(default_factory=list)
     exports: list[str] = Field(default_factory=list)
     signature: str = Field(default="")
+    #: Which collection answered: the project's own, or a framework corpus it
+    #: links. Without it a reader cannot tell "your code does X" from "the
+    #: framework you vendor does X" — one is editable, the other is not, and
+    #: the payload alone cannot say, because a framework chunk carries the
+    #: framework's id rather than the project's.
+    scope: str = Field(default="project", description="project | framework")
+    #: The framework corpus a `framework`-scoped hit came from ("" otherwise).
+    scope_source: str = Field(default="")
     # Rerank-adjusted score (set by the dev pipeline; None for plain search).
     adjusted_score: float | None = Field(default=None)

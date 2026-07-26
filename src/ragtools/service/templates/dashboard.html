@@ -3,29 +3,44 @@
 {% block header %}
 <h1 class="page-title">Dashboard</h1>
 {% endblock %}
+{% block actions %}
+<a href="/projects" class="btn btn-secondary btn-sm">Manage projects</a>
+{% endblock %}
 {% block content %}
 
-<div class="card" style="padding: 14px 20px;">
-    <form action="/search" method="get" style="display:flex; gap:10px; align-items:center;">
-        <input type="text" name="query" placeholder="Search your knowledge base..." class="form-input"
-               style="flex:1; margin:0; height:40px;" autofocus>
-        <button type="submit" class="btn btn-primary" style="height:40px; padding:0 20px; white-space:nowrap;">Search</button>
+<div class="stack">
+
+    <form action="/search" method="get" class="dash-search" role="search">
+        <label class="sr-only" for="dash-query">Search your knowledge base</label>
+        <input type="text" id="dash-query" name="query" class="form-input"
+               placeholder="Search your knowledge base…" autofocus>
+        <button type="submit" class="btn btn-primary">Search</button>
     </form>
-</div>
 
-<div id="dash-status" hx-get="/ui/dash/status" hx-trigger="load" hx-swap="innerHTML">
-    <span class="loading-placeholder">Loading...</span>
-</div>
-
-<div id="dash-projects" hx-get="/ui/dash/projects" hx-trigger="load" hx-swap="innerHTML">
-    <span class="loading-placeholder">Loading projects...</span>
-</div>
-
-<div class="card">
-    <div class="card-header">Recent Activity</div>
-    <div id="dash-activity" hx-get="/ui/dash/activity" hx-trigger="load, every 10s" hx-swap="innerHTML">
-        <span class="loading-placeholder">Loading...</span>
+    <div id="dash-status" aria-live="polite"
+         hx-get="/ui/dash/status"
+         hx-trigger="load, every 60s, rag-invalidate from:body"
+         hx-swap="innerHTML">
+        <span class="loading-placeholder">Loading index status…</span>
     </div>
+
+    <div id="dash-projects" aria-live="polite"
+         hx-get="/ui/dash/projects"
+         hx-trigger="load, every 60s, rag-invalidate from:body"
+         hx-swap="innerHTML">
+        <span class="loading-placeholder">Loading projects…</span>
+    </div>
+
+    <div class="card">
+        <div class="card-header">Recent activity</div>
+        <div id="dash-activity"
+             hx-get="/ui/dash/activity"
+             hx-trigger="load, every 60s, rag-invalidate from:body"
+             hx-swap="innerHTML">
+            <span class="loading-placeholder">Loading activity…</span>
+        </div>
+    </div>
+
 </div>
 
 {% endblock %}

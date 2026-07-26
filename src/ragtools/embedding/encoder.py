@@ -13,10 +13,25 @@ class Encoder:
     """Thin wrapper around SentenceTransformer for consistent encoding."""
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        self.model_name = model_name
         self.model = SentenceTransformer(model_name, device="cpu")
         self.dimension = self.model.get_sentence_embedding_dimension()
         self._query_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._cache_lock = threading.Lock()
+
+    def metadata(self):
+        """Declare this backend's model identity for collection enforcement (A5).
+
+        Satisfies :class:`ragtools.embedding.backend.EmbeddingBackend`; the
+        returned record is what :func:`~ragtools.embedding.backend.assert_model_compatible`
+        checks on every collection open. ``normalize`` is always True here —
+        :meth:`encode_batch` / :meth:`encode_query` pass ``normalize_embeddings=True``.
+        """
+        from ragtools.embedding.backend import ModelMetadata
+
+        return ModelMetadata(
+            model_name=self.model_name, dimension=self.dimension, normalize=True
+        )
 
     def encode_batch(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
         """Encode a list of texts into normalized embeddings.

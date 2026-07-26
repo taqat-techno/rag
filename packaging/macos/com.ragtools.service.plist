@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent — installed to ~/Library/LaunchAgents/com.ragtools.service.plist
+
+  An agent, not a daemon: it runs in the user's session with access to ~, where
+  this product's data and the user's projects both live. A daemon runs as root
+  before login and can see neither.
+
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.ragtools.service.plist
+
+  KeepAlive/SuccessfulExit=false means "restart it if it crashes, leave it alone
+  if it exits cleanly" — otherwise `rag service stop` becomes a fight with
+  launchd.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ragtools.service</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rag</string>
+        <string>service</string>
+        <string>run</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>21420</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RAG_PROFILE</key>
+        <string>installed</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -1,23 +1,23 @@
 {% extends "base.html" %}
 {% block title %}Semantic Map — RAG Tools{% endblock %}
 {% block header %}
-<h1 class="page-title">Semantic Map</h1>
+<h1 class="page-title">Semantic map</h1>
+<div class="page-subtitle">Every indexed file, placed by meaning</div>
+{% endblock %}
+{% block actions %}
+<div class="map-view-toggle" role="group" aria-label="Map view">
+    <button type="button" id="btn-2d" class="btn-toggle active" onclick="switchView('2d')">2D</button>
+    <button type="button" id="btn-3d" class="btn-toggle" onclick="switchView('3d')">3D</button>
+</div>
+<div id="map-toolbar-extra" hidden>
+    <button type="button" id="btn-rotate" class="btn btn-sm btn-secondary" onclick="toggleAutoRotate()">Auto-rotate</button>
+</div>
 {% endblock %}
 {% block content %}
 
-<div class="map-toolbar">
-    <div class="map-view-toggle">
-        <button id="btn-2d" class="btn-toggle active" onclick="switchView('2d')">2D</button>
-        <button id="btn-3d" class="btn-toggle" onclick="switchView('3d')">3D</button>
-    </div>
-    <div id="map-toolbar-extra" style="display:none;">
-        <button id="btn-rotate" class="btn btn-sm btn-secondary" onclick="toggleAutoRotate()">Auto-rotate</button>
-    </div>
-</div>
-
 <div id="map-container">
     <canvas id="map-canvas"></canvas>
-    <div id="map-3d" style="display:none; width:100%; height:100%;"></div>
+    <div id="map-3d" class="map-3d-host" hidden></div>
     <div id="map-legend"></div>
     <div id="map-tooltip" class="map-tooltip"></div>
     <div id="map-status">Loading map data...</div>
@@ -36,22 +36,23 @@
 
         document.getElementById('btn-2d').classList.toggle('active', mode === '2d');
         document.getElementById('btn-3d').classList.toggle('active', mode === '3d');
-        document.getElementById('map-toolbar-extra').style.display = mode === '3d' ? '' : 'none';
+        document.getElementById('btn-2d').setAttribute('aria-pressed', String(mode === '2d'));
+        document.getElementById('btn-3d').setAttribute('aria-pressed', String(mode === '3d'));
+        document.getElementById('map-toolbar-extra').hidden = mode !== '3d';
 
         const canvas = document.getElementById('map-canvas');
         const div3d = document.getElementById('map-3d');
         const legend = document.getElementById('map-legend');
 
-        if (mode === '2d') {
-            div3d.style.display = 'none';
-            canvas.style.display = 'block';
-            legend.style.display = '';
+        const is2d = mode === '2d';
+        canvas.hidden = !is2d;
+        div3d.hidden = is2d;
+        legend.hidden = !is2d;
+
+        if (is2d) {
             if (typeof dispose3D === 'function') dispose3D();
             if (typeof render === 'function') render();
         } else {
-            canvas.style.display = 'none';
-            legend.style.display = 'none';
-            div3d.style.display = 'block';
             await load3D();
         }
     }
@@ -76,7 +77,7 @@
             }
         }
         if (_mapPoints.length === 0) {
-            setStatus('No indexed files. <a href="/index" style="color:var(--color-accent)">Run an index</a> to populate the map.');
+            setStatus('Nothing indexed yet. <a href="/projects">Add a project</a> to fill the map.');
             return;
         }
         init3D(_mapPoints);

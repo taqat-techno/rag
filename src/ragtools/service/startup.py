@@ -1,205 +1,155 @@
-"""Windows startup integration for automatic service launch.
+"""Service autostart — a thin delegate over the platform adapter.
 
-Uses the Windows Startup folder (shell:startup) to register a VBScript
-launcher that runs on user login. No elevation or admin privileges required.
+This module used to be 205 lines of Windows: a Startup-folder path, a generated
+``.vbs`` launcher, ``wscript``, and a ``schtasks`` fallback. There was no Linux
+or macOS path at all, so "autostart" simply did not exist on two of the three
+first-class platforms.
 
-Replaces the previous schtasks approach which required elevation for
-/sc onlogon triggers — causing "Access is denied" on standard user accounts.
+All of that now lives in :mod:`ragtools.platform`, one implementation per OS.
+What remains here is the product-level shape of the registration — which command
+to run, under what name, with what delay — plus the public functions the CLI,
+service boot and health check already import, so no caller had to change.
+
+The legacy constants stay on purpose: the upgrade engine needs the names of the
+registrations previous versions created in order to remove them.
 """
 
+from __future__ import annotations
+
 import logging
-import os
 import sys
 from pathlib import Path
 
 from ragtools.config import Settings
+from ragtools.platform import (
+    KIND_SERVICE,
+    AutostartSpec,
+    PlatformUnsupported,
+    adapter,
+    assert_single_registration,
+)
 
 logger = logging.getLogger("ragtools.service")
 
+#: Registration names created by superseded versions. Referenced by the upgrade
+#: engine's cleanup; never created here.
 TASK_NAME = "RAGTools Service"
 STARTUP_FILENAME = "RAGTools.vbs"
 
-
-def _check_windows() -> bool:
-    """Check if on Windows. Returns False on other platforms instead of crashing."""
-    if sys.platform != "win32":
-        logger.info("Startup integration: skipped (not Windows, current platform: %s)", sys.platform)
-        return False
-    return True
+#: Wait after login before starting. The encoder takes tens of seconds to load;
+#: racing the rest of the login makes both slower.
+DEFAULT_DELAY_SECONDS = 30
 
 
-def _get_startup_folder() -> Path:
-    """Get the Windows Startup folder path."""
-    # %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
-    appdata = os.environ.get("APPDATA", "")
-    if not appdata:
-        raise RuntimeError("APPDATA environment variable not set")
-    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+def _service_argv(settings: Settings) -> list[str]:
+    """The command the OS should run at login.
 
-
-def _get_startup_script_path() -> Path:
-    """Get the full path to the startup script."""
-    return _get_startup_folder() / STARTUP_FILENAME
-
-
-def _build_startup_script(settings: Settings, delay_seconds: int) -> str:
-    """Build a VBScript that starts the RAG service after a delay.
-
-    The script:
-    1. Waits for the configured delay (lets the system settle after login)
-    2. Checks if the service is already running (health check)
-    3. If not running, starts it silently
-    4. Optionally opens the browser
+    A packaged build launches its own executable; a source checkout launches the
+    running interpreter with ``-m``, so a developer's registration points at
+    their checkout rather than at an installed copy that may not exist.
     """
     from ragtools.config import is_packaged
 
+    host = settings.service_host
+    port = str(settings.service_port)
     if is_packaged():
-        exe_path = sys.executable
-    else:
-        exe_path = sys.executable
-        # In dev mode, we need to run python -m ragtools.service.run
-        # But VBScript can't easily do this, so use the CLI entry point
-        # which should be on PATH after pip install -e .
+        return [sys.executable, "service", "run", "--host", host, "--port", port]
+    return [sys.executable, "-m", "ragtools.cli", "service", "run",
+            "--host", host, "--port", port]
 
-    # Build the shell.Run command string with proper VBScript quoting.
-    # In VBScript: "" inside a string literal = escaped double-quote.
-    # shell.Run expects: shell.Run "full command string", 0, False
-    if is_packaged():
-        run_args = "service start"
-    else:
-        run_args = "-m ragtools.cli service start"
 
-    # Escape the exe path for VBScript (double quotes around path with spaces)
-    # Result: shell.Run """C:\path\to\python.exe"" -m ragtools.cli service start", 0, False
-    vbs_cmd = f'"""{exe_path}"" {run_args}"'
-
-    # Determine the working directory for the service process
-    from ragtools.config import get_data_dir
-    work_dir = str(get_data_dir().parent)  # Parent of data dir (e.g., %LOCALAPPDATA%\RAGTools)
-
-    return f"""' RAGTools Auto-Start Script
-' Created by RAGTools service install
-' Starts the RAG service after login with a delay
-
-Dim shell
-Set shell = CreateObject("WScript.Shell")
-
-' Wait for system to settle after login
-WScript.Sleep {delay_seconds * 1000}
-
-' Check if service is already running
-Dim healthy
-healthy = False
-On Error Resume Next
-Dim http
-Set http = CreateObject("MSXML2.XMLHTTP")
-http.Open "GET", "http://127.0.0.1:{settings.service_port}/health", False
-http.Send
-If http.Status = 200 Then healthy = True
-Set http = Nothing
-On Error GoTo 0
-
-' Start service if not already running
-If Not healthy Then
-    shell.CurrentDirectory = "{work_dir}"
-    shell.Run {vbs_cmd}, 0, False
-End If
-"""
+def _spec(settings: Settings, delay_seconds: int | None = None) -> AutostartSpec:
+    delay = getattr(settings, "startup_delay", DEFAULT_DELAY_SECONDS)
+    return AutostartSpec(
+        name=TASK_NAME,
+        kind=KIND_SERVICE,
+        argv=_service_argv(settings),
+        description="RAG Tools — local knowledge-base service",
+        delay_seconds=delay if delay_seconds is None else delay_seconds,
+        environment={"RAG_PROFILE": "installed"},
+    )
 
 
 def install_task(settings: Settings, delay_seconds: int | None = None) -> bool:
-    """Register RAG Tools to start automatically on Windows login.
-
-    Places a VBScript in the Windows Startup folder. This approach:
-    - Requires NO elevation (unlike schtasks /sc onlogon)
-    - Is visible in Task Manager > Startup tab
-    - Survives reboots
-    - Can be disabled by the user via Task Manager
-
-    Args:
-        settings: Application settings.
-        delay_seconds: Seconds to delay after login. Uses settings.startup_delay if None.
-
-    Returns:
-        True if startup registration succeeded.
-
-    Raises:
-        RuntimeError: If file operation fails.
-    """
-    if not _check_windows():
+    """Register the service to start at login. Idempotent."""
+    try:
+        registration = adapter().install_autostart(_spec(settings, delay_seconds))
+    except PlatformUnsupported as exc:
+        logger.warning("Autostart unavailable: %s", exc)
         return False
-
-    delay = delay_seconds if delay_seconds is not None else settings.startup_delay
-    startup_dir = _get_startup_folder()
-
-    if not startup_dir.exists():
-        raise RuntimeError(f"Startup folder not found: {startup_dir}")
-
-    script_content = _build_startup_script(settings, delay)
-    script_path = _get_startup_script_path()
-
-    logger.info("Installing startup script: %s (delay=%ds)", script_path, delay)
-    script_path.write_text(script_content, encoding="utf-8")
-    logger.info("Startup script installed successfully")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Autostart registration failed: %s", exc)
+        return False
+    logger.info("Registered service autostart: %s", registration.describe())
     return True
 
 
 def uninstall_task() -> bool:
-    """Remove RAG Tools from Windows startup.
+    """Remove the service registration, including superseded mechanisms.
 
-    Returns:
-        True if removed or didn't exist.
+    Idempotent: removing nothing is success, so an interrupted uninstall can be
+    re-run without stranding the machine half-configured.
     """
-    if not _check_windows():
-        return True
-
-    script_path = _get_startup_script_path()
-    logger.info("Removing startup script: %s", script_path)
-
-    if script_path.exists():
-        script_path.unlink()
-        logger.info("Startup script removed")
-    else:
-        logger.info("Startup script was not installed")
-
-    # Also clean up old schtasks-based task if it exists
     try:
-        import subprocess
-        result = subprocess.run(
-            ["schtasks", "/delete", "/tn", TASK_NAME, "/f"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            logger.info("Removed legacy scheduled task: %s", TASK_NAME)
-    except Exception:
-        pass
-
+        impl = adapter()
+    except PlatformUnsupported:
+        return True
+    removed = []
+    for registration in impl.find_autostart(KIND_SERVICE):
+        removed.extend(impl.remove_autostart(registration.name))
+    for registration in removed:
+        logger.info("Removed service autostart: %s", registration.describe())
     return True
 
 
 def is_task_installed() -> bool:
-    """Check if RAG Tools is registered for startup."""
-    if sys.platform != "win32":
+    """Whether a current (non-legacy) registration exists."""
+    try:
+        found = adapter().find_autostart(KIND_SERVICE)
+    except PlatformUnsupported:
         return False
-    return _get_startup_script_path().exists()
+    return any(not r.legacy for r in found)
 
 
 def get_task_info() -> dict | None:
-    """Get startup registration details.
+    """Registration detail for ``rag doctor`` and ``/api/diagnostics``.
 
-    Returns:
-        Dict with details, or None if not registered.
+    Reports duplicates and superseded entries rather than the first match. The
+    development machine ran a scheduled task *and* two Startup-folder scripts
+    simultaneously, and every "is it installed?" check answered yes — which is
+    why nothing ever cleaned them up.
     """
-    if sys.platform != "win32":
+    try:
+        impl = adapter()
+        found = impl.find_autostart(KIND_SERVICE)
+    except PlatformUnsupported:
+        return None
+    if not found:
         return None
 
-    script_path = _get_startup_script_path()
-    if not script_path.exists():
-        return None
+    problem = ""
+    try:
+        assert_single_registration(found, KIND_SERVICE)
+    except Exception as exc:  # noqa: BLE001 — the message IS the finding
+        problem = str(exc)
 
+    current = [r for r in found if not r.legacy]
+    primary = current[0] if current else found[0]
     return {
-        "task_name": TASK_NAME,
-        "status": "Installed",
-        "location": str(script_path),
-        "method": "Startup folder",
+        "task_name": primary.name,
+        "status": "Installed" if current else "Legacy only",
+        "location": str(primary.path) if primary.path else primary.target,
+        "method": primary.mechanism,
+        "platform": impl.name,
+        "registrations": [r.describe() for r in found],
+        "legacy": [r.describe() for r in found if r.legacy],
+        "problem": problem,
     }
+
+
+def legacy_startup_folder() -> Path | None:
+    """Legacy Startup-folder location, for cleanup only. Nothing writes here."""
+    try:
+        return getattr(adapter(), "_startup", None)
+    except PlatformUnsupported:
+        return None

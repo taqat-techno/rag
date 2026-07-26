@@ -501,47 +501,81 @@ def test_tray_app_release_removes_pid_file(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_tray_startup_script_hides_window(tmp_path):
-    """shell.Run with ``0`` as the second arg means 'hidden window'.
-    This prevents a console flash at login."""
-    from ragtools.service.tray_startup import _build_tray_script
-    settings = _settings(tmp_path)
-    script = _build_tray_script(settings)
-    # The second arg of shell.Run is the window style — 0 is hidden.
-    assert "shell.Run" in script
-    assert ", 0, False" in script  # hidden + don't wait
+def test_tray_autostart_launches_no_console_shim(tmp_path):
+    """The tray must not flash a console at login.
+
+    The old design achieved that with a `.vbs` whose `shell.Run(..., 0, False)`
+    hid the window. The window style is a process-creation concern, so the shim
+    is gone and the adapter registers the command directly — but the invariant
+    it protected is unchanged and now asserted on the registration.
+    """
+    from ragtools.platform import KIND_TRAY
+    from ragtools.service import tray_startup
+
+    argv = tray_startup._tray_argv()
+    assert "tray" in argv, "the registration must actually launch the tray"
+    assert not any(str(a).lower().endswith(".vbs") for a in argv)
+    assert not any("wscript" in str(a).lower() for a in argv)
 
 
-def test_tray_startup_script_includes_tray_command(tmp_path):
-    from ragtools.service.tray_startup import _build_tray_script
-    settings = _settings(tmp_path)
-    script = _build_tray_script(settings)
-    assert "tray" in script  # invokes ``rag tray``
+def test_tray_autostart_waits_for_the_shell_before_launching(tmp_path):
+    """Without a delay the tray races explorer's systray initialisation and
+    `Shell_NotifyIcon` fails silently — the icon simply never appears. Too long
+    and its absence reads as broken. The old VBS slept; the registration now
+    carries the delay, and the policy window is the same.
+    """
+    from ragtools.platform import KIND_TRAY
+    from ragtools.service import tray_startup
+
+    captured = {}
+
+    class _Adapter:
+        name = "test"
+
+        def has_desktop_session(self):
+            return True
+
+        def install_autostart(self, spec):
+            captured["spec"] = spec
+            from ragtools.platform import Registration
+
+            return Registration(spec.name, spec.kind, "test", " ".join(spec.argv))
+
+    # Patch the name `tray_startup` resolves — it imported `adapter` directly,
+    # so patching the package attribute would leave the real adapter in play
+    # and this test would register a scheduled task on the developer's machine.
+    saved = tray_startup.adapter
+    tray_startup.adapter = lambda: _Adapter()
+    try:
+        assert tray_startup.install_tray_task(_settings(tmp_path)) is True
+    finally:
+        tray_startup.adapter = saved
+
+    spec = captured["spec"]
+    assert spec.kind == KIND_TRAY
+    assert 10 <= spec.delay_seconds <= 60
 
 
-def test_tray_startup_script_waits_before_launch(tmp_path):
-    """Without a sleep before shell.Run, the tray VBS races explorer.exe's
-    systray initialisation and ``Shell_NotifyIcon`` can fail silently. The
-    delay must be expressed in milliseconds and must precede shell.Run."""
-    from ragtools.service.tray_startup import (
-        TRAY_STARTUP_DELAY_SECONDS,
-        _build_tray_script,
-    )
-    settings = _settings(tmp_path)
-    script = _build_tray_script(settings)
+def test_tray_autostart_is_refused_without_a_desktop_session(tmp_path):
+    """Headless installs are fully supported WITHOUT a tray. Registering one
+    there would fail at every login instead of simply not existing."""
+    from ragtools.service import tray_startup
 
-    expected_ms = TRAY_STARTUP_DELAY_SECONDS * 1000
-    assert f"WScript.Sleep {expected_ms}" in script
-    # Order matters — sleep MUST come before shell.Run, otherwise the delay
-    # only affects subsequent calls and the launch race is unfixed.
-    assert script.index("WScript.Sleep") < script.index("shell.Run")
+    class _Headless:
+        name = "test"
 
+        def has_desktop_session(self):
+            return False
 
-def test_tray_startup_delay_is_at_least_ten_seconds(tmp_path):
-    """Pin the policy: too short and the race returns; too long and the
-    icon's appearance feels broken to the user."""
-    from ragtools.service.tray_startup import TRAY_STARTUP_DELAY_SECONDS
-    assert 10 <= TRAY_STARTUP_DELAY_SECONDS <= 60
+        def install_autostart(self, spec):      # pragma: no cover - must not run
+            raise AssertionError("registered a tray on a headless machine")
+
+    saved = tray_startup.adapter
+    tray_startup.adapter = lambda: _Headless()
+    try:
+        assert tray_startup.install_tray_task(_settings(tmp_path)) is False
+    finally:
+        tray_startup.adapter = saved
 
 
 # ---------------------------------------------------------------------------
@@ -641,111 +675,112 @@ def test_configure_tray_logging_swallows_unwritable_dir(tmp_path, monkeypatch):
 
 
 def test_linux_clipboard_uses_first_available_tool(tmp_path, monkeypatch):
-    """On Linux, _on_copy_url must walk wl-copy → xclip → xsel and pick
-    whichever is on PATH. Missing tools must not raise; if none are found,
-    the action logs a warning and returns cleanly."""
+    """wl-copy → xclip → xsel, skipping whatever is not installed, and never
+    raising when none of them are."""
     import subprocess
-    from ragtools import tray as tray_mod
 
-    # Force the Linux branch
-    monkeypatch.setattr(tray_mod.sys, "platform", "linux")
+    from ragtools.platform.linux import LinuxAdapter
 
-    app = TrayApp(_settings(tmp_path))
-
-    # Prime shutil.which so only xclip is "available"
-    import shutil
-    real_which = shutil.which
-
-    def fake_which(tool):
-        return "/usr/bin/xclip" if tool == "xclip" else None
-
-    monkeypatch.setattr(shutil, "which", fake_which)
-
-    # Capture subprocess.run calls
+    monkeypatch.setattr("shutil.which",
+                        lambda tool: "/usr/bin/xclip" if tool == "xclip" else None)
     calls = []
-    monkeypatch.setattr(subprocess, "run",
-                        lambda argv, **kw: calls.append((argv, kw)))
 
-    app._on_copy_url()
+    class _Done:
+        returncode = 0
 
-    assert len(calls) == 1
-    assert calls[0][0][0] == "xclip"
-    assert calls[0][0][1:] == ["-selection", "clipboard"]
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: calls.append(argv) or _Done())
+
+    assert LinuxAdapter(home=tmp_path).copy_text("http://x") is True
+    assert calls and calls[0][0] == "xclip"
 
 
-def test_linux_clipboard_prefers_wl_copy_on_wayland(tmp_path, monkeypatch):
-    """If wl-copy is available (Wayland session), it takes precedence over
-    xclip/xsel — xclip won't work on Wayland without XWayland fallback."""
+def test_linux_clipboard_prefers_wl_copy_on_wayland(monkeypatch, tmp_path):
+    """xclip may exist on a Wayland session and silently do nothing, so wl-copy
+    must be tried first. The chain moved behind the platform adapter; the
+    invariant did not."""
     import subprocess
-    from ragtools import tray as tray_mod
 
-    monkeypatch.setattr(tray_mod.sys, "platform", "linux")
-    app = TrayApp(_settings(tmp_path))
+    from ragtools.platform.linux import LinuxAdapter
 
-    import shutil
-    monkeypatch.setattr(shutil, "which",
-                        lambda tool: "/usr/bin/wl-copy" if tool == "wl-copy" else "/usr/bin/xclip")
-
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda tool: "/usr/bin/wl-copy" if tool == "wl-copy" else "/usr/bin/xclip",
+    )
     calls = []
-    monkeypatch.setattr(subprocess, "run",
-                        lambda argv, **kw: calls.append(argv))
 
-    app._on_copy_url()
+    class _Done:
+        returncode = 0
 
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: calls.append(argv) or _Done())
+
+    assert LinuxAdapter(home=tmp_path).copy_text("http://x") is True
     assert len(calls) == 1
-    assert calls[0][0] == "wl-copy"   # preferred even if xclip is also present
+    assert calls[0][0] == "wl-copy"
 
 
-def test_linux_clipboard_logs_warning_when_nothing_available(tmp_path, monkeypatch, caplog):
-    """When no clipboard tool is present (minimal/headless Linux), the
-    tool must log a warning — no exception, no silent failure."""
-    import logging
+def test_linux_clipboard_reports_when_no_tool_exists(monkeypatch, tmp_path):
+    """A minimal or headless box has no clipboard tool at all. The adapter must
+    say no rather than pretend, and launch no process doing it."""
     import subprocess
-    from ragtools import tray as tray_mod
 
-    monkeypatch.setattr(tray_mod.sys, "platform", "linux")
-    app = TrayApp(_settings(tmp_path))
+    from ragtools.platform.linux import LinuxAdapter
 
-    import shutil
-    monkeypatch.setattr(shutil, "which", lambda _: None)
-
+    monkeypatch.setattr("shutil.which", lambda _: None)
     ran = []
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: ran.append(a))
 
-    with caplog.at_level(logging.WARNING):
-        app._on_copy_url()
+    assert LinuxAdapter(home=tmp_path).copy_text("http://x") is False
+    assert ran == []
 
-    assert ran == []  # no external process launched
+
+def test_tray_warns_when_the_clipboard_is_unavailable(tmp_path, caplog):
+    """The user-visible half: "nothing happened" versus "install wl-copy"."""
+    import logging
+
+    from ragtools import tray as tray_mod
+
+    app = TrayApp(_settings(tmp_path))
+
+    class _NoClipboard:
+        def copy_text(self, text):
+            return False
+
+    import ragtools.platform as platform_mod
+
+    saved = platform_mod.adapter
+    platform_mod.adapter = lambda: _NoClipboard()
+    try:
+        with caplog.at_level(logging.WARNING):
+            app._on_copy_url()
+    finally:
+        platform_mod.adapter = saved
+
     assert any("no clipboard tool" in r.message.lower() for r in caplog.records)
 
 
-# ---------------------------------------------------------------------------
-# Config Linux arm (v2.5.1 — was returning None)
-# ---------------------------------------------------------------------------
-
-
-def test_get_app_dir_has_linux_arm(monkeypatch):
-    """Linux installed-mode data dir should honour XDG_DATA_HOME with a
-    sensible ~/.local/share fallback. Was previously returning None."""
+def test_get_app_dir_honours_xdg_on_linux(monkeypatch, tmp_path):
+    """Linux installed-mode root follows XDG_DATA_HOME with a ~/.local/share
+    fallback. Asserted at the adapter now that config delegates to it."""
     from pathlib import Path as _P
-    import ragtools.config as cfg
 
-    monkeypatch.setattr(cfg.sys, "platform", "linux")
+    from ragtools.platform.linux import LinuxAdapter
 
-    # With XDG_DATA_HOME set
     monkeypatch.setenv("XDG_DATA_HOME", "/var/lib/demo/data")
-    result = cfg._get_app_dir()
-    assert result == _P("/var/lib/demo/data") / "RAGTools"
+    assert LinuxAdapter(home=tmp_path).app_dir() == _P("/var/lib/demo/data") / "RAGTools"
 
-    # Without XDG_DATA_HOME — fall back to ~/.local/share
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    result = cfg._get_app_dir()
-    assert result == _P.home() / ".local" / "share" / "RAGTools"
+    assert LinuxAdapter(home=tmp_path).app_dir() == tmp_path / ".local" / "share" / "RAGTools"
 
 
 def test_get_app_dir_none_for_unknown_platform(monkeypatch):
-    """Backwards-compat: anything that isn't win32/darwin/linux still
-    returns None (dev-mode CWD fallback). Not a regression."""
+    """Anything that is not windows/linux/darwin still yields None so callers
+    fall back to the dev-mode CWD layout instead of inventing a path."""
     import ragtools.config as cfg
-    monkeypatch.setattr(cfg.sys, "platform", "freebsd13")
+    import ragtools.platform as platform_mod
+    from ragtools.platform import PlatformUnsupported
+
+    def _refuse():
+        raise PlatformUnsupported("freebsd13")
+
+    monkeypatch.setattr(platform_mod, "adapter", _refuse)
     assert cfg._get_app_dir() is None

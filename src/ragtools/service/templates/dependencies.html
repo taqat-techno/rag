@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Shared dependencies — RAG Tools{% endblock %}
+{% block header %}
+<h1 class="page-title">Shared dependencies</h1>
+<div class="page-subtitle">Vendored frameworks indexed once and used by any project</div>
+{% endblock %}
+{% block actions %}
+<button type="button" id="add-dep-toggle" class="btn btn-primary btn-sm"
+        aria-expanded="false" aria-controls="add-dep-panel">Add dependency</button>
+{% endblock %}
+{% block content %}
+
+<div class="stack">
+
+    <div class="card" id="add-dep-panel" hidden>
+        <div class="card-header">Add a shared dependency</div>
+        <p class="card-desc">
+            A framework or library that several projects use — a vendored Odoo core, a
+            checked-in SDK. Add it once here, then select it from each project that uses it.
+            It is indexed <strong>once</strong> and shared, instead of copied into every project.
+        </p>
+        <form hx-post="/ui/dependencies/add" hx-target="#dependencies-list" hx-swap="innerHTML"
+              hx-indicator="#dependencies-overlay" hx-disabled-elt="find .btn">
+            <div class="grid-2">
+                <div class="form-group">
+                    <label class="form-label" for="nd-id">Dependency ID</label>
+                    <input type="text" name="id" id="nd-id" class="form-input"
+                           placeholder="odoo-18" required>
+                    <small class="hint">Lowercase letters, numbers and hyphens. Projects refer to it by this.</small>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="nd-name">Display name</label>
+                    <input type="text" name="name" id="nd-name" class="form-input"
+                           placeholder="Odoo 18 core">
+                    <small class="hint">Optional. Defaults to the folder name.</small>
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="nd-path">Folder path</label>
+                <input type="text" name="path" id="nd-path" class="form-input"
+                       placeholder="C:\path\to\odoo" required>
+                <small class="hint">Absolute path. Shared by many projects, so it has no
+                project to be relative to.</small>
+            </div>
+            <button type="button" class="btn btn-secondary btn-sm"
+                    hx-post="/ui/dependencies/check" hx-include="#nd-path"
+                    hx-target="#nd-check" hx-swap="innerHTML"
+                    hx-disabled-elt="this">Check folder</button>
+            <div id="nd-check" class="deps-check" role="status"></div>
+            <div class="card-footer">
+                <button type="submit" class="btn btn-primary btn-sm">Add dependency</button>
+                <button type="button" id="add-dep-cancel" class="btn btn-ghost btn-sm">Cancel</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="card">
+        <div class="card-header">Catalog</div>
+        <div class="overlay-host">
+            <div id="dependencies-list"
+                 hx-get="/ui/dependencies/list"
+                 hx-trigger="load, every 15s, rag-invalidate from:body, rag-job-done from:body"
+                 hx-swap="innerHTML">
+                <span class="loading-placeholder">Loading dependencies…</span>
+            </div>
+            <div id="dependencies-overlay" class="section-overlay">
+                <span class="overlay-spinner"></span>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script>
+(function () {
+    var toggle = document.getElementById('add-dep-toggle');
+    var panel  = document.getElementById('add-dep-panel');
+    var cancel = document.getElementById('add-dep-cancel');
+    if (!toggle || !panel) return;
+
+    function setOpen(open) {
+        panel.hidden = !open;
+        toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (open) {
+            var first = panel.querySelector('input');
+            if (first) first.focus();
+        } else {
+            toggle.focus();
+        }
+    }
+    toggle.addEventListener('click', function () { setOpen(panel.hidden); });
+    if (cancel) cancel.addEventListener('click', function () { setOpen(false); });
+
+    document.body.addEventListener('htmx:afterRequest', function (e) {
+        var path = (e.detail.pathInfo && e.detail.pathInfo.requestPath) || '';
+        if (path === '/ui/dependencies/add' && e.detail.successful && !panel.hidden) {
+            panel.querySelector('form').reset();
+            document.getElementById('nd-check').innerHTML = '';
+            setOpen(false);
+        }
+    });
+
+    // Suggest an id from the folder name — the id is what projects select by,
+    // and making people invent one twice is friction with no benefit.
+    var pathInput = document.getElementById('nd-path');
+    var idInput   = document.getElementById('nd-id');
+    if (pathInput && idInput) {
+        pathInput.addEventListener('blur', function () {
+            if (idInput.value.trim()) return;      // never overwrite a typed id
+            var parts = pathInput.value.replace(/[\\/]+$/, '').split(/[\\/]/);
+            var leaf = parts[parts.length - 1] || '';
+            idInput.value = leaf.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        });
+    }
+})();
+</script>
+
+{% endblock %}

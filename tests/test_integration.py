@@ -63,10 +63,17 @@ def mcp_env():
 
 class TestSearchKnowledgeBase:
     def test_basic_search(self, mcp_env):
-        result = mcp_server.search_knowledge_base("backend architecture")
+        result = mcp_server.search_knowledge_base(
+            "backend architecture", projects=["project_a", "project_b"]
+        )
         # Compact format: [N] file.md > Heading (score):
         assert "[1]" in result
         assert "(" in result  # score in parens
+
+    def test_unscoped_search_refuses(self, mcp_env):
+        # Fail-closed (S1/A2): an unscoped tool call refuses, never widens.
+        result = mcp_server.search_knowledge_base("backend architecture")
+        assert "SCOPE_UNRESOLVED" in result
 
     def test_project_filter(self, mcp_env):
         result = mcp_server.search_knowledge_base("documentation", project="project_a")
@@ -74,7 +81,9 @@ class TestSearchKnowledgeBase:
         assert "README.md" in result or "guide.md" in result
 
     def test_top_k(self, mcp_env):
-        result = mcp_server.search_knowledge_base("architecture", top_k=2)
+        result = mcp_server.search_knowledge_base(
+            "architecture", top_k=2, projects=["project_a", "project_b"]
+        )
         assert "[1]" in result
         # Should have at most 2 numbered results
         assert "[3]" not in result
@@ -90,7 +99,8 @@ class TestSearchKnowledgeBase:
 
     def test_no_relevant_results(self, mcp_env):
         result = mcp_server.search_knowledge_base(
-            "xyzzy flurbo garbanzoid completely irrelevant nonsense"
+            "xyzzy flurbo garbanzoid completely irrelevant nonsense",
+            projects=["project_a", "project_b"],
         )
         # Compact format: "No relevant content found" or low-relevance warning
         assert "No relevant" in result or "LOW RELEVANCE" in result or "[1]" in result

@@ -16,7 +16,7 @@ from ragtools.config import Settings
 
 def setup_logging(settings: Settings) -> None:
     """Configure service logging with rotating file handler."""
-    log_dir = Path(settings.qdrant_path).parent / "logs"
+    log_dir = Path(settings.data_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "service.log"
 
@@ -57,35 +57,23 @@ def _post_startup(settings: Settings, from_scheduler: bool) -> None:
     try:
         import sys as _sys
         from ragtools.config import is_packaged
-        if _sys.platform == "win32" and is_packaged():
-            from ragtools.service.startup import is_task_installed, install_task
+        # Self-register autostart on first packaged boot, on every platform.
+        if is_packaged():
+            from ragtools.service.startup import install_task, is_task_installed
+
             if not is_task_installed():
                 install_task(settings, delay_seconds=settings.startup_delay)
                 logger.info("Auto-registered Windows startup task (delay=%ds)", settings.startup_delay)
                 from ragtools.service.activity import log_activity
                 log_activity("success", "startup", "Auto-registered Windows login startup task")
-        elif _sys.platform == "win32":
+        else:
             logger.info("Startup auto-registration skipped: running from source (dev mode)")
     except Exception as e:
         logger.warning("Failed to auto-register startup task (non-fatal): %s", e)
 
-    # Auto-register the watchdog task alongside the login task. Same guard —
-    # only in packaged mode. Idempotent: schtasks /create /f overwrites.
-    try:
-        import sys as _sys
-        from ragtools.config import is_packaged
-        if _sys.platform == "win32" and is_packaged():
-            from ragtools.service.watchdog import (
-                is_watchdog_installed,
-                install_watchdog_task,
-            )
-            if not is_watchdog_installed():
-                if install_watchdog_task(settings):
-                    logger.info("Auto-registered Task Scheduler watchdog (every 15 min)")
-                    from ragtools.service.activity import log_activity
-                    log_activity("success", "startup", "Auto-registered service watchdog")
-    except Exception as e:
-        logger.warning("Failed to auto-register watchdog (non-fatal): %s", e)
+    # The watchdog task is gone: restart-on-failure is a native capability of
+    # Task Scheduler, systemd and launchd, so a bespoke polling task was one
+    # more thing to install, flash a console, and leave behind on upgrade.
 
     # Fire a "service is running" desktop toast — once per OS boot, so
     # routine restarts inside the same session don't spam the user.
@@ -162,7 +150,7 @@ def main():
     setup_logging(settings)
 
     # Write PID file
-    pid_path = Path(settings.qdrant_path).parent / "service.pid"
+    pid_path = Path(settings.data_dir) / "service.pid"
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()))
 
@@ -170,7 +158,7 @@ def main():
     from ragtools.config import is_packaged
     mode = "installed" if is_packaged() else "dev (source)"
     logger.info("Starting uvicorn on %s:%d (PID %d) [mode=%s]", host, port, os.getpid(), mode)
-    logger.info("Data directory: %s", Path(settings.qdrant_path).parent.resolve())
+    logger.info("Data directory: %s", Path(settings.data_dir).resolve())
 
     try:
         import uvicorn
@@ -178,6 +166,15 @@ def main():
         from ragtools.service.app import create_app
 
         app = create_app()
+
+        # Record the ACTUAL launched bind so GET /identity reports the real
+        # port (§27.1) — the route's fallback only knows the configured value,
+        # so a CLI --port override would otherwise be misreported. A `0`
+        # (ephemeral) bind needs the uvicorn.Server-object pattern to read the
+        # assigned socket port; recorded here for the fixed-port case.
+        if port:
+            from ragtools.service.routes import set_bound_address
+            set_bound_address(host, port)
 
         # Schedule post-startup tasks after uvicorn is ready
         # (run in a thread that waits for health endpoint)
@@ -253,7 +250,7 @@ def _record_fatal_crash(settings: Settings, exc: BaseException, host: str, port:
     )
 
     try:
-        log_dir = Path(settings.qdrant_path).parent / "logs"
+        log_dir = Path(settings.data_dir) / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         marker = log_dir / "last_crash.json"
         payload = {

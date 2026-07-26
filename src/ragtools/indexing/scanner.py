@@ -162,6 +162,7 @@ def scan_configured_projects(
     global_ignore_patterns: list[str] | None = None,
     use_ragignore: bool = True,
     secret_allowlist: list[str] | None = None,
+    dependencies: list | None = None,
 ) -> list[tuple[str, Path]]:
     """Scan explicitly configured projects for markdown files (v2).
 
@@ -173,6 +174,11 @@ def scan_configured_projects(
         projects: List of ProjectConfig entries. Only enabled projects are scanned.
         global_ignore_patterns: Global ignore patterns (applied to all projects).
         use_ragignore: Whether to parse .ragignore files in project directories.
+        dependencies: The shared-dependency catalog (`Settings.dependencies`).
+            Required for projects that link catalog entries rather than
+            declaring raw paths — without it their dependency roots are NOT
+            excluded here, and the same files end up both in the project's own
+            collection and in the shared corpus.
 
     Returns: list of (project_id, absolute_file_path) tuples.
     """
@@ -209,8 +215,23 @@ def scan_configured_projects(
 
         # Owned-only default: external dependency / co-located framework roots
         # (declared dependency_paths + git submodules) are excluded.
+        #
+        # Declared roots are resolved first (symlinks, junctions, `..`, absolute
+        # vs relative, drive-letter case) and validated — a declaration naming
+        # the project root itself is REFUSED rather than silently excluding
+        # every file in the project. Resolution also means an absolute path and
+        # its relative spelling produce the same exclusion instead of only the
+        # literal string matching.
+        from ragtools.dependency_catalog import resolve_project_dependency_paths
+        from ragtools.frameworks import exclusion_globs_for
         from ragtools.source_class import dependency_spec
-        proj_dep_spec = dependency_spec(project_path, project.dependency_paths)
+        # Catalog links AND legacy raw paths — the same union the sync indexes.
+        declared_roots = resolve_project_dependency_paths(project, dependencies)
+        proj_dep_spec = dependency_spec(
+            project_path,
+            list(project.dependency_paths) + exclusion_globs_for(
+                project_path, declared_roots),
+        )
 
         # Per-project Mode (docs / code / general) governs what is indexed.
         for found in discover_indexable_files(

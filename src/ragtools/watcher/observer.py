@@ -149,16 +149,25 @@ def _run_incremental(settings: Settings, ignore_rules: IgnoreRules) -> None:
         from ragtools.indexing.indexer import (
             ensure_collection,
             delete_file_points,
+            delete_files_points,
             index_file,
         )
         from ragtools.indexing.state import IndexState
         from ragtools.indexing.scanner import scan_project, get_relative_path
 
+        from ragtools.collection_router import build_router
+
         client = settings.get_qdrant_client()
         encoder = Encoder(settings.embedding_model)
         state = IndexState(settings.state_db)
 
-        ensure_collection(client, settings.collection_name, encoder.dimension)
+        # `rag watch` writes vectors, so it must resolve collections exactly the
+        # way the service does — otherwise a file edited while the CLI watcher
+        # is running lands in the shared collection and is invisible to a
+        # per-project search.
+        router, _registry, _frameworks = build_router(settings)
+        for name in router.all_collections():
+            ensure_collection(client, name, encoder.dimension)
 
         files = scan_project(
             settings.content_root,
@@ -174,9 +183,21 @@ def _run_incremental(settings: Settings, ignore_rules: IgnoreRules) -> None:
         deleted = 0
         chunks = 0
 
-        # Handle deleted files
+        # Handle deleted files. The state row names the owning project, and so
+        # the collection — read it before `state.remove` drops the row.
+        _drop: dict[str, list[str]] = {}
         for del_path in deleted_paths:
-            delete_file_points(client, settings.collection_name, del_path)
+            record = state.get(del_path) or {}
+            del_pid = record.get("project_id")
+            try:
+                targets = [router.write_collection(del_pid)] if del_pid else router.all_collections()
+            except Exception:  # noqa: BLE001 — project deregistered; sweep all
+                targets = router.all_collections()
+            for coll in targets:
+                _drop.setdefault(coll, []).append(del_path)
+        for coll, paths in _drop.items():
+            delete_files_points(client, coll, paths)
+        for del_path in deleted_paths:
             state.remove(del_path)
             deleted += 1
 
@@ -189,11 +210,13 @@ def _run_incremental(settings: Settings, ignore_rules: IgnoreRules) -> None:
                 skipped += 1
                 continue
 
-            delete_file_points(client, settings.collection_name, relative_path)
+            collection = router.write_collection(pid)
+            ensure_collection(client, collection, encoder.dimension)
+            delete_file_points(client, collection, relative_path)
             count = index_file(
                 client=client,
                 encoder=encoder,
-                collection_name=settings.collection_name,
+                collection_name=collection,
                 project_id=pid,
                 file_path=file_path,
                 relative_path=relative_path,
@@ -206,6 +229,7 @@ def _run_incremental(settings: Settings, ignore_rules: IgnoreRules) -> None:
             chunks += count
 
         state.close()
+        router.close()   # release the registry SQLite handles too
 
         # Close Qdrant client to release the lock
         del client

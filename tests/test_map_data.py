@@ -133,8 +133,13 @@ def test_cache_stale_after_change():
         conn.commit()
         conn.close()
 
-        loaded = load_cached_map(db_path)
-        assert loaded is None  # Cache is stale
+        # Staleness is still detected — but it no longer DESTROYS the cache.
+        # Serving the previous map instantly (and refreshing in the background)
+        # is what keeps the UI responsive during indexing.
+        from ragtools.service.map_data import is_map_cache_stale
+        assert load_cached_map(db_path, allow_stale=False) is None   # detected
+        assert is_map_cache_stale(db_path) is False  # hash-drift, not marked
+        assert load_cached_map(db_path) is not None  # still servable
 
 
 def test_cache_invalidation():
@@ -154,9 +159,14 @@ def test_cache_invalidation():
         # Verify cache exists
         assert load_cached_map(db_path) is not None
 
-        # Invalidate
+        # Invalidate now MARKS STALE rather than deleting: a full recompute
+        # (scroll every point + PCA) used to be forced on the next view, which
+        # fired at the end of every index — exactly when the machine was busiest.
+        from ragtools.service.map_data import is_map_cache_stale
         invalidate_map_cache(db_path)
-        assert load_cached_map(db_path) is None
+        assert is_map_cache_stale(db_path) is True
+        assert load_cached_map(db_path, allow_stale=False) is None
+        assert load_cached_map(db_path) is not None, "cache was destroyed, not marked"
 
 
 def test_cache_empty_state():

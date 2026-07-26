@@ -3,125 +3,213 @@
 {% block header %}
 <h1 class="page-title">Settings</h1>
 {% endblock %}
+{% block actions %}
+{# One save action for the whole page. Hidden until something actually
+   changes, so the header is quiet while you are only reading. #}
+<span id="settings-dirty" class="save-hint" role="status" aria-live="polite" hidden>
+    Unsaved changes
+</span>
+<button type="button" id="settings-save" class="btn btn-primary btn-sm" hidden>
+    Save changes
+</button>
+{% endblock %}
 {% block content %}
 
-<form hx-put="/ui/config/save" hx-target="#save-result" hx-swap="innerHTML">
+<div class="settings-layout">
 
-<div class="grid-2">
-    <div class="card">
-        <div class="card-header">Indexing</div>
-        <div class="form-group">
-            <label class="form-label">Chunk size (tokens)</label>
-            <input type="number" name="chunk_size" id="cfg-chunk-size" class="form-input" min="100" max="2000">
+    <nav class="settings-nav" id="settings-nav" aria-label="Settings sections">
+        <a href="#sec-indexing" class="active">Indexing</a>
+        <a href="#sec-service">Service</a>
+        <a href="#sec-claude">Claude access</a>
+        <a href="#sec-danger">Danger zone</a>
+    </nav>
+
+    <div>
+    <form id="settings-form" hx-put="/ui/config/save" hx-target="#save-result" hx-swap="innerHTML">
+
+        <!-- ── Indexing & retrieval ───────────────────────────────── -->
+        <section id="sec-indexing" aria-labelledby="sec-indexing-title">
+            <h2 class="section-title" id="sec-indexing-title">Indexing &amp; retrieval</h2>
+            <p class="section-desc">
+                How documents are split for embedding, and how results are selected at search time.
+                Changing chunk size or overlap only affects files indexed from now on — rebuild to apply it everywhere.
+            </p>
+
+            <div class="grid-2">
+                <div class="card">
+                    <div class="card-header">Indexing</div>
+                    <div class="form-group">
+                        <label class="form-label" for="cfg-chunk-size">Chunk size</label>
+                        <input type="number" name="chunk_size" id="cfg-chunk-size" class="form-input" min="100" max="2000">
+                        <small class="hint">Target tokens per chunk.</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="cfg-chunk-overlap">Chunk overlap</label>
+                        <input type="number" name="chunk_overlap" id="cfg-chunk-overlap" class="form-input" min="0" max="500">
+                        <small class="hint">Tokens repeated between neighbouring chunks, so meaning isn't cut in half.</small>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">Retrieval</div>
+                    <div class="form-group">
+                        <label class="form-label" for="cfg-top-k">Results per search</label>
+                        <input type="number" name="top_k" id="cfg-top-k" class="form-input" min="1" max="100">
+                        <small class="hint">Maximum chunks returned to Claude for one query.</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="cfg-score-threshold">Score threshold</label>
+                        <input type="number" name="score_threshold" id="cfg-score-threshold" class="form-input"
+                               min="0" max="1" step="0.05">
+                        <small class="hint">0.0–1.0. Anything scoring below this is dropped.</small>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Service ────────────────────────────────────────────── -->
+        <section id="sec-service" aria-labelledby="sec-service-title">
+            <h2 class="section-title" id="sec-service-title">Service</h2>
+            <p class="section-desc">How RAG Tools runs on this machine, and how it tells you when something breaks.</p>
+
+            <div class="card">
+                <div class="card-header">Notifications</div>
+                <div class="form-group">
+                    <label class="form-check">
+                        <input type="checkbox" name="desktop_notifications" id="cfg-desktop-notifications" value="true">
+                        <span>
+                            Show a desktop notification when the service crashes
+                            <small class="hint">Reaches you even when the admin panel is closed.</small>
+                        </span>
+                    </label>
+                </div>
+                <div class="card-footer">
+                    <button type="button" class="btn btn-secondary btn-sm"
+                            hx-post="/api/notifications/test"
+                            hx-target="#notif-test-result"
+                            hx-swap="innerHTML"
+                            hx-disabled-elt="this">Send a test notification</button>
+                    <span id="notif-test-result"></span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">Startup &amp; ports</div>
+                <div class="grid-2">
+                    <div>
+                        <div class="form-group">
+                            <label class="form-label" for="cfg-port">
+                                Port <span class="badge badge-warning">Restart required</span>
+                            </label>
+                            <input type="number" name="service_port" id="cfg-port" class="form-input" min="1024" max="65535">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="cfg-log-level">
+                                Log level <span class="badge badge-warning">Restart required</span>
+                            </label>
+                            <select name="log_level" id="cfg-log-level" class="form-select">
+                                <option value="DEBUG">DEBUG</option>
+                                <option value="INFO">INFO</option>
+                                <option value="WARNING">WARNING</option>
+                                <option value="ERROR">ERROR</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="form-group">
+                            <label class="form-check">
+                                <input type="checkbox" name="startup_open_browser" id="cfg-open-browser" value="true">
+                                <span>Open the admin panel when the service starts</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="cfg-startup-delay">Startup delay</label>
+                            <input type="number" name="startup_delay" id="cfg-startup-delay" class="form-input"
+                                   min="0" max="300">
+                            <small class="hint">Seconds to wait after login before starting.</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- No save button here: this page has ONE save action, in the page
+             header. A sticky bar was worse on both counts — it hovered over the
+             fields it was meant to save, and having a second "Save tool access"
+             button below made "which one do I press?" a real question. -->
+        <span id="save-result" hidden></span>
+
+    </form>
+
+    <!-- ── Claude access ──────────────────────────────────────────────
+         Deliberately outside the settings <form>: both cards below save
+         themselves (the tool grid by fetch, client profiles by their own
+         htmx forms), and a <form> must never be nested inside another. -->
+    <section id="sec-claude" aria-labelledby="sec-claude-title">
+        <h2 class="section-title" id="sec-claude-title">Claude access</h2>
+        <p class="section-desc">
+            What connected agents can see and do. Tool access applies to every client;
+            a client profile narrows it further for one of them.
+        </p>
+
+        <div class="card">
+            <div class="card-header">MCP tool access</div>
+            <p class="card-desc">
+                Disabled tools are never registered, so the agent doesn't see them at all.
+                <strong>search_knowledge_base</strong>, <strong>list_projects</strong> and
+                <strong>index_status</strong> are always available.
+            </p>
+
+            <div id="mcp-tools-grid">
+                <!-- populated by JS from /api/config.mcp_tools — grouped by purpose -->
+            </div>
+
+            <div class="note">
+                <span aria-hidden="true">⚠</span>
+                <span>
+                    <strong>Restart Claude Code to apply.</strong>
+                    The MCP server reads this once at startup, so changes take effect on the next connection.
+                </span>
+            </div>
         </div>
-        <div class="form-group">
-            <label class="form-label">Chunk overlap (tokens)</label>
-            <input type="number" name="chunk_overlap" id="cfg-chunk-overlap" class="form-input" min="0" max="500">
+
+        <div class="card">
+            <div class="card-header">Client profiles</div>
+            <p class="card-desc">
+                Give one MCP client a narrower slice of access — which projects it may search and which
+                capabilities it may use. A client with no profile is the <strong>owner</strong> and has full
+                access. Set a profile in that client's <code>.mcp.json</code>:
+                <code>"env": {"RAG_CLIENT_PROFILE": "&lt;id&gt;"}</code>
+            </p>
+            <div id="clients-panel" hx-get="/ui/clients" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
+                <span class="loading-placeholder">Loading client profiles…</span>
+            </div>
         </div>
+    </section>
+
+    <!-- ── Danger zone ────────────────────────────────────────────── -->
+    <section id="sec-danger" aria-labelledby="sec-danger-title">
+        <h2 class="section-title" id="sec-danger-title">Danger zone</h2>
+        <p class="section-desc">Actions here discard indexed data. They cannot be undone.</p>
+
+        <div class="card card-danger">
+            <div class="card-header">Rebuild the knowledge base</div>
+            <p class="card-desc">
+                Deletes every indexed chunk and re-indexes all projects from scratch.
+                Search returns nothing until it finishes. Use this after changing chunk size or the embedding model.
+            </p>
+            <button type="button" class="btn btn-danger" hx-post="/ui/rebuild" hx-target="#rebuild-result" hx-swap="innerHTML"
+                    hx-confirm="Delete all indexed data and rebuild from scratch?"
+                    hx-disabled-elt="this"
+                    data-processing-msg="Rebuilding the knowledge base — this can take several minutes">
+                Rebuild knowledge base
+            </button>
+            <div id="rebuild-result"></div>
+        </div>
+    </section>
     </div>
 
-    <div class="card">
-        <div class="card-header">Retrieval</div>
-        <div class="form-group">
-            <label class="form-label">Top K (max results)</label>
-            <input type="number" name="top_k" id="cfg-top-k" class="form-input" min="1" max="100">
-        </div>
-        <div class="form-group">
-            <label class="form-label">Score threshold (0.0 – 1.0)</label>
-            <input type="number" name="score_threshold" id="cfg-score-threshold" class="form-input" min="0" max="1" step="0.05">
-        </div>
-    </div>
 </div>
-
-<div class="card">
-    <div class="card-header">MCP Tool Access</div>
-    <p style="font-size:13px; color:var(--color-text-secondary); margin:0 0 14px;">
-        Control which optional tools the RAG Tools MCP server exposes to Claude Code.
-        Disabled tools are not registered — the agent never sees them.
-        <strong>Core tools (search_knowledge_base, list_projects, index_status)</strong> are always available.
-    </p>
-    <div id="mcp-tools-grid">
-        <!-- populated by JS from /api/config.mcp_tools — grouped by purpose -->
-    </div>
-    <div style="margin-top:14px; padding:10px 14px; background:var(--color-warning-bg, #fff8e1); border-left:3px solid var(--color-warning, #f59e0b); border-radius:4px; font-size:13px;">
-        <strong>⚠ Restart Claude Code for changes to take effect.</strong>
-        The MCP server reads this setting once at startup — toggles here only apply to the next connection.
-    </div>
-    <div style="margin-top:14px; display:flex; gap:12px; align-items:center;">
-        <button type="button" id="mcp-tools-save" class="btn btn-primary btn-sm">Save MCP Tool Access</button>
-        <span id="mcp-tools-result" style="font-size:12px;"></span>
-    </div>
-</div>
-
-<div class="card">
-    <div class="card-header">Notifications</div>
-    <div class="grid-2">
-        <div>
-            <div class="form-group">
-                <label class="form-label">
-                    <input type="checkbox" name="desktop_notifications" id="cfg-desktop-notifications" value="true">
-                    Show desktop toast when the service crashes
-                </label>
-                <small style="color:var(--color-text-muted); display:block; margin-top:4px;">
-                    Alerts you immediately on Windows, even if the admin panel is closed.
-                </small>
-            </div>
-        </div>
-        <div>
-            <div class="form-group" style="margin-top:4px;">
-                <button type="button" class="btn btn-secondary btn-sm"
-                        hx-post="/api/notifications/test"
-                        hx-target="#notif-test-result"
-                        hx-swap="innerHTML"
-                        hx-disabled-elt="this">
-                    Send test notification
-                </button>
-                <span id="notif-test-result" style="margin-left:10px; font-size:12px;"></span>
-            </div>
-        </div>
-    </div>
-</div>
-
-<div class="card">
-    <div class="card-header">Service &amp; Startup</div>
-    <div class="grid-2">
-        <div>
-            <div class="form-group">
-                <label class="form-label">Port <span class="badge badge-warning" style="margin-left:4px; font-size:9px;">Restart required</span></label>
-                <input type="number" name="service_port" id="cfg-port" class="form-input" min="1024" max="65535">
-            </div>
-            <div class="form-group">
-                <label class="form-label">Log level <span class="badge badge-warning" style="margin-left:4px; font-size:9px;">Restart required</span></label>
-                <select name="log_level" id="cfg-log-level" class="form-select">
-                    <option value="DEBUG">DEBUG</option>
-                    <option value="INFO">INFO</option>
-                    <option value="WARNING">WARNING</option>
-                    <option value="ERROR">ERROR</option>
-                </select>
-            </div>
-        </div>
-        <div>
-            <div class="form-group">
-                <label class="form-label">
-                    <input type="checkbox" name="startup_open_browser" id="cfg-open-browser" value="true">
-                    Open admin panel on startup
-                </label>
-            </div>
-            <div class="form-group">
-                <label class="form-label">Startup delay (seconds)</label>
-                <input type="number" name="startup_delay" id="cfg-startup-delay" class="form-input" min="0" max="300" style="max-width:120px;">
-                <small style="color:var(--color-text-muted);">Wait before launching after login.</small>
-            </div>
-        </div>
-    </div>
-</div>
-
-<div style="display:flex; gap:12px; align-items:center; margin-bottom:16px;">
-    <button type="submit" class="btn btn-primary" hx-disabled-elt="this">Save Settings</button>
-    <span id="save-result"></span>
-</div>
-
-</form>
 
 <script>
 // Short human-facing descriptions for each optional MCP tool.
@@ -159,9 +247,8 @@ var MCP_TOOL_GROUPS = [
     {
         id: "project",
         title: "Project tools",
-        summary: "Inspection (read-only) plus maintenance (writes) for working on a specific project. " +
-                 "Enabled by default — this is the primary agent workflow tier. " +
-                 "Write tools are guarded (confirm_token, per-tool cooldowns).",
+        summary: "Inspection and maintenance for a specific project. On by default — this is the primary agent workflow. " +
+                 "Write tools are guarded by a confirm token and per-tool cooldowns.",
         defaultOn: true,
         tools: [
             // Reads first — orientation / inspection
@@ -174,9 +261,9 @@ var MCP_TOOL_GROUPS = [
     },
     {
         id: "debug",
-        title: "Debugging / diagnostics",
-        summary: "Disabled by default — enable individually when you're troubleshooting the RAG service itself. " +
-                 "These tools are operator-facing and would distract an agent doing content work.",
+        title: "Debugging",
+        summary: "Off by default. Turn these on while troubleshooting RAG Tools itself — they are operator-facing " +
+                 "and would distract an agent doing content work.",
         defaultOn: false,
         tools: ["service_status", "recent_activity", "tail_logs", "crash_history",
                 "get_config", "get_ignore_rules", "get_paths", "system_health",
@@ -184,7 +271,16 @@ var MCP_TOOL_GROUPS = [
     },
 ];
 
-fetch('/api/config').then(r => r.json()).then(d => {
+// Single owner for the /api/config resource. Previously this ran once with no
+// .catch(): if it failed, every numeric input stayed EMPTY (they carry no
+// value= default) and a subsequent Save submitted "" -> 422 -> swallowed by
+// htmx. Now a load failure is loud, and the form is disabled rather than
+// offering to save values it never read.
+function ragLoadConfig() {
+  return fetch('/api/config').then(r => {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(d => {
     document.getElementById('cfg-chunk-size').value = d.chunk_size;
     document.getElementById('cfg-chunk-overlap').value = d.chunk_overlap;
     document.getElementById('cfg-top-k').value = d.top_k;
@@ -204,25 +300,19 @@ fetch('/api/config').then(r => r.json()).then(d => {
 
     function mkLabel(name, checked) {
         var label = document.createElement('label');
-        label.className = 'form-label';
-        label.style.margin = '0';
-        label.style.display = 'flex';
-        label.style.alignItems = 'flex-start';
-        label.style.gap = '8px';
+        label.className = 'check';
 
         var cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.dataset.tool = name;
         cb.checked = checked;
-        cb.style.marginTop = '3px';
 
-        var text = document.createElement('div');
+        var text = document.createElement('span');
         var codeEl = document.createElement('code');
+        codeEl.className = 'mcp-tool-name';
         codeEl.textContent = name;
-        codeEl.style.fontSize = '12px';
         var desc = document.createElement('small');
-        desc.style.display = 'block';
-        desc.style.color = 'var(--color-text-muted)';
+        desc.className = 'mcp-tool-desc';
         desc.textContent = MCP_TOOL_DESCRIPTIONS[name] || '';
         text.appendChild(codeEl);
         text.appendChild(desc);
@@ -236,31 +326,21 @@ fetch('/api/config').then(r => r.json()).then(d => {
         var section = document.createElement('div');
         section.className = 'mcp-tool-group';
         section.dataset.group = group.id;
-        section.style.gridColumn = '1 / -1';           // span full grid width
-        section.style.marginTop = '14px';
-        section.style.paddingTop = '10px';
-        section.style.borderTop = '1px solid var(--color-border, #e5e7eb)';
 
         var head = document.createElement('div');
-        head.style.display = 'flex';
-        head.style.alignItems = 'center';
-        head.style.justifyContent = 'space-between';
-        head.style.gap = '12px';
-        head.style.marginBottom = '4px';
+        head.className = 'mcp-group-head';
 
-        var title = document.createElement('strong');
+        var title = document.createElement('span');
+        title.className = 'mcp-group-title';
         title.textContent = group.title;
-        title.style.fontSize = '13px';
         head.appendChild(title);
 
-        // Per-group "Enable all / Disable all" quick toggle — convenience
+        // Per-group "enable all / disable all" quick toggle — convenience
         // for the common "turn on everything in this tier" flow.
         var toggleAll = document.createElement('button');
         toggleAll.type = 'button';
-        toggleAll.className = 'btn btn-secondary btn-sm';
-        toggleAll.style.fontSize = '11px';
-        toggleAll.style.padding = '2px 8px';
-        toggleAll.textContent = 'Toggle group';
+        toggleAll.className = 'btn btn-ghost btn-sm';
+        toggleAll.textContent = 'Toggle all';
         toggleAll.addEventListener('click', function() {
             var boxes = section.querySelectorAll('input[type=checkbox][data-tool]');
             // If ALL boxes are checked, uncheck all. Otherwise check all.
@@ -272,16 +352,12 @@ fetch('/api/config').then(r => r.json()).then(d => {
         section.appendChild(head);
 
         var summary = document.createElement('small');
-        summary.style.display = 'block';
-        summary.style.color = 'var(--color-text-muted)';
-        summary.style.marginBottom = '10px';
+        summary.className = 'hint';
         summary.textContent = group.summary;
         section.appendChild(summary);
 
         var gridInner = document.createElement('div');
-        gridInner.style.display = 'grid';
-        gridInner.style.gridTemplateColumns = '1fr 1fr';
-        gridInner.style.gap = '8px 16px';
+        gridInner.className = 'check-grid';
         group.tools.forEach(function(name) {
             // Forward-compat: if a tool is missing from the saved config
             // (added upstream after last save), inherit the group's default
@@ -293,44 +369,128 @@ fetch('/api/config').then(r => r.json()).then(d => {
 
         grid.appendChild(section);
     });
+    // Whatever the server just told us is now the clean baseline.
+    ragMarkSettingsClean();
+  }).catch(function (err) {
+    // Loud, and refuse to let the user save values we never loaded.
+    var form = document.getElementById('settings-form');
+    if (form) {
+      form.querySelectorAll('input, select, button').forEach(function (el) { el.disabled = true; });
+    }
+    var save = document.getElementById('settings-save');
+    if (save) save.disabled = true;
+    if (window.ragToast) {
+      window.ragToast('Could not load settings (' + err.message + '). Saving is disabled ' +
+                      'until they load — reload once the service is reachable.', 'error', true);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------
+// One save action for the whole page.
+//
+// There used to be two — "Save settings" (the form) and "Save tool access"
+// (the MCP grid) — because they hit different endpoints. That is an
+// implementation detail; from the reader's side it is all one Settings page,
+// and two buttons made "which one applies to what I just changed?" a real
+// question. Now: one button that saves everything, shown only when there is
+// something to save.
+// ---------------------------------------------------------------------
+var _settingsBaseline = null;
+
+function ragCollectMcpTools() {
+    var tools = {};
+    document.querySelectorAll('#mcp-tools-grid input[type=checkbox][data-tool]')
+        .forEach(function (cb) { tools[cb.dataset.tool] = cb.checked; });
+    return tools;
+}
+
+function ragSettingsSnapshot() {
+    // A stable string for every value this page can save. Compared, not parsed.
+    var form = document.getElementById('settings-form');
+    var parts = [];
+    if (form) {
+        form.querySelectorAll('input, select, textarea').forEach(function (el) {
+            if (!el.name) return;
+            parts.push(el.name + '=' +
+                       (el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value));
+        });
+    }
+    parts.push('mcp=' + JSON.stringify(ragCollectMcpTools()));
+    return parts.join('');
+}
+
+function ragSettingsDirty() {
+    return _settingsBaseline !== null && ragSettingsSnapshot() !== _settingsBaseline;
+}
+
+function ragRefreshSaveAffordance() {
+    var dirty = ragSettingsDirty();
+    var btn = document.getElementById('settings-save');
+    var hint = document.getElementById('settings-dirty');
+    if (btn) btn.hidden = !dirty;
+    if (hint) hint.hidden = !dirty;
+}
+
+function ragMarkSettingsClean() {
+    _settingsBaseline = ragSettingsSnapshot();
+    ragRefreshSaveAffordance();
+}
+
+// Any edit anywhere on the page re-evaluates whether there is work to save.
+['input', 'change'].forEach(function (evt) {
+    document.addEventListener(evt, function (e) {
+        if (!e.target.closest || !e.target.closest('.settings-layout')) return;
+        ragRefreshSaveAffordance();
+    });
 });
 
-// Dedicated save handler for MCP tool access — avoids mixing nested dicts
-// into the main form-encoded save.
-document.getElementById('mcp-tools-save').addEventListener('click', function() {
-    var grid = document.getElementById('mcp-tools-grid');
-    var boxes = grid.querySelectorAll('input[type=checkbox][data-tool]');
-    var tools = {};
-    boxes.forEach(function(cb) { tools[cb.dataset.tool] = cb.checked; });
+function ragSaveSettings() {
+    var btn = document.getElementById('settings-save');
+    var form = document.getElementById('settings-form');
+    if (btn) btn.disabled = true;
 
-    var out = document.getElementById('mcp-tools-result');
-    while (out.firstChild) out.removeChild(out.firstChild);
-
+    // MCP tool access is a nested dict, so it cannot ride the form-encoded
+    // save; it goes first, and a failure there stops the whole save rather
+    // than half-applying and reporting success.
     fetch('/api/config', {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({mcp_tools: tools}),
-    }).then(function(r) {
-        return r.json().then(function(body) { return {status: r.status, body: body}; });
-    }).then(function(result) {
-        var span = document.createElement('span');
-        if (result.status === 200) {
-            span.className = 'notif-test-ok';
-            span.textContent = 'Saved. Restart Claude Code to see the new tool list.';
-        } else {
-            span.className = 'notif-test-warn';
-            span.textContent = 'Save failed: ' + (result.body.detail || JSON.stringify(result.body));
+        body: JSON.stringify({mcp_tools: ragCollectMcpTools()}),
+    }).then(function (r) {
+        return r.json().then(function (body) { return {status: r.status, body: body}; });
+    }).then(function (result) {
+        if (result.status !== 200) {
+            throw new Error(result.body.detail || JSON.stringify(result.body));
         }
-        out.appendChild(span);
-        setTimeout(function() {
-            while (out.firstChild) out.removeChild(out.firstChild);
-        }, 6000);
-    }).catch(function(e) {
-        var span = document.createElement('span');
-        span.className = 'notif-test-warn';
-        span.textContent = 'Save failed: ' + e;
-        out.appendChild(span);
+        // Then the form fields. htmx owns this request so the existing
+        // re-read-after-save listener still fires.
+        if (form) htmx.trigger(form, 'submit');
+        else ragLoadConfig();
+    }).catch(function (e) {
+        if (btn) btn.disabled = false;
+        if (window.ragToast) {
+            window.ragToast('Could not save settings: ' + e.message, 'error', true);
+        }
     });
+}
+
+document.getElementById('settings-save').addEventListener('click', ragSaveSettings);
+
+ragLoadConfig();
+
+// Re-read after a successful save: the server is the source of truth, and a
+// coerced or rejected field must not linger in the form as if it were saved.
+// ragLoadConfig() re-baselines, which hides the button again.
+document.body.addEventListener('htmx:afterRequest', function (evt) {
+    var path = (evt.detail.pathInfo && evt.detail.pathInfo.requestPath) || '';
+    if (path !== '/ui/config/save') return;
+    var btn = document.getElementById('settings-save');
+    if (btn) btn.disabled = false;
+    if (evt.detail.successful) {
+        ragLoadConfig();
+        if (window.ragToast) window.ragToast('Settings saved.', 'success');
+    }
 });
 
 // Render the test-notification response into #notif-test-result using DOM
@@ -345,10 +505,10 @@ document.body.addEventListener('htmx:afterRequest', function(evt) {
         var body = JSON.parse(evt.detail.xhr.responseText);
         if (body.sent) {
             span.className = 'notif-test-ok';
-            span.textContent = 'Sent — check your notification center.';
+            span.textContent = 'Sent — check your notification centre.';
         } else if (body.reason === 'disabled') {
             span.className = 'notif-test-muted';
-            span.textContent = 'Notifications are disabled. Enable them above and save first.';
+            span.textContent = 'Notifications are off. Turn them on above and save first.';
         } else {
             span.className = 'notif-test-warn';
             span.textContent = 'Dispatched, but delivery failed. Check the log.';
@@ -361,51 +521,50 @@ document.body.addEventListener('htmx:afterRequest', function(evt) {
         while (box.firstChild) box.removeChild(box.firstChild);
     }, 6000);
 });
+
+// Section nav highlights whichever section you are actually reading.
+//
+// Position-based rather than IntersectionObserver: with several short
+// sections more than one is on screen at once, and "first intersecting"
+// then sticks to the earliest one — so scrolling to the bottom of the page
+// still highlighted a section three headings above.
+(function () {
+    var links = Array.prototype.slice.call(document.querySelectorAll('#settings-nav a'));
+    var sections = links
+        .map(function (a) { return document.querySelector(a.getAttribute('href')); })
+        .filter(Boolean);
+    if (!sections.length) return;
+
+    var READING_LINE = 96;   // just below the sticky page header
+    var queued = false;
+
+    function update() {
+        queued = false;
+        var current = sections[0];
+        // The last section whose heading has passed the reading line.
+        sections.forEach(function (s) {
+            if (s.getBoundingClientRect().top <= READING_LINE) current = s;
+        });
+        // At the very bottom the final section may never reach the line.
+        var atBottom = window.innerHeight + window.scrollY >=
+                       document.documentElement.scrollHeight - 2;
+        if (atBottom) current = sections[sections.length - 1];
+
+        links.forEach(function (a) {
+            a.classList.toggle('active', a.getAttribute('href') === '#' + current.id);
+        });
+    }
+
+    function onScroll() {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(update);
+    }
+
+    window.addEventListener('scroll', onScroll, {passive: true});
+    window.addEventListener('resize', onScroll, {passive: true});
+    update();
+})();
 </script>
-
-<div class="card" id="mcp-card">
-    <div class="card-header">Connect to Claude</div>
-    <p style="font-size:13px; color:var(--color-text-secondary); margin:0 0 12px;">
-        Add this configuration to your <code>.mcp.json</code> file so Claude Code can search your knowledge base.
-    </p>
-    <div style="position:relative;">
-        <pre id="mcp-config" style="background:var(--color-bg); border:1px solid var(--color-border); border-radius:var(--radius-sm); padding:14px 16px; font-size:12.5px; overflow-x:auto; margin:0;">Loading...</pre>
-        <button type="button" id="mcp-copy-btn" onclick="copyMcpConfig()" class="btn btn-secondary btn-sm"
-                style="position:absolute; top:8px; right:8px; font-size:11px; padding:3px 10px;">
-            Copy
-        </button>
-    </div>
-    <p style="font-size:12px; color:var(--color-text-muted); margin:10px 0 0;">
-        Paste into <code>~/.claude/.mcp.json</code> or your project's <code>.mcp.json</code>
-    </p>
-</div>
-
-<script>
-fetch('/api/mcp-config').then(r => r.json()).then(d => {
-    document.getElementById('mcp-config').textContent = JSON.stringify(d.config, null, 2);
-});
-function copyMcpConfig() {
-    var text = document.getElementById('mcp-config').textContent;
-    navigator.clipboard.writeText(text).then(function() {
-        var btn = document.getElementById('mcp-copy-btn');
-        btn.textContent = 'Copied!';
-        setTimeout(function() { btn.textContent = 'Copy'; }, 2000);
-    });
-}
-</script>
-
-<div class="card card-danger">
-    <div class="card-header" style="color: var(--color-danger);">Danger Zone</div>
-    <p style="font-size: 13px; color: var(--color-text-secondary); margin: 0 0 14px;">
-        Drop all indexed data and rebuild the knowledge base from scratch.
-    </p>
-    <button type="button" class="btn btn-danger" hx-post="/ui/rebuild" hx-target="#rebuild-result" hx-swap="innerHTML"
-            hx-confirm="This will DELETE all indexed data and rebuild from scratch. Continue?"
-            hx-disabled-elt="this"
-            data-processing-msg="Rebuilding knowledge base... this may take several minutes">
-        Rebuild Knowledge Base
-    </button>
-    <div id="rebuild-result" style="margin-top: 10px;"></div>
-</div>
 
 {% endblock %}

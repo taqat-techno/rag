@@ -28,6 +28,19 @@ unknown log source, negative limit)."""
 CONFIRM_TOKEN_MISMATCH = "CONFIRM_TOKEN_MISMATCH"
 """``reindex_project`` was called without ``confirm_token == project``."""
 
+SCOPE_UNRESOLVED = "SCOPE_UNRESOLVED"
+"""A search scope could not be resolved and was refused rather than widened to
+a global search (S1/A2 fail-closed). Pass an explicit project/projects."""
+
+CAPABILITY_DENIED = "CAPABILITY_DENIED"
+"""The active client profile may not use this tool (server-side re-check, S12/S13
+§24.2). Not a transport error — the endpoint refused an authorized-but-forbidden
+call regardless of what the tool list showed."""
+
+UNAUTHORIZED = "UNAUTHORIZED"
+"""The MCP process is misconfigured for authorization (e.g. RAG_CLIENT_PROFILE
+names a profile the store does not have). Fails closed rather than escalating."""
+
 COOLDOWN = "COOLDOWN"
 """Write tool called again inside its cooldown window. Response includes
 ``retry_after_seconds`` in the data so the agent can decide whether to wait."""
@@ -53,7 +66,8 @@ warning so we can catch and fix the missing label."""
 
 __all__ = [
     "SERVICE_DOWN", "DEGRADED_MODE", "STARTUP_FAILED",
-    "INVALID_ARG", "CONFIRM_TOKEN_MISMATCH", "COOLDOWN",
+    "INVALID_ARG", "CONFIRM_TOKEN_MISMATCH", "SCOPE_UNRESOLVED", "COOLDOWN",
+    "CAPABILITY_DENIED", "UNAUTHORIZED",
     "PROXY_CONNECT_FAILED", "PROXY_HTTP_4XX", "PROXY_HTTP_5XX", "BACKEND_ERROR",
     "UNKNOWN",
 ]

@@ -17,6 +17,7 @@ Packaged mode detection:
 
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Literal, Tuple, Type
@@ -51,6 +52,75 @@ def mode_indexes(mode: str, is_documentation: bool) -> bool:
     return True  # general
 
 
+def _dependency_path_key(path: str | Path) -> str:
+    """Identity of a dependency folder, for "is this the same one?".
+
+    Resolved, then case-folded. ``resolve()`` collapses symlinks, junctions,
+    ``..`` and relative spellings; case-folding collapses ``C:\\`` vs ``c:\\``
+    on Windows. Two spellings of one folder must never become two catalog
+    entries — that is precisely the duplication the catalog exists to remove.
+
+    Falls back to the literal string when the path cannot be resolved (it may
+    not exist yet), which is still better than treating every spelling as
+    distinct.
+    """
+    try:
+        resolved = str(Path(path).resolve())
+    except OSError:
+        resolved = str(path)
+    return os.path.normcase(resolved)
+
+
+def _slugify_dependency_id(text: str) -> str:
+    """Folder name -> a usable catalog id."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")
+    return slug or "dependency"
+
+
+def _unique_dependency_id(path: Path, taken: set[str]) -> str:
+    """A stable, readable id for an adopted legacy path.
+
+    Prefers the folder name; disambiguates with the parent folder before
+    falling back to a counter, so two vendored cores both called ``odoo``
+    become ``odoo`` and ``pearl-pixels-18-odoo`` rather than ``odoo-2``.
+    """
+    base = _slugify_dependency_id(path.name)
+    if base not in taken:
+        return base
+    parent = _slugify_dependency_id(path.parent.name)
+    if parent:
+        combined = f"{parent}-{base}"
+        if combined not in taken:
+            return combined
+    n = 2
+    while f"{base}-{n}" in taken:
+        n += 1
+    return f"{base}-{n}"
+
+
+class DependencyConfig(BaseModel):
+    """A shared dependency in the catalog — declared once, used by many projects.
+
+    Deliberately holds INTENT only (id, display name, path). What the folder
+    turns out to be — framework name, version, edition, build id, and therefore
+    which collection it maps to — is derived at every sync and never stored
+    here: a checkout can switch branches or be upgraded in place, and a stale
+    stored identity would quietly route a project at the wrong corpus.
+
+    ``path`` is the natural key. Two entries for one resolved folder would
+    defeat the entire point of declaring it once.
+    """
+
+    id: str                    # slug; the key projects link by
+    name: str = ""             # display name (defaults to id)
+    path: str                  # absolute path to the dependency root
+    enabled: bool = True       # skip without deleting (keeps links intact)
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.name:
+            self.name = self.id
+
+
 class ProjectConfig(BaseModel):
     """Configuration for a single project folder."""
 
@@ -59,11 +129,14 @@ class ProjectConfig(BaseModel):
     path: str                                        # absolute path to project folder
     enabled: bool = True                             # Project Status: skip if False
     ignore_patterns: list[str] = Field(default_factory=list)  # per-project ignore patterns
-    # External-dependency / co-located framework roots (gitignore-style globs,
-    # relative to the project path) — classified as `source_class=dependency`
-    # and excluded from indexing by default (owned-only). Generic: a user or a
-    # profile declares these (e.g. a vendored framework core). Git submodules
-    # are detected automatically and need not be listed.
+    # Catalog entries this project uses — ids from `Settings.dependencies`.
+    # This is the model users manage: declare a shared dependency once, then
+    # select it from any number of projects.
+    dependencies: list[str] = Field(default_factory=list)
+    # LEGACY, still honoured: dependency roots declared as raw paths on the
+    # project itself. Superseded by the `dependencies` catalog above, which is
+    # migrated to on load; sync takes the union of both so an existing config
+    # keeps working untouched.
     dependency_paths: list[str] = Field(default_factory=list)
     # Project Mode — what this project indexes (secret-bearing files always excluded):
     #   "docs"    = documentation / text / Markdown only (default)
@@ -105,21 +178,18 @@ def is_packaged() -> bool:
 
 
 def _get_app_dir() -> Path | None:
-    """Get the platform-specific application data directory, or None for dev mode."""
-    if sys.platform == "win32":
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        if local_app_data:
-            return Path(local_app_data) / "RAGTools"
-    elif sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "RAGTools"
-    elif sys.platform.startswith("linux"):
-        # XDG Base Directory spec: honour $XDG_DATA_HOME if set, else the
-        # conventional ~/.local/share. Ubuntu is the primary validated target
-        # but this covers any XDG-compliant distro (Debian, Fedora, Arch, ...).
-        xdg = os.environ.get("XDG_DATA_HOME", "").strip()
-        base = Path(xdg) if xdg else Path.home() / ".local" / "share"
-        return base / "RAGTools"
-    return None
+    """Platform application-data root, or None when this platform has no adapter.
+
+    The three-way OS branch that used to live here now lives behind the adapter
+    seam (`ragtools.platform`), so adding a platform is adding an adapter
+    rather than editing every module that happens to care about a path.
+    """
+    from ragtools.platform import PlatformUnsupported, adapter
+
+    try:
+        return adapter().app_dir()
+    except PlatformUnsupported:
+        return None
 
 
 def get_data_dir() -> Path:
@@ -250,16 +320,38 @@ class TomlConfigSource(PydanticBaseSettingsSource):
 # --- Default Path Factories ---
 
 
-def _default_qdrant_path() -> str:
+def _resolve_data_dir() -> Path:
+    """The single authoritative data directory (S2).
+
+    ``RAG_DATA_DIR`` wins in EVERY mode (fixing the dev no-op where it was
+    ignored for storage); a packaged install uses ``<app_dir>/data``; a source
+    checkout uses ``<cwd>/data``. Always ABSOLUTE, so running from another
+    directory can never split logs/pids/storage across two anchors.
+
+    This is behaviour-preserving for the physical location of both the packaged
+    (``<app_dir>/data/...``) and dev (``<cwd>/data/...``) layouts, but replaces
+    the ~10 scattered ``Path(qdrant_path).parent`` derivations with one anchor.
+    """
+    explicit = os.environ.get("RAG_DATA_DIR")
+    if explicit:
+        return Path(explicit).resolve()
     if is_packaged():
-        return str(get_data_dir() / "data" / "qdrant")
-    return "data/qdrant"
+        app_dir = _get_app_dir()
+        if app_dir:
+            return app_dir / "data"
+    return Path("data").resolve()
+
+
+def _default_data_dir() -> str:
+    return str(_resolve_data_dir())
+
+
+def _default_qdrant_path() -> str:
+    return str(_resolve_data_dir() / "qdrant")
 
 
 def _default_state_db() -> str:
-    if is_packaged():
-        return str(get_data_dir() / "data" / "index_state.db")
-    return "data/index_state.db"
+    return str(_resolve_data_dir() / "index_state.db")
 
 
 def _default_service_port() -> int:
@@ -273,9 +365,34 @@ def _default_service_port() -> int:
 class Settings(BaseSettings):
     """Application settings loaded from environment variables with RAG_ prefix."""
 
+    # Application data directory (S2) — the single authoritative anchor for
+    # logs, PIDs, backups, markers, and the service registry. qdrant_path and
+    # state_db default under it but can be overridden independently. Consumers
+    # MUST use ``settings.data_dir`` rather than ``Path(qdrant_path).parent``.
+    data_dir: str = Field(default_factory=_default_data_dir)
+
     # Qdrant local mode
     qdrant_path: str = Field(default_factory=_default_qdrant_path)
     collection_name: str = "markdown_kb"
+
+    # Collection strategy (S6/S11). "shared" (default) preserves the v2 model —
+    # one collection + payload filter — so nothing changes unless opted in.
+    # "per_project" routes indexing/search to a UUID-derived collection per
+    # project (the v3 model), available behind this flag until the owner elects
+    # the cutover + re-index. Default-off = backward compatible, no test breakage.
+    collection_strategy: str = "shared"
+
+    # Storage backend (S3): embedded (default) | managed (S4) | external.
+    storage_backend: str = "embedded"
+    storage_url: str | None = None
+    storage_api_key: str | None = None
+    #: Explicit path to the Qdrant executable for managed mode. Without this,
+    #: `find_qdrant_binary` searches the packaged app dir, sys.prefix/bin and
+    #: <data_dir>/bin. `find_qdrant_binary` has always read this value; it was
+    #: never a settings field, so it could not actually be configured.
+    #: A path that is set but missing is an ERROR, not a silent downgrade to
+    #: embedded — a typo must not look like "unsupported platform".
+    qdrant_binary: str | None = None
 
     # Embedding
     embedding_model: str = "all-MiniLM-L6-v2"
@@ -296,6 +413,8 @@ class Settings(BaseSettings):
 
     # Projects (v2 — explicit multi-folder project configuration)
     projects: list[ProjectConfig] = Field(default_factory=list)
+    # Shared-dependency catalog: declared once, selected by any project.
+    dependencies: list[DependencyConfig] = Field(default_factory=list)
     config_version: int = 1
 
     # Retrieval
@@ -359,6 +478,12 @@ class Settings(BaseSettings):
         "set_project_mode":         True,
         "add_project_ignore_rule":  True,
         "remove_project_ignore_rule": True,
+        # Shared dependencies — same tier as the project writes they complement:
+        # onboarding a project that vendors a framework needs both halves.
+        "list_dependencies":        True,
+        "add_dependency":           True,
+        "set_project_dependencies": True,
+        "remove_dependency":        True,
         # Debugging / diagnostics — disabled by default (opt-in for operators)
         "service_status":           False,
         "recent_activity":          False,
@@ -373,10 +498,96 @@ class Settings(BaseSettings):
 
     model_config = {"env_prefix": "RAG_", "env_file": ".env", "env_file_encoding": "utf-8"}
 
+    @model_validator(mode="after")
+    def _anchor_data_dir(self):
+        """Keep ``data_dir`` consistent with an explicit ``qdrant_path`` (S2).
+
+        Backward-compat: if a caller sets ``qdrant_path`` but not ``data_dir``
+        (as most existing tests and configs do), ``data_dir`` follows
+        ``qdrant_path``'s parent — preserving the old "artifacts live next to
+        the store" behaviour. An explicit ``data_dir`` (or ``RAG_DATA_DIR``)
+        always wins and decouples the two.
+        """
+        fields_set = getattr(self, "model_fields_set", set())
+        if "data_dir" not in fields_set and "qdrant_path" in fields_set:
+            object.__setattr__(
+                self, "data_dir", str(Path(self.qdrant_path).resolve().parent)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _adopt_legacy_dependency_paths(self):
+        """Fold legacy per-project ``dependency_paths`` into the catalog.
+
+        READ-ONLY and idempotent: loading a config must never rewrite it, so
+        this only shapes the in-memory model. The TOML is normalised the next
+        time the user saves, and ``dependency_paths`` keeps working either way
+        (sync takes the union), so an existing install changes nothing until
+        someone touches it.
+
+        Two projects that declared the SAME folder collapse to one catalog
+        entry — the deduplication the old model could only reach by accident,
+        when both spellings happened to resolve to the same build identity.
+        """
+        by_path: dict[str, DependencyConfig] = {}
+        for entry in self.dependencies:
+            by_path[_dependency_path_key(entry.path)] = entry
+        taken = {entry.id for entry in self.dependencies}
+        adopted: list[DependencyConfig] = []
+
+        for project in self.projects:
+            for raw in list(project.dependency_paths or []):
+                text = str(raw).strip()
+                if not text:
+                    continue
+                candidate = Path(text)
+                if not candidate.is_absolute():
+                    candidate = Path(project.path) / candidate
+                key = _dependency_path_key(str(candidate))
+
+                entry = by_path.get(key)
+                if entry is None:
+                    entry = DependencyConfig(
+                        id=_unique_dependency_id(candidate, taken),
+                        name=candidate.name or "dependency",
+                        path=str(candidate),
+                    )
+                    taken.add(entry.id)
+                    by_path[key] = entry
+                    adopted.append(entry)
+                if entry.id not in project.dependencies:
+                    project.dependencies.append(entry.id)
+            # CONSUME the legacy field, exactly as `_migrate_legacy_index_source_code`
+            # pops `index_source_code`. Leaving both populated makes the legacy
+            # field a dead control: clearing it would not un-declare anything,
+            # because the adopted link still stands — a silent no-op on the one
+            # gesture a user would expect to work.
+            project.dependency_paths = []
+
+        if adopted:
+            self.dependencies = list(self.dependencies) + adopted
+        return self
+
     @property
     def has_explicit_projects(self) -> bool:
         """True if explicit projects are configured (v2 model)."""
         return len(self.projects) > 0
+
+    def dependency(self, dependency_id: str) -> DependencyConfig | None:
+        """Catalog lookup by id."""
+        return next((d for d in self.dependencies if d.id == dependency_id), None)
+
+    def dependency_paths_for(self, project: ProjectConfig) -> list[str]:
+        """Every dependency root a project uses — catalog links plus legacy.
+
+        Delegates so the scanner (which excludes these roots) and the sync
+        (which indexes them) can never drift apart — see
+        :func:`ragtools.dependency_catalog.resolve_project_dependency_paths`.
+        Imported locally: the catalog module imports this one.
+        """
+        from ragtools.dependency_catalog import resolve_project_dependency_paths
+
+        return resolve_project_dependency_paths(project, self.dependencies)
 
     @property
     def enabled_projects(self) -> list[ProjectConfig]:
@@ -402,11 +613,15 @@ class Settings(BaseSettings):
         )
 
     def get_qdrant_client(self):
-        """Create a Qdrant client in local persistent mode."""
-        from qdrant_client import QdrantClient
+        """Create a Qdrant client via the configured storage backend (S3).
 
-        Path(self.qdrant_path).mkdir(parents=True, exist_ok=True)
-        return QdrantClient(path=self.qdrant_path)
+        Routes through :func:`ragtools.storage.resolve_backend` so the embedded
+        default is preserved while ``external`` (and later ``managed``) work
+        through the same call. This is the single production constructor.
+        """
+        from ragtools.storage import resolve_backend
+
+        return resolve_backend(self).client()
 
     @staticmethod
     def get_memory_client():

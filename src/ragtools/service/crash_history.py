@@ -35,7 +35,9 @@ _MAX_MARKER_AGE_SECONDS = 30 * 24 * 60 * 60
 
 def _logs_dir_for(settings) -> Path:
     """Resolve the logs directory from Settings."""
-    return Path(settings.qdrant_path).parent / "logs"
+    # S2/A9: single authoritative anchor (was Path(qdrant_path).parent, which
+    # split from the watcher's Path(state_db).parent when either was overridden).
+    return Path(settings.data_dir) / "logs"
 
 
 def _load_marker(path: Path) -> Optional[dict]:

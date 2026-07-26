@@ -43,7 +43,18 @@ _GENERATED_PATTERNS = [
     "dist/", "build/", "out/", ".next/", ".nuxt/", "target/",
     "coverage/", "__generated__/", "generated/",
     "*.min.js", "*.min.css", "*.bundle.js", "*.map",
+    # S8/B23: vendored libraries and machine-generated export dumps that an
+    # extension allowlist alone would index (a 125 MB Figma-export JSON was 47%
+    # of one project's apparent indexable bytes; vendored pdf.js sat in a
+    # framework layer).
+    "**/static/lib/",
+    "**/*-extraction/",
+    "**/*_extraction/",
 ]
+
+#: A file larger than this is treated as machine-generated (the 125 MB JSON
+#: case). Hand-written source/config is far smaller. Configurable per call.
+DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MB
 
 _DEP_DIR_SPEC = pathspec.PathSpec.from_lines("gitignore", _DEPENDENCY_DIRS)
 _GEN_SPEC = pathspec.PathSpec.from_lines("gitignore", _GENERATED_PATTERNS)
@@ -88,6 +99,9 @@ def dependency_spec(
 def classify_source_class(
     rel_path: Path | str,
     dep_spec: "pathspec.PathSpec | None" = None,
+    *,
+    size_bytes: int | None = None,
+    max_bytes: int = DEFAULT_MAX_FILE_BYTES,
 ) -> str:
     """Classify a path's source class (precedence: secret > dependency > generated > owned).
 
@@ -95,6 +109,10 @@ def classify_source_class(
     dependency matcher from :func:`dependency_spec` (declared globs + submodules);
     pass ``None`` to skip the per-project layer (conventional/build detection
     still applies).
+
+    ``size_bytes`` (S8/B23) applies the per-file size policy: a file larger than
+    ``max_bytes`` is treated as machine-generated. Pass ``None`` to skip the size
+    check (behaviour unchanged for callers that don't supply a size).
     """
     from ragtools.ignore import is_secret
 
@@ -106,5 +124,7 @@ def classify_source_class(
     if _DEP_DIR_SPEC.match_file(rel):
         return DEPENDENCY
     if _GEN_SPEC.match_file(rel):
+        return GENERATED
+    if size_bytes is not None and size_bytes > max_bytes:
         return GENERATED
     return OWNED

@@ -106,6 +106,11 @@ def test_status_endpoint_includes_scale_field(tmp_path):
     from ragtools.service.owner import QdrantOwner
 
     fake_client = MagicMock()
+    # Status counts with `count(exact=True)`: `get_collection().points_count` is
+    # an optimizer-maintained ESTIMATE that lags recent upserts/deletes and is
+    # None on a fresh collection. Stub both — the exact call is what the code
+    # uses, the estimate is its documented fallback.
+    fake_client.count.return_value = MagicMock(count=23_000)
     fake_client.get_collection.return_value = MagicMock(points_count=23_000)
 
     settings = Settings(

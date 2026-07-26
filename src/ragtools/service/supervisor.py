@@ -230,9 +230,11 @@ def run_supervisor(
     # Detached-child creation flags on Windows to avoid the supervisor
     # and child sharing a console that could close out from under them.
     popen_kwargs: dict = {}
-    if sys.platform == "win32":
-        CREATE_NO_WINDOW = 0x08000000
-        popen_kwargs["creationflags"] = CREATE_NO_WINDOW
+    # Console suppression is a platform concern; the adapter owns the flag.
+    from ragtools.platform import current_platform
+
+    if current_platform() == "windows":
+        popen_kwargs["creationflags"] = 0x08000000
 
     # Stream child stdout/stderr into the same service.log the real service
     # writes to, so all diagnostics stay in one place.

@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Diagnostics — RAG Tools{% endblock %}
+{% block header %}
+<h1 class="page-title">Diagnostics</h1>
+<div class="page-subtitle">What this service actually is, right now</div>
+{% endblock %}
+{% block content %}
+
+{% if not ready %}
+<div class="card">
+  <div class="empty-state">
+    <p class="empty-state-title">The service is still starting</p>
+    <p class="empty-state-body">Reload this page once it reports ready.</p>
+  </div>
+</div>
+{% else %}
+<div class="stack">
+
+  <section class="card" aria-labelledby="svc-identity">
+    <h2 class="card-header" id="svc-identity">Service identity</h2>
+    <p class="card-desc">
+      More than one RAG service can run on this machine. These are the values that tell them apart —
+      the collection, not the version, is what decides which knowledge base you are looking at.
+    </p>
+    <table class="kv-table">
+      <tbody>
+        <tr><th scope="row">Service</th><td>ragtools</td></tr>
+        <tr><th scope="row">Version</th><td>{{ version }}</td></tr>
+        <tr><th scope="row">API version</th><td>{{ api_version }}</td></tr>
+        <tr><th scope="row">Profile</th><td>{{ profile }}</td></tr>
+        <tr><th scope="row">Bound address</th><td><code>{{ bound_host }}:{{ bound_port }}</code></td></tr>
+        <tr><th scope="row">Collection</th><td><code>{{ collection }}</code></td></tr>
+        <tr><th scope="row">Data directory</th><td><code>{{ data_dir }}</code></td></tr>
+      </tbody>
+    </table>
+    <div class="card-footer">
+      <span class="muted">Same values as JSON: <a href="/identity">/identity</a></span>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="svc-storage">
+    <h2 class="card-header" id="svc-storage">Storage engine</h2>
+    <p class="card-desc">
+      Qdrant's local mode is an in-process Python engine: it scans every vector on
+      every query, silently ignores payload indexes, and allows one process at a time.
+      A managed or external server removes all three limits — which is why the scale
+      warning is derived from this table rather than from a fixed number of points.
+    </p>
+    <table class="kv-table">
+      <tbody>
+        <tr><th scope="row">Backend</th><td><code>{{ storage.backend }}</code></td></tr>
+        <tr><th scope="row">Engine version</th>
+            <td>{% if storage.engine_version %}<code>{{ storage.engine_version }}</code>
+                {% else %}<span class="cell-empty">in-process (no server)</span>{% endif %}</td></tr>
+        <tr><th scope="row">Indexed search (HNSW)</th>
+            <td>{% if storage.hnsw %}<span class="badge badge-success">Yes</span>
+                {% else %}<span class="badge badge-warning">No — brute-force scan</span>{% endif %}</td></tr>
+        <tr><th scope="row">Payload indexes</th>
+            <td>{% if storage.payload_indexes %}<span class="badge badge-success">Yes</span>
+                {% else %}<span class="badge badge-warning">Silently ignored</span>{% endif %}</td></tr>
+        <tr><th scope="row">Concurrent readers</th>
+            <td>{% if storage.concurrent_readers %}<span class="badge badge-success">Yes</span>
+                {% else %}<span class="badge badge-warning">No — exclusive lock</span>{% endif %}</td></tr>
+        <tr><th scope="row">Collection model</th><td><code>{{ collection_strategy }}</code></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card" aria-labelledby="svc-collections">
+    <h2 class="card-header" id="svc-collections">Collections</h2>
+    <p class="card-desc">
+      {% if collection_strategy == 'per_project' %}
+        One collection per project, plus one shared corpus per framework build. A
+        framework is indexed once and referenced by every project that links it,
+        rather than re-embedded per project.
+      {% else %}
+        A single shared collection holds every project; scoping is a payload filter.
+      {% endif %}
+    </p>
+    <div class="table-wrap">
+      <table class="table-clean">
+        <thead><tr>
+          <th>Collection</th><th>Kind</th><th>Project</th><th class="cell-num">Points</th>
+        </tr></thead>
+        <tbody>
+          {% for c in collections %}
+          <tr>
+            <td><code>{{ c.name }}</code></td>
+            <td>{% if c.kind == 'framework' %}<span class="badge badge-info">Framework</span>
+                {% elif c.kind == 'project' %}<span class="badge badge-accent">Project</span>
+                {% else %}<span class="badge badge-muted">Shared</span>{% endif %}
+                {% if c.archived %} <span class="badge badge-muted">Archived</span>{% endif %}</td>
+            <td>{% if c.project %}{{ c.project }}{% else %}<span class="cell-empty">—</span>{% endif %}</td>
+            <td class="cell-num">{{ "{:,}".format(c.points or 0) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="card-footer">
+      <span class="muted">{{ "{:,}".format(points_total) }} points across
+        {{ collections | length }} collection{{ '' if collections | length == 1 else 's' }}</span>
+    </div>
+  </section>
+
+</div>
+{% endif %}
+
+{% endblock %}

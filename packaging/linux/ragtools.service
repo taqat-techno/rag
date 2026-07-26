@@ -1,0 +1,36 @@
+# systemd USER unit — installed to ~/.config/systemd/user/ragtools.service
+#
+# A user unit, not a system unit: the product indexes the logged-in user's own
+# projects into a per-user data directory, and a system unit runs as another
+# account that cannot see $HOME.
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ragtools.service
+#
+# On a headless machine also run:
+#   loginctl enable-linger $USER
+# Without it the user manager — and this service — stop at logout, which reads
+# as "indexing randomly broke" the next time someone looks.
+
+[Unit]
+Description=RAG Tools — local knowledge-base service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rag service run --host 127.0.0.1 --port 21420
+Environment="RAG_PROFILE=installed"
+
+# Restart-on-failure is why no bespoke watchdog exists on any platform.
+Restart=on-failure
+RestartSec=5
+# A crash loop must eventually surface as `failed` rather than spin forever.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# The service is loopback-bound and owns only its own data directory.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -185,7 +185,7 @@ def build_menu_items(state: TrayState, callbacks: MenuCallbacks) -> List[MenuIte
 
 def _tray_pid_path(settings) -> Path:
     """Where the tray's own PID file lives (sibling of service.pid)."""
-    return Path(settings.qdrant_path).parent / "tray.pid"
+    return Path(settings.data_dir) / "tray.pid"
 
 
 def _admin_url(settings) -> str:
@@ -219,7 +219,7 @@ def _configure_tray_logging(settings) -> None:
     try:
         from logging.handlers import RotatingFileHandler
 
-        logs_dir = Path(settings.qdrant_path).parent / "logs"
+        logs_dir = Path(settings.data_dir) / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(
             logs_dir / "tray.log",
@@ -291,31 +291,16 @@ class TrayApp:
 
     def _on_copy_url(self) -> None:
         try:
-            import shutil
-            import subprocess
             url = _admin_url(self.settings)
-            if sys.platform == "win32":
-                subprocess.run(["clip"], input=url.encode("utf-8"), check=False)
-                return
-            if sys.platform == "darwin":
-                subprocess.run(["pbcopy"], input=url.encode("utf-8"), check=False)
-                return
-            # Linux / other Unix — try a portable fallback chain covering
-            # Wayland (wl-copy), X11 with xclip, X11 with xsel. Each candidate
-            # is checked with shutil.which first so missing tools don't raise.
-            for tool, args in (
-                ("wl-copy", []),
-                ("xclip",   ["-selection", "clipboard"]),
-                ("xsel",    ["--clipboard", "--input"]),
-            ):
-                if shutil.which(tool):
-                    subprocess.run([tool, *args],
-                                   input=url.encode("utf-8"), check=False)
-                    return
-            logger.warning(
-                "Copy URL: no clipboard tool found on PATH "
-                "(tried wl-copy, xclip, xsel). URL: %s", url,
-            )
+            from ragtools.platform import adapter
+
+            if not adapter().copy_text(url):
+                # A minimal or headless Linux box has no clipboard tool at all.
+                # Saying so is the difference between "nothing happened" and
+                # "install wl-copy or xclip".
+                logger.warning(
+                    "Copy URL failed: no clipboard tool available on this system"
+                )
         except Exception as e:
             logger.warning("Copy URL failed: %s", e)
 
@@ -349,7 +334,7 @@ class TrayApp:
             logger.error("Tray stop failed: %s", e)
 
     def _on_open_logs(self) -> None:
-        self._open_folder(Path(self.settings.qdrant_path).parent / "logs")
+        self._open_folder(Path(self.settings.data_dir) / "logs")
 
     def _on_open_backups(self) -> None:
         self._open_folder(Path(self.settings.state_db).parent / "backups")
@@ -357,14 +342,9 @@ class TrayApp:
     def _open_folder(self, path: Path) -> None:
         try:
             path.mkdir(parents=True, exist_ok=True)
-            if sys.platform == "win32":
-                os.startfile(str(path))
-            elif sys.platform == "darwin":
-                import subprocess
-                subprocess.Popen(["open", str(path)])
-            else:
-                import subprocess
-                subprocess.Popen(["xdg-open", str(path)])
+            from ragtools.platform import adapter
+
+            adapter().open_path(path)
         except Exception as e:
             logger.warning("Open folder failed (%s): %s", path, e)
 

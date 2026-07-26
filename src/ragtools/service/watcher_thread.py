@@ -42,6 +42,23 @@ def _deepest_matching_root(resolved: Path, roots) -> Path | None:
     return best
 
 
+def _affected_projects(changed_paths, project_map) -> set:
+    """Attribute each changed path to its DEEPEST matching project (S1/A6, B25).
+
+    A first-match would mis-attribute a nested child's change to its parent,
+    whose (possibly docs-only) mode then filters the child's code edits out and
+    the scanner excludes them from the parent's scan — silently dropping the
+    change. ``project_map`` maps a resolved project root Path to its id.
+    """
+    affected: set = set()
+    for changed_path in changed_paths:
+        resolved = Path(changed_path).resolve()
+        root = _deepest_matching_root(resolved, project_map.keys())
+        if root is not None:
+            affected.add(project_map[root])
+    return affected
+
+
 class WatcherThread(threading.Thread):
     """File watcher that runs as a daemon thread.
 
@@ -161,7 +178,9 @@ class WatcherThread(threading.Thread):
         watcher's error path and must never raise.
         """
         try:
-            logs_dir = Path(self._settings.state_db).parent / "logs"
+            # S2/A9: same authoritative anchor as crash_history (was
+            # state_db.parent, which could diverge from qdrant_path.parent).
+            logs_dir = Path(self._settings.data_dir) / "logs"
             logs_dir.mkdir(parents=True, exist_ok=True)
             marker = logs_dir / "watcher_gave_up.json"
             marker.write_text(json.dumps({
@@ -265,17 +284,12 @@ class WatcherThread(threading.Thread):
                 if not md_changes:
                     continue
 
-                # Determine affected projects
-                affected = set()
-                for _, changed_path in md_changes:
-                    resolved = Path(changed_path).resolve()
-                    for root, pid in project_map.items():
-                        try:
-                            resolved.relative_to(root)
-                            affected.add(pid)
-                            break
-                        except ValueError:
-                            continue
+                # Determine affected projects — DEEPEST match, not first match
+                # (S1/A6, B25), so a nested child's change is not mis-attributed
+                # to its parent and silently dropped.
+                affected = _affected_projects(
+                    [p for _, p in md_changes], project_map
+                )
 
                 added = sum(1 for c, _ in md_changes if c == Change.added)
                 modified = sum(1 for c, _ in md_changes if c == Change.modified)

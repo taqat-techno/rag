@@ -29,7 +29,16 @@ tray_app = typer.Typer(
 app.add_typer(tray_app, name="tray")
 wiki_app = typer.Typer(help="Wiki sync and maintenance.")
 app.add_typer(wiki_app, name="wiki")
+client_app = typer.Typer(help="Manage MCP client access profiles (who can do what).")
+app.add_typer(client_app, name="client")
 console = Console()
+
+
+def _profile_store(settings=None):
+    """Open the client-profile store at ``{data_dir}/profiles.db``."""
+    from ragtools.profile_store import ProfileStore
+    settings = settings or _get_settings()
+    return ProfileStore(str(Path(settings.data_dir) / "profiles.db"))
 
 
 def _get_settings():
@@ -298,35 +307,24 @@ def doctor(
     config_count = len(patterns.get("config", []))
     checks.append(("Ignore rules", "OK", f"{len(patterns['built-in'])} built-in, {config_count} config"))
 
-    # Auto-recovery integrations (Windows only). If these silently fail to
-    # register during install, the user only finds out the next time a crash
-    # or reboot happens — and then too late. Surfacing both states in
-    # `rag doctor` closes that visibility gap (see field report: watchdog
-    # script existed on disk but Task Scheduler had no entry).
-    if sys.platform == "win32":
-        try:
-            from ragtools.service.startup import is_task_installed
-            if is_task_installed():
-                checks.append(("Login startup", "OK", "Registered in Startup folder"))
-            else:
-                checks.append((
-                    "Login startup", "MISSING",
-                    "Register with: rag service install",
-                ))
-        except Exception as e:
-            checks.append(("Login startup", "ERROR", str(e)))
+    # Autostart health, on every platform. The old check was Windows-only and
+    # answered "is it installed?" with the FIRST match — which is why a machine
+    # carrying a scheduled task and two Startup-folder scripts always looked
+    # correctly configured. `get_task_info` reports duplicates and superseded
+    # entries, and those are the states worth surfacing.
+    try:
+        from ragtools.service.startup import get_task_info
 
-        try:
-            from ragtools.service.watchdog import is_watchdog_installed, TASK_NAME
-            if is_watchdog_installed():
-                checks.append(("Watchdog", "OK", f"Task: {TASK_NAME} (every 15 min)"))
-            else:
-                checks.append((
-                    "Watchdog", "MISSING",
-                    "Register with: rag service watchdog install",
-                ))
-        except Exception as e:
-            checks.append(("Watchdog", "ERROR", str(e)))
+        info = get_task_info()
+        if info is None:
+            checks.append(("Login startup", "MISSING", "Register with: rag service install"))
+        elif info.get("problem"):
+            checks.append(("Login startup", "WARN", info["problem"]))
+        else:
+            checks.append(("Login startup", "OK", f"{info['method']} · {info['task_name']}"))
+    except Exception as e:
+        checks.append(("Login startup", "ERROR", str(e)))
+
 
     # --- Index freshness (A-008) ---
     if state_path.exists():
@@ -380,7 +378,7 @@ def doctor(
             checks.append(("Project paths", "OK", f"{len(_enabled)} project(s)"))
 
     # --- Log file location (L6: surface where logs live; previously hidden) ---
-    _log_path = Path(settings.qdrant_path).parent / "logs" / "service.log"
+    _log_path = Path(settings.data_dir) / "logs" / "service.log"
     data["log_path"] = str(_log_path)
     checks.append(("Logs", "OK" if _log_path.exists() else "INFO", str(_log_path)))
 
@@ -590,7 +588,7 @@ def service_start(
             console.print(f"[green]Service started under supervisor[/green] (PID {pid})")
             console.print("  Supervisor will auto-restart the service on crash.")
         console.print(f"  Listening on http://{settings.service_host}:{settings.service_port}")
-        console.print(f"  Logs: {Path(settings.qdrant_path).parent / 'logs' / 'service.log'}")
+        console.print(f"  Logs: {Path(settings.data_dir) / 'logs' / 'service.log'}")
         console.print("  Note: encoder loading takes 5-10 seconds before service is ready.")
     except RuntimeError as e:
         console.print(f"[yellow]{e}[/yellow]")
@@ -755,99 +753,6 @@ def service_uninstall():
 
 # --- Watchdog (service sub-group) ---
 
-watchdog_app = typer.Typer(help="Scheduled Task watchdog (restarts the service if the supervisor dies).")
-service_app.add_typer(watchdog_app, name="watchdog")
-
-
-@watchdog_app.command("install")
-def watchdog_install(
-    interval: int = typer.Option(15, "--interval", help="Minutes between health checks. Minimum 1."),
-):
-    """Register the Windows Task Scheduler watchdog task."""
-    from ragtools.service.watchdog import DEFAULT_INTERVAL_MINUTES, install_watchdog_task, TASK_NAME
-
-    if sys.platform != "win32":
-        console.print("[yellow]Watchdog install is Windows-only.[/yellow]")
-        raise typer.Exit(0)
-
-    if interval < 1:
-        console.print("[red]--interval must be at least 1 minute.[/red]")
-        raise typer.Exit(2)
-
-    settings = _get_settings()
-    if install_watchdog_task(settings, interval_minutes=interval):
-        console.print(f"[green]Watchdog installed.[/green]")
-        console.print(f"  Task name: {TASK_NAME}")
-        console.print(f"  Interval: every {interval} min")
-        console.print(f"  Command: rag service watchdog check")
-    else:
-        console.print("[red]Watchdog install failed — see log.[/red]")
-        raise typer.Exit(1)
-
-
-@watchdog_app.command("uninstall")
-def watchdog_uninstall():
-    """Remove the watchdog task from Task Scheduler."""
-    from ragtools.service.watchdog import uninstall_watchdog_task
-
-    settings = _get_settings()
-    if uninstall_watchdog_task(settings=settings):
-        console.print("[green]Watchdog removed (or was not installed).[/green]")
-    else:
-        console.print("[red]Watchdog uninstall failed — see log.[/red]")
-        raise typer.Exit(1)
-
-
-@watchdog_app.command("status")
-def watchdog_status():
-    """Show the watchdog task's current state."""
-    from ragtools.service.watchdog import TASK_NAME, get_watchdog_info, is_watchdog_installed
-
-    if sys.platform != "win32":
-        console.print(f"[dim]Not on Windows — watchdog is a no-op.[/dim]")
-        return
-
-    if not is_watchdog_installed():
-        console.print(f"[yellow]Watchdog '{TASK_NAME}' is not installed.[/yellow]")
-        console.print("Install with: [bold]rag service watchdog install[/bold]")
-        return
-
-    info = get_watchdog_info() or {}
-    table = Table(title="Watchdog")
-    table.add_column("Field", style="bold")
-    table.add_column("Value")
-    for k in ("task_name", "status", "next_run", "last_run", "last_result"):
-        table.add_row(k.replace("_", " ").title(), str(info.get(k, "")))
-    console.print(table)
-
-
-@watchdog_app.command("check")
-def watchdog_check():
-    """Perform one health-check. Invoked by Task Scheduler.
-
-    Always exits 0 so Task Scheduler doesn't mark the task as failed —
-    that would suppress Windows's own retry logic and spam notifications.
-    """
-    from ragtools.service.watchdog import run_check, WatchdogAction
-
-    settings = _get_settings()
-    result = run_check(settings)
-
-    if result.action == WatchdogAction.NOTHING:
-        console.print("[green]Service is healthy.[/green]")
-    elif result.action == WatchdogAction.START:
-        pid_str = f" (PID {result.started_pid})" if result.started_pid else ""
-        console.print(f"[yellow]Service was dead; relaunched{pid_str}.[/yellow]")
-        if result.note:
-            console.print(f"[dim]{result.note}[/dim]")
-    elif result.action == WatchdogAction.ALREADY_STARTING:
-        console.print(f"[dim]Another process is already starting the service.[/dim]")
-    # Intentionally do not raise typer.Exit with a non-zero code.
-
-
-# --- Ignore Subcommands ---
-
-
 @ignore_app.command("list")
 def ignore_list(
     path: str = typer.Argument(".", help="Content root to check for .ragignore files"),
@@ -958,19 +863,30 @@ def project_add(
     mode: str = typer.Option("docs", "--mode", help="Project Mode: docs (documentation only), code (source & config only), or general (both)"),
 ):
     """Add a new project folder to the configuration."""
-    import re
+    from ragtools.identity import (
+        InvalidProjectId,
+        slugify_project_id,
+        validate_project_id,
+    )
 
     if mode not in ("docs", "code", "general"):
         console.print("[red]--mode must be: docs, code, or general.[/red]")
         raise typer.Exit(2)
 
-    # Auto-generate ID from name if not provided
+    # One shared rule for the id (plan §11.1). Auto-generate from the name when
+    # none is given; otherwise VALIDATE the owner-supplied id — the offline
+    # branch below used to accept anything, diverging from the HTTP route.
     if not project_id:
-        project_id = re.sub(r'[^a-z0-9-]', '-', name.lower()).strip('-')
-        project_id = re.sub(r'-+', '-', project_id)  # collapse multiple hyphens
-    if not project_id:
-        console.print("[red]Could not generate a valid ID from the name.[/red]")
-        raise typer.Exit(1)
+        project_id = slugify_project_id(name)
+        if not project_id:
+            console.print("[red]Could not generate a valid ID from the name.[/red]")
+            raise typer.Exit(1)
+    else:
+        try:
+            project_id = validate_project_id(project_id)
+        except InvalidProjectId as exc:
+            console.print(f"[red]Invalid --id:[/red] {exc}")
+            raise typer.Exit(2)
 
     resolved_path = str(Path(path).resolve())
     if not Path(resolved_path).is_dir():
@@ -1391,13 +1307,21 @@ def tray_run():
 
 @tray_app.command("install")
 def tray_install():
-    """Register the tray to start on Windows login."""
-    if sys.platform != "win32":
-        console.print("[yellow]Tray autostart is Windows-only for now.[/yellow]")
-        console.print("On macOS/Linux, run `rag tray` manually or use your DE's autostart.")
-        raise typer.Exit(0)
+    """Register the tray to start at login."""
+    from ragtools.platform import PlatformUnsupported, adapter
+    from ragtools.service.tray_startup import TRAY_STARTUP_FILENAME, install_tray_task
 
-    from ragtools.service.tray_startup import install_tray_task, TRAY_STARTUP_FILENAME
+    # A tray needs a desktop session. Headless installs are fully supported
+    # without one, so say that instead of registering something that would fail
+    # at every login.
+    try:
+        if not adapter().has_desktop_session():
+            console.print("[yellow]No desktop session — the tray is not applicable here.[/yellow]")
+            console.print("The service runs headless; nothing further is needed.")
+            raise typer.Exit(0)
+    except PlatformUnsupported as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+        raise typer.Exit(0)
 
     settings = _get_settings()
     try:
@@ -1440,14 +1364,25 @@ def tray_status():
     table.add_column("Field", style="bold")
     table.add_column("Value")
 
-    if sys.platform != "win32":
-        table.add_row("Platform", "[yellow]non-Windows — autostart unsupported[/yellow]")
+    from ragtools.platform import KIND_TRAY, PlatformUnsupported, adapter
+
+    try:
+        impl = adapter()
+    except PlatformUnsupported as exc:
+        table.add_row("Platform", f"[yellow]{exc}[/yellow]")
         console.print(table)
         return
 
-    if is_tray_task_installed():
+    table.add_row("Platform", impl.name)
+    if not impl.has_desktop_session():
+        table.add_row("Desktop session", "[yellow]none — tray not applicable[/yellow]")
+
+    found = impl.find_autostart(KIND_TRAY)
+    if any(not r.legacy for r in found):
         table.add_row("Autostart", "[green]Installed[/green]")
-        table.add_row("Script", str(_startup_script_path()))
+        for registration in found:
+            table.add_row("  " + ("legacy" if registration.legacy else "entry"),
+                          registration.describe())
     else:
         table.add_row("Autostart", "[yellow]Not installed[/yellow]")
         table.add_row("Fix", "rag tray install")
@@ -1573,6 +1508,123 @@ def wiki_sync(
 
 def _slug(ref: str) -> str:
     return "".join(c if c.isalnum() else "-" for c in ref).strip("-") or "ref"
+
+
+# ---------------------------------------------------------------------------
+# Client access profiles (rag client ...)
+# ---------------------------------------------------------------------------
+
+
+@client_app.command("capabilities")
+def client_capabilities():
+    """List the capability groups you can grant (the security checkboxes)."""
+    from ragtools.client_admin import AGENT_GRANTABLE_GROUPS, CAPABILITY_CATALOG
+
+    table = Table(title="Capability groups")
+    table.add_column("Group"); table.add_column("Grantable")
+    table.add_column("Tier"); table.add_column("What it allows")
+    for c in CAPABILITY_CATALOG:
+        grantable = "yes" if c.group in AGENT_GRANTABLE_GROUPS else "[dim]owner-only[/dim]"
+        table.add_row(c.group, grantable, c.tier, c.description)
+    console.print(table)
+    console.print("[dim]Destructive ops (delete/restore collection) are a separate "
+                  "opt-in: add --allow-destructive.[/dim]")
+
+
+@client_app.command("list")
+def client_list():
+    """List configured client profiles."""
+    from ragtools.client_admin import profile_summary
+
+    profiles = _profile_store().list()
+    if not profiles:
+        console.print("[dim]No client profiles. The owner (no RAG_CLIENT_PROFILE) "
+                      "has full access by default.[/dim]")
+        return
+    table = Table(title="Client access profiles")
+    table.add_column("ID"); table.add_column("Name"); table.add_column("Scope")
+    table.add_column("Capabilities"); table.add_column("Destructive")
+    for p in profiles:
+        s = profile_summary(p)
+        scope = s["scope"] if isinstance(s["scope"], str) else ", ".join(s["scope"]) or "none"
+        table.add_row(s["profile_id"], s["display_name"], scope,
+                      ", ".join(s["capabilities"]) or "none",
+                      "yes" if s["destructive"] else "no")
+    console.print(table)
+
+
+@client_app.command("show")
+def client_show(profile_id: str):
+    """Show one client profile and its .mcp.json snippet."""
+    import json
+
+    from ragtools.client_admin import client_config_snippet, profile_summary
+
+    p = _profile_store().get(profile_id)
+    if p is None:
+        console.print(f"[red]No such client:[/red] {profile_id}")
+        raise typer.Exit(1)
+    console.print(profile_summary(p))
+    console.print("\n[bold]Client config (.mcp.json):[/bold]")
+    console.print(json.dumps(client_config_snippet(p), indent=2))
+
+
+@client_app.command("add")
+def client_add(
+    profile_id: str = typer.Argument(..., help="Client id (lowercase, e.g. 'docs-bot')."),
+    name: str = typer.Option("", "--name", help="Display name."),
+    all_projects: bool = typer.Option(False, "--all-projects", help="Grant all projects."),
+    projects: str = typer.Option("", "--projects", help="Comma-separated project ids to scope to."),
+    cap: list[str] = typer.Option(None, "--cap", help="Capability group (repeatable). See `rag client capabilities`."),
+    allow_destructive: bool = typer.Option(False, "--allow-destructive", help="Permit delete/restore collection."),
+):
+    """Add or update a client profile with specific access."""
+    import json
+
+    from ragtools.client_admin import ClientAdminError, build_profile, client_config_snippet
+
+    proj_list = [x.strip() for x in projects.split(",") if x.strip()] if projects else []
+    try:
+        profile = build_profile(
+            profile_id=profile_id, display_name=name, all_projects=all_projects,
+            projects=proj_list, capabilities=list(cap or []),
+            allow_destructive=allow_destructive,
+        )
+    except ClientAdminError as exc:
+        console.print(f"[red]Invalid client:[/red] {exc}")
+        raise typer.Exit(2)
+    store = _profile_store()
+    existed = store.get(profile.profile_id) is not None
+    store.add(profile)
+    console.print(f"[green]Client {'updated' if existed else 'created'}:[/green] "
+                  f"{profile.profile_id}")
+    console.print("\n[bold]Point the client's MCP at this profile (.mcp.json):[/bold]")
+    console.print(json.dumps(client_config_snippet(profile), indent=2))
+
+
+@client_app.command("remove")
+def client_remove(profile_id: str):
+    """Remove a client profile."""
+    store = _profile_store()
+    if store.get(profile_id) is None:
+        console.print(f"[red]No such client:[/red] {profile_id}")
+        raise typer.Exit(1)
+    store.remove(profile_id)
+    console.print(f"[green]Client removed:[/green] {profile_id}")
+
+
+@client_app.command("config")
+def client_config(profile_id: str):
+    """Print the .mcp.json snippet for a client."""
+    import json
+
+    from ragtools.client_admin import client_config_snippet
+
+    p = _profile_store().get(profile_id)
+    if p is None:
+        console.print(f"[red]No such client:[/red] {profile_id}")
+        raise typer.Exit(1)
+    console.print(json.dumps(client_config_snippet(p), indent=2))
 
 
 def _main() -> None:

@@ -18,7 +18,14 @@ def test_version_is_string():
 
 def test_settings_defaults(settings):
     """Settings instantiate with all defaults (no .env needed)."""
-    assert settings.qdrant_path == "data/qdrant"
+    from pathlib import Path
+
+    # S2: storage/state default UNDER the authoritative data_dir, and paths are
+    # ABSOLUTE (no CWD-relative strings that could split the anchor).
+    assert Path(settings.qdrant_path).is_absolute()
+    assert Path(settings.state_db).is_absolute()
+    assert Path(settings.qdrant_path) == Path(settings.data_dir) / "qdrant"
+    assert Path(settings.state_db) == Path(settings.data_dir) / "index_state.db"
     assert settings.collection_name == "markdown_kb"
     assert settings.embedding_model == "all-MiniLM-L6-v2"
     assert settings.embedding_dim == 384
@@ -26,7 +33,6 @@ def test_settings_defaults(settings):
     assert settings.chunk_overlap == 100
     assert settings.top_k == 10
     assert settings.score_threshold == 0.3
-    assert settings.state_db == "data/index_state.db"
 
 
 def test_chunk_model():
