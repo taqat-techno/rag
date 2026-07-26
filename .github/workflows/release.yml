@@ -50,9 +50,12 @@ jobs:
         run: choco install innosetup -y --no-progress
 
       - name: Build installer
+        # The version comes from the TAG, not from installer.iss. Hardwired, it
+        # emitted RAGTools-Setup-3.0.0.exe for tag v3.0.0-rc.2, the upload glob
+        # matched nothing, and the release shipped without an installer.
         run: |
           $env:PATH += ";C:\Program Files (x86)\Inno Setup 6"
-          iscc installer.iss
+          iscc /DMyAppVersion=${{ steps.version.outputs.version }} installer.iss
 
       - name: Create zip of portable bundle
         shell: bash
@@ -67,6 +70,10 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
+          # An asset that does not match is a release published WITHOUT it.
+          # Unset, this defaults to false: the macOS rename and the installer
+          # version drift both shipped incomplete releases that reported success.
+          fail_on_unmatched_files: true
           files: |
             dist/RAGTools-Setup-${{ steps.version.outputs.version }}.exe
             dist/RAGTools-${{ steps.version.outputs.version }}-portable.zip
@@ -130,6 +137,10 @@ jobs:
           name: RAG Tools v${{ steps.version.outputs.version }}
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+          # An asset that does not match is a release published WITHOUT it.
+          # Unset, this defaults to false: the macOS rename and the installer
+          # version drift both shipped incomplete releases that reported success.
+          fail_on_unmatched_files: true
           files: |
             dist/RAGTools-${{ steps.version.outputs.version }}-macOS-arm64.zip
 
@@ -190,5 +201,9 @@ jobs:
           name: RAG Tools v${{ steps.version.outputs.version }}
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+          # An asset that does not match is a release published WITHOUT it.
+          # Unset, this defaults to false: the macOS rename and the installer
+          # version drift both shipped incomplete releases that reported success.
+          fail_on_unmatched_files: true
           files: |
             dist/RAGTools-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz

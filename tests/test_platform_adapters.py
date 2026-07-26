@@ -534,18 +534,42 @@ def test_no_platform_branch_survives_outside_this_package():
     """The seam is only real if it cannot leak back. Thirteen modules branched
     on sys.platform before this package existed; three had no non-Windows path
     at all, which is a Windows product rather than a portable one.
+
+    Parsed, not grepped. The regex version matched its own subject matter: a
+    docstring EXPLAINING why a platform test is the wrong tool was reported as a
+    platform branch, and the build went red for prose. A structural rule that
+    cannot be discussed in a comment is a rule people route around — and the
+    fix, deleting the sentence, would have made the codebase worse.
+
+    The AST also makes the check stricter than the grep ever was: `getattr(sys,
+    "platform")` and an aliased `from sys import platform` are dispatch too, and
+    a text search sees neither.
     """
-    import re
+    import ast
 
     root = Path(__file__).resolve().parents[1] / "src" / "ragtools"
-    pattern = re.compile(r"sys\.platform|platform\.system\(\)")
     offenders: list[str] = []
+
     for path in root.rglob("*.py"):
         rel = path.relative_to(root).as_posix()
         if rel.startswith("platform/"):
             continue                       # the seam itself
-        if pattern.search(path.read_text(encoding="utf-8", errors="replace")):
-            offenders.append(rel)
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:                # not ours to police
+            continue
+        for node in ast.walk(tree):
+            # sys.platform / platform.system()
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                if (node.value.id, node.attr) in {("sys", "platform"),
+                                                  ("platform", "system")}:
+                    offenders.append(rel)
+                    break
+            # from sys import platform  /  from platform import system
+            if isinstance(node, ast.ImportFrom) and node.module in {"sys", "platform"}:
+                if any(a.name in {"platform", "system"} for a in node.names):
+                    offenders.append(rel)
+                    break
 
     assert not offenders, (
         "platform dispatch outside ragtools.platform: " + ", ".join(sorted(offenders))
