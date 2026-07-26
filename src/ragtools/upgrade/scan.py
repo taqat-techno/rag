@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-from ragtools.upgrade.migrate import fold_for_match
+from ragtools.upgrade.migrate import directory_identity, fold_for_match
 
 #: Directory names that mark a NON-installed environment. Matching any of these
 #: anywhere in a path disqualifies it from every cleanup action.
@@ -102,16 +102,15 @@ class ScanResult:
 
 
 def _path_key(value: str) -> str:
-    """Identity of a PATH entry: resolved, normalised, case-folded.
+    """Identity of a PATH entry. One implementation, shared with the repairer.
 
-    ``Programs\\RAGTools`` and ``Programs\\ragtools`` are one directory on
-    Windows and must not be counted as two installs.
+    This used to be a second copy of the same `normcase` logic, and carried the
+    same defect: `Programs\\RAGTools` and `Programs\\ragtools` are one directory
+    on Windows and on the default APFS, two on ext4, and `normcase` answers that
+    correctly only on Windows. Delegating means the scanner and the repairer
+    cannot disagree about what counts as a duplicate.
     """
-    try:
-        resolved = str(Path(value).expanduser().resolve())
-    except OSError:
-        resolved = value
-    return os.path.normcase(resolved.rstrip("\\/"))
+    return directory_identity(value)
 
 
 def is_development_path(path: Path | str) -> bool:
