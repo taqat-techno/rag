@@ -136,6 +136,12 @@ jobs:
           python -m venv cleanroom
           python -c "import sys,glob,subprocess,os; py=os.path.join('cleanroom','Scripts' if sys.platform=='win32' else 'bin','python'+('.exe' if sys.platform=='win32' else '')); subprocess.check_call([py,'-m','pip','install','-q',glob.glob('dist/*.whl')[0]])"
       - name: Exercise the installed artifact
+        # `shell: bash` is load-bearing on windows-latest, where the default
+        # shell is PowerShell and a `<<'PY'` heredoc is a syntax error. Without
+        # it this step failed on Windows alone while passing on Linux and macOS
+        # — so the one platform whose packaging is most complex was the one
+        # never actually exercised. Caught on the v3.0.0-rc.1 run.
+        shell: bash
         run: |
           python - <<'PY'
           import glob, os, subprocess, sys
