@@ -196,3 +196,33 @@ def test_info_surfaces_duplicate_current_registrations(fake):
         Registration("b", KIND_SERVICE, "systemd-user", "y"),
     ]))
     assert "expected exactly one" in startup.get_task_info()["problem"]
+
+
+def test_the_profile_reaches_the_registered_command_not_just_the_environment():
+    """A Windows scheduled task cannot carry environment variables.
+
+    `AutostartSpec.environment` is expressible in a systemd unit and a launchd
+    plist, so `RAG_PROFILE=installed` was honoured on Linux and macOS — and
+    silently dropped on Windows, where `resolve_profile` then falls back to
+    `dev` for a source checkout. One registration, two data roots, decided by
+    the OS. The flag is what makes the declaration true everywhere.
+    """
+    from ragtools.service.startup import AUTOSTART_PROFILE, _service_argv, _spec
+    from ragtools.config import Settings
+
+    settings = Settings(qdrant_path="q", state_db="s")
+    argv = _service_argv(settings)
+
+    assert "--profile" in argv
+    assert argv[argv.index("--profile") + 1] == AUTOSTART_PROFILE
+    # And the declaration the other platforms use still agrees with it.
+    assert _spec(settings).environment["RAG_PROFILE"] == AUTOSTART_PROFILE
+
+
+def test_the_service_run_command_accepts_the_profile_it_is_registered_with():
+    """The flag has to exist on the command the task actually invokes."""
+    import inspect
+
+    from ragtools.cli import service_run
+
+    assert "profile" in inspect.signature(service_run).parameters

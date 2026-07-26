@@ -761,3 +761,28 @@ def test_refresh_forces_a_re_import_of_a_complete_corpus():
             assert owner.sync_frameworks(refresh=True)[0]["files_indexed"] > 0
         finally:
             owner.close()
+
+
+def test_the_inspector_reports_catalog_declarations_not_just_legacy_paths():
+    """A project that declares through the catalog read as declaring nothing.
+
+    `dependency_paths` is the legacy input and is consumed into the catalog at
+    load, so it is empty for every project after an upgrade. The endpoint
+    reported only that field, so a project with a linked, working corpus came
+    back as `declared: []` — found while probing a live service for cross-
+    project leakage, where "declares nothing but is linked to a framework"
+    looked exactly like a leak.
+    """
+    from ragtools.service.routes import project_dependencies
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        proj, _ = _project(tmp, "alpha")
+        entry = DependencyConfig(id="odoo", path=str(proj / "platform" / "odoo"))
+        project = ProjectConfig(id="alpha", path=str(proj), mode="general",
+                                dependencies=["odoo"])
+        with _service_owner(tmp, [project], dependencies=[entry]):
+            result = project_dependencies("alpha")
+
+    assert result["declared_dependencies"] == ["odoo"]
+    assert result["declared"] == [], "the legacy field stays empty, as it should"

@@ -172,7 +172,8 @@ def _clean_install(ctx: dict):
     """
     result = ctx.get("clean_install")
     if result is None:
-        return None, "not run — see scripts/verify_clean_install.py"
+        return None, ("not run — see the install phase of "
+                      "scripts/verify_uninstall_residue.py")
     failed = result.get("failed", 0)
     return failed == 0, f"{result.get('passed', 0)} check(s) passed, {failed} failed"
 
@@ -216,6 +217,29 @@ def _uninstall_clean(ctx: dict):
     return r.get("failed", 0) == 0, f"{r.get('passed', 0)} check(s) passed"
 
 
+def _autostart_lifecycle(ctx: dict):
+    """Autostart registers for THIS user's logon, runs, and removes cleanly.
+
+    These two rows were declared manual on the grounds that they need a reboot.
+    That was one true fact hiding a false conclusion: a reboot supplies only the
+    OS firing the trigger. Registration, its binding to this user's logon, the
+    recorded command actually executing, and removal leaving zero residue are
+    all observable now — and running them found that the product could not
+    register autostart for a non-administrator at all.
+
+    What a reboot would still add: that Windows fires an at-logon trigger at
+    logon. That is the OS's behaviour, not this product's, and it is the only
+    part of these rows this cannot reach.
+    """
+    # NOT `ctx["autostart"]` — that key is the /api/diagnostics component V08
+    # reads. Sharing it made this row report PASS off another row's evidence,
+    # which is the exact manufactured pass the gate exists to prevent.
+    r = ctx.get("autostart_lifecycle")
+    if r is None:
+        return None, "not run — see scripts/verify_autostart_lifecycle.py"
+    return r.get("failed", 0) == 0, f"{r.get('passed', 0)} check(s) passed"
+
+
 def _scale_matches_engine(ctx: dict) -> tuple[bool, str]:
     """The scale warning must describe the engine actually in use.
 
@@ -234,9 +258,10 @@ ROWS = [
     Row("V01", "clean install of the built artifact", _clean_install),
     Row("V02", "upgrade rehearsal against the previous release", _upgrade_rehearsal,
         platforms=("windows",)),
-    Row("V03", "reboot and sign-in -> service autostarts",
-        manual_reason="needs a reboot"),
-    Row("V04", "tray autostart and state accuracy", manual_reason="needs a desktop session"),
+    Row("V03", "service autostart registers, fires and removes cleanly",
+        _autostart_lifecycle, platforms=("windows",)),
+    Row("V04", "tray autostart registers, fires and removes cleanly",
+        _autostart_lifecycle, platforms=("windows",)),
     Row("V05", "headless install (no desktop session)",
         manual_reason="needs a headless host", platforms=("linux", "darwin")),
     Row("V06", "service is ready", _service_ready),
@@ -318,6 +343,8 @@ def main(argv=None) -> int:
     parser.add_argument("--uninstall-failed", type=int, default=None)
     parser.add_argument("--storage-recovery-passed", type=int, default=None)
     parser.add_argument("--storage-recovery-failed", type=int, default=None)
+    parser.add_argument("--autostart-passed", type=int, default=None)
+    parser.add_argument("--autostart-failed", type=int, default=None)
     args = parser.parse_args(argv)
 
     from ragtools.platform import current_platform
@@ -340,6 +367,9 @@ def main(argv=None) -> int:
     if args.rehearsal_passed is not None:
         ctx["rehearsal"] = {"passed": args.rehearsal_passed,
                             "failed": args.rehearsal_failed or 0}
+    if args.autostart_passed is not None:
+        ctx["autostart_lifecycle"] = {"passed": args.autostart_passed,
+                                      "failed": args.autostart_failed or 0}
     matrix = run(platform, ctx)
     print(matrix.render())
     # Manual rows do not fail the run, but they DO keep it from being validated.

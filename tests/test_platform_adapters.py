@@ -34,7 +34,7 @@ from ragtools.platform import (
 from ragtools.platform.base import CommandResult
 from ragtools.platform.darwin import DarwinAdapter
 from ragtools.platform.linux import LinuxAdapter
-from ragtools.platform.windows import WindowsAdapter
+from ragtools.platform.windows import WindowsAdapter, render_task_xml
 
 
 class FakeRunner:
@@ -141,11 +141,16 @@ def test_a_surviving_legacy_registration_names_the_fix():
 # --- Windows -------------------------------------------------------------
 
 
-def _win(tmp_path, runner):
+def _win(tmp_path, runner, **kwargs):
     startup = tmp_path / "Startup"
     startup.mkdir(parents=True, exist_ok=True)
-    return WindowsAdapter(runner, home=tmp_path,
-                          local_app_data=tmp_path / "Local", startup_dir=startup), startup
+    kwargs.setdefault("user", "TESTHOST\\tester")
+    return WindowsAdapter(runner, home=tmp_path, local_app_data=tmp_path / "Local",
+                          startup_dir=startup, **kwargs), startup
+
+
+def _rendered(spec, user="TESTHOST\\tester", task_path=r"\RAGTools\Service"):
+    return render_task_xml(spec, user=user, task_path=task_path)
 
 
 def test_windows_registers_one_at_logon_task_without_a_vbs_shim(tmp_path, allow_platform_writes):
@@ -159,10 +164,118 @@ def test_windows_registers_one_at_logon_task_without_a_vbs_shim(tmp_path, allow_
         name="svc", kind=KIND_SERVICE, argv=[r"C:\P\rag.exe", "service", "run"]))
 
     assert reg.mechanism == "task-scheduler"
-    assert runner.saw("/sc onlogon")
-    assert runner.saw("/rl limited"), "a per-user product must not elevate"
+    assert runner.saw("/xml"), "registration goes through a task definition"
     assert not runner.saw(".vbs")
     assert not runner.saw("wscript")
+
+
+def test_windows_names_the_user_in_the_logon_trigger():
+    """The defect this closes, stated as a test.
+
+    `schtasks /sc onlogon` emits a LogonTrigger with no <UserId> — "at logon of
+    ANY user" — which the scheduler accepts only from an administrator. Measured
+    on a standard account: /sc onlogon is refused with *Access is denied* while
+    /sc once succeeds in the same namespace. Without this element the product
+    cannot start itself for the very user it is installed for.
+    """
+    xml = _rendered(AutostartSpec("svc", KIND_SERVICE, ["rag.exe"]))
+
+    trigger = xml.split("<Triggers>")[1].split("</Triggers>")[0]
+    assert "<UserId>TESTHOST\\tester</UserId>" in trigger
+    assert "<RunLevel>LeastPrivilege</RunLevel>" in xml, "must never elevate"
+
+
+def test_windows_task_survives_the_conditions_a_service_actually_meets():
+    """Windows' own defaults are wrong for a background service, and `/sc
+    onlogon` set none of them: it would refuse to start on battery, be stopped
+    on switching to battery, and be killed at the default 72-hour limit."""
+    xml = _rendered(AutostartSpec("svc", KIND_SERVICE, ["rag.exe"]))
+
+    assert "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" in xml
+    assert "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" in xml
+    assert "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in xml, "PT0S = no limit"
+    assert "<StartWhenAvailable>true</StartWhenAvailable>" in xml
+
+
+def test_windows_restart_policy_replaces_the_watchdog_process():
+    """The 462-line watchdog restarted a service the scheduler restarts
+    natively — but only if something asks it to, and nothing ever did."""
+    xml = _rendered(AutostartSpec("svc", KIND_SERVICE, ["rag.exe"]))
+
+    restart = xml.split("<RestartOnFailure>")[1].split("</RestartOnFailure>")[0]
+    assert "<Interval>PT1M</Interval>" in restart
+    assert "<Count>3</Count>" in restart
+
+
+def test_windows_task_xml_is_written_as_utf16(tmp_path, allow_platform_writes):
+    """Task Scheduler rejects a UTF-8 definition as "The task XML is malformed",
+    which reads like a schema error and is not one."""
+    seen: dict = {}
+
+    def runner(argv):
+        argv = list(argv)
+        if "/xml" in argv:
+            seen["raw"] = Path(argv[argv.index("/xml") + 1]).read_bytes()
+        return OK
+
+    adapter, _ = _win(tmp_path, runner)
+    adapter.install_autostart(AutostartSpec("svc", KIND_SERVICE, ["rag.exe"]))
+
+    assert seen["raw"][:2] in (b"\xff\xfe", b"\xfe\xff"), "UTF-16 BOM expected"
+    assert "<LogonTrigger>" in seen["raw"].decode("utf-16")
+
+
+def test_windows_task_definition_is_not_left_in_the_temp_directory(tmp_path, allow_platform_writes):
+    """The definition names the account the task runs as. It is a temp file with
+    a lifetime, not a document to leave lying around."""
+    captured: dict = {}
+
+    def runner(argv):
+        argv = list(argv)
+        if "/xml" in argv:
+            captured["path"] = Path(argv[argv.index("/xml") + 1])
+        return CommandResult(1, "", "Access denied")
+
+    adapter, _ = _win(tmp_path, runner)
+    with pytest.raises(RuntimeError):
+        adapter.install_autostart(AutostartSpec("svc", KIND_SERVICE, ["rag.exe"]))
+
+    assert not captured["path"].exists(), "removed even when registration fails"
+
+
+def test_windows_xml_escapes_arguments():
+    """A path or argument containing `&` produces a malformed document, and the
+    scheduler's only reply is that the XML is malformed."""
+    xml = _rendered(AutostartSpec(
+        "svc", KIND_SERVICE, [r"C:\Program Files\R&D\rag.exe", "--flag", "a<b"],
+        description="R&D build", working_dir=Path(r"C:\R&D")))
+
+    assert "R&amp;D" in xml
+    assert "a&lt;b" in xml
+    assert "&D\\rag" not in xml, "a raw ampersand would break the document"
+
+
+def test_windows_removal_prunes_the_empty_task_folder(tmp_path, allow_platform_writes):
+    """Task Scheduler keeps the folder after its last task is deleted, so an
+    uninstall that removes both registrations still leaves a `RAGTools` node in
+    the scheduler tree."""
+    runner = FakeRunner({"/tn \\RAGTools\\Service": OK, "schtasks /delete": OK})
+    adapter, _ = _win(tmp_path, runner)
+
+    adapter.remove_autostart(r"\RAGTools\Service")
+
+    assert runner.saw("DeleteFolder('RAGTools', 0)")
+
+
+def test_windows_removing_a_startup_file_does_not_touch_the_task_folder(tmp_path, allow_platform_writes):
+    """Pruning is scoped to the mechanism that owns the folder."""
+    runner = FakeRunner()
+    adapter, startup = _win(tmp_path, runner)
+    (startup / "RAGTools.vbs").write_text("legacy", encoding="utf-8")
+
+    adapter.remove_autostart("RAGTools.vbs")
+
+    assert not runner.saw("DeleteFolder")
 
 
 def test_windows_enumerates_every_superseded_registration(tmp_path):
@@ -205,12 +318,15 @@ def test_windows_removing_a_startup_file_is_idempotent(tmp_path, allow_platform_
     assert adapter.remove_autostart("RAGTools.vbs") == []      # second run: no-op
 
 
-def test_windows_delay_is_encoded_as_schtasks_expects(tmp_path, allow_platform_writes):
-    runner = FakeRunner({"schtasks /create": OK})
-    adapter, _ = _win(tmp_path, runner)
-    adapter.install_autostart(AutostartSpec(
-        name="svc", kind=KIND_SERVICE, argv=["rag.exe"], delay_seconds=90))
-    assert runner.saw("0001:30")
+def test_windows_delay_is_encoded_as_the_task_schema_expects():
+    """ISO-8601, because that is what the schema takes — `schtasks`' own
+    `mmmm:ss` form does not appear in a task definition."""
+    assert "<Delay>PT90S</Delay>" in _rendered(
+        AutostartSpec("svc", KIND_SERVICE, ["rag.exe"], delay_seconds=90))
+    assert "<Delay>PT2M</Delay>" in _rendered(
+        AutostartSpec("svc", KIND_SERVICE, ["rag.exe"], delay_seconds=120))
+    assert "<Delay>" not in _rendered(
+        AutostartSpec("svc", KIND_SERVICE, ["rag.exe"])), "no delay, no element"
 
 
 def test_windows_install_failure_raises_rather_than_reporting_success(tmp_path, allow_platform_writes):
@@ -487,7 +603,7 @@ def test_darwin_refuses_a_label_less_plist():
 
 
 def test_windows_ignores_spec_name_for_the_registration_target(tmp_path, allow_platform_writes):
-    """`spec.name` is a DISPLAY name; the target comes from `kind`.
+    r"""`spec.name` is a DISPLAY name; the target comes from `kind`.
 
     Found by a verification probe that passed a sandbox name, was silently given
     the real `\RAGTools\Service` path, and would have overwritten the user's

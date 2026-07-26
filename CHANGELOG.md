@@ -54,6 +54,29 @@ files are preserved; the vector store is not convertible. See
   ship an interpreted shim.
 
 ### Fixed
+- **Windows autostart could not be registered by a standard user.** Registration
+  went through `schtasks /sc onlogon`, which builds a logon trigger with no
+  `<UserId>` — "at logon of *any* user" — and only an administrator may create
+  that. A per-user product therefore needed elevation to start itself. It now
+  registers from a task XML naming the account, which needs no elevation. Also
+  settled, having been left at Windows' defaults: the service no longer refuses
+  to start on battery, is no longer stopped when the machine switches to
+  battery, and is no longer killed at the default 72-hour execution limit. The
+  task now carries the native `RestartOnFailure` policy the retired watchdog was
+  imitating by hand.
+- Removing autostart also prunes the now-empty task folder — Task Scheduler
+  keeps it after its last task is deleted, so uninstall left a `RAGTools` node
+  behind in the scheduler tree.
+- **Autostart started the service on the wrong data root on Windows.** The
+  registration declares `RAG_PROFILE=installed`, which a systemd unit and a
+  launchd plist can carry and a scheduled task cannot — so on Windows a source
+  install fell back to the `dev` profile and the service that came up at login
+  served a different index. The profile now travels as `rag service run
+  --profile`, which every mechanism carries.
+- `/api/projects/{id}/dependencies` reported only the legacy `dependency_paths`
+  field, so a project declaring through the catalog read as `declared: []`
+  while holding a linked, working corpus. It now also returns
+  `declared_dependencies`.
 - `StartLimitIntervalSec` was emitted in `[Service]`, where systemd ignores it —
   the crash-loop protection did nothing.
 - A zombie process reported as alive, so a dead service read as running and stale

@@ -149,3 +149,17 @@ def test_supplied_evidence_makes_the_row_pass():
 def test_evidence_of_failure_fails_the_row():
     ctx = {**HEALTHY, "clean_install": {"passed": 4, "failed": 2}}
     assert run("windows", ctx, _rows("V01")).results[0].status == FAIL
+
+
+def test_autostart_rows_need_the_probe_and_are_not_manual_by_default():
+    """V03/V04 stopped being "needs a reboot" rows once it turned out a reboot
+    supplies only the OS firing the trigger. They are automated now — but they
+    still require evidence, so an unrun probe reports MANUAL rather than green.
+    """
+    assert all(r.status == MANUAL for r in run("windows", HEALTHY, _rows("V03", "V04")).results)
+
+    ctx = {**HEALTHY, "autostart_lifecycle": {"passed": 20, "failed": 0}}
+    assert all(r.status == PASS for r in run("windows", ctx, _rows("V03", "V04")).results)
+
+    ctx = {**HEALTHY, "autostart_lifecycle": {"passed": 18, "failed": 2}}
+    assert all(r.status == FAIL for r in run("windows", ctx, _rows("V03", "V04")).results)

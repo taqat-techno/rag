@@ -23,11 +23,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 PASS, FAIL = "PASS", "FAIL"
-results: list[tuple[str, str, str]] = []
+
+#: (name, status, detail, phase). The phases are reported separately because
+#: they are separate matrix rows: V01 is "a clean install of the BUILT artifact
+#: works", V15 is "removing it leaves nothing". One run produces both, but
+#: collapsing them into a single number would let install evidence satisfy the
+#: uninstall row and vice versa.
+results: list[tuple[str, str, str, str]] = []
+
+INSTALL, UNINSTALL = "install", "uninstall"
 
 
-def check(name: str, ok: bool, detail: str = "") -> None:
-    results.append((name, PASS if ok else FAIL, detail))
+def check(name: str, ok: bool, detail: str = "", phase: str = UNINSTALL) -> None:
+    results.append((name, PASS if ok else FAIL, detail, phase))
     print(f"  [{PASS if ok else FAIL}] {name}" + (f" — {detail}" if detail else ""))
 
 
@@ -64,7 +72,7 @@ def main() -> int:
                      "-w", str(dist), "-q"])
         wheels = list(dist.glob("*.whl"))
         check("the wheel builds", bool(wheels),
-              wheels[0].name if wheels else (built.stderr or "")[-90:])
+              wheels[0].name if wheels else (built.stderr or "")[-90:], INSTALL)
         if not wheels:
             return 1
 
@@ -73,13 +81,31 @@ def main() -> int:
             "python.exe" if sys.platform == "win32" else "python")
         install = run([str(py), "-m", "pip", "install", "-q", str(wheels[0])])
         check("it installs into a clean interpreter", install.returncode == 0,
-              (install.stderr or "")[-90:] if install.returncode else "")
+              (install.stderr or "")[-90:] if install.returncode else "", INSTALL)
 
         scripts_dir = venv / ("Scripts" if sys.platform == "win32" else "bin")
         entry = [p for p in scripts_dir.glob("rag*") if p.suffix.lower() in (".exe", "")]
         check("entry points are created", len(entry) >= 2,
               ", ".join(sorted(p.name for p in entry))
-              or f"scripts dir holds: {sorted(q.name for q in scripts_dir.iterdir())[:6]}")
+              or f"scripts dir holds: {sorted(q.name for q in scripts_dir.iterdir())[:6]}",
+              INSTALL)
+
+        # --- drive the installed artifact, not the source tree -----------
+        # "pip install returned 0" is not evidence that what ships works. This
+        # is the same set the CI clean-install job runs: package data present,
+        # the platform adapter resolvable, and the retired watchdog genuinely
+        # absent from the distribution rather than merely deleted from git.
+        exercised = run([str(py), "-c", (
+            "import ragtools, pathlib, importlib.util as u;"
+            "root = pathlib.Path(ragtools.__file__).parent;"
+            "assert len(list((root/'service'/'templates').glob('*.html'))) >= 8;"
+            "from ragtools.platform import adapter; adapter();"
+            "from ragtools.upgrade import scan, migrate_config;"
+            "assert u.find_spec('ragtools.service.watchdog') is None, 'watchdog shipped';"
+            "print(ragtools.__version__)")])
+        check("the installed artifact imports and resolves its platform",
+              exercised.returncode == 0,
+              (exercised.stdout or exercised.stderr or "").strip()[-90:], INSTALL)
 
         # --- a runtime footprint, as a real install would leave ----------
         (data / "logs").mkdir(parents=True)
@@ -134,9 +160,17 @@ def main() -> int:
         shutil.rmtree(root, ignore_errors=True)
         check("the sandbox itself is removed", not root.exists(), str(root))
 
+    def tally(phase: str) -> dict:
+        rows = [r for r in results if r[3] == phase]
+        failed = [r for r in rows if r[1] == FAIL]
+        return {"passed": len(rows) - len(failed), "failed": len(failed)}
+
     failed = [r for r in results if r[1] == FAIL]
     print(f"\n  {len(results) - len(failed)} passed, {len(failed)} failed")
-    print(json.dumps({"passed": len(results) - len(failed), "failed": len(failed)}))
+    print(json.dumps({
+        "passed": len(results) - len(failed), "failed": len(failed),
+        INSTALL: tally(INSTALL), UNINSTALL: tally(UNINSTALL),
+    }))
     return 1 if failed else 0
 
 

@@ -1068,7 +1068,13 @@ def project_dependencies(project_id: str):
     return {
         "project": project_id,
         "supported": owner.router.is_per_project,
+        # `dependency_paths` is the LEGACY input, consumed into the catalog at
+        # load — so it is empty for every project that declares through the
+        # catalog, which is all of them after an upgrade. Reporting only that
+        # made a project with a linked, working corpus read as declaring
+        # nothing at all.
         "declared": list(project.dependency_paths),
+        "declared_dependencies": list(project.dependencies or []),
         "linked_collections": linked,
         # Declared-but-not-yet-linked means the sync has not run (or failed):
         # those files are in NO collection right now, which is worth saying.

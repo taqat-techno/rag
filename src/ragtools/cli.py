@@ -667,8 +667,30 @@ def service_status_cmd():
 def service_run(
     host: str = typer.Option(None, "--host", help="Bind host"),
     port: int = typer.Option(None, "--port", help="Bind port"),
+    profile: str = typer.Option(
+        None, "--profile",
+        help="Runtime profile (installed|dev). Equivalent to RAG_PROFILE, and "
+             "the form autostart uses — a scheduled task cannot carry "
+             "environment variables.",
+    ),
 ):
     """Start the service in the foreground (internal use)."""
+    if profile:
+        # Set before anything resolves settings: the profile decides which data
+        # root, index and configuration the process uses.
+        #
+        # This option exists because `AutostartSpec.environment` is expressible
+        # in a systemd unit and a launchd plist but NOT in a Windows scheduled
+        # task, so one registration yielded `installed` on Linux and `dev` on
+        # Windows — the autostarted service silently serving a different index
+        # depending on the OS. An argument travels everywhere a command does.
+        import os as _os
+
+        from ragtools.devenv import resolve_profile
+
+        resolve_profile({"RAG_PROFILE": profile})      # rejects an unknown value
+        _os.environ["RAG_PROFILE"] = profile.strip().lower()
+
     from ragtools.service.run import main as run_main
     import sys as _sys
     argv = ["ragtools.service.run"]

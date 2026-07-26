@@ -15,11 +15,28 @@ The ``.vbs`` shims are gone. They existed to hide a console window, which is
 what ``CREATE_NO_WINDOW`` is for; shipping an interpreted script to work around
 a process-creation flag is how "a black box flashes on my screen every minute"
 became a shipped behaviour.
+
+Registration goes through a **task XML document**, not ``schtasks /sc onlogon``.
+That is not a stylistic preference. ``/sc onlogon`` builds a logon trigger with
+no ``<UserId>`` — "at logon of *any* user" — which the scheduler will only
+accept from an administrator, so the earlier implementation could not register
+autostart for a standard account at all: measured on a non-admin machine,
+``/sc onlogon`` is refused with *Access is denied* while ``/sc once`` succeeds
+in the same namespace. A per-user product that needs elevation to start itself
+is broken for the user it is aimed at. Naming the user in the trigger removes
+the requirement entirely.
+
+Writing the XML ourselves also settles three defaults that Windows gets wrong
+for a background service and that ``/sc onlogon`` left untouched: it would not
+start on battery, it would be *stopped* on switching to battery, and it would be
+killed after the default 72-hour execution limit. It also supplies the native
+``RestartOnFailure`` policy that makes a bespoke watchdog process unnecessary.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -51,6 +68,21 @@ LEGACY_STARTUP_FILES = {
     "RAGTools-Tray.vbs": KIND_TRAY,
 }
 
+#: Task Scheduler accepts nothing but UTF-16 for `/xml`. A UTF-8 file — even
+#: with a BOM — is rejected outright as "The task XML is malformed", which reads
+#: like a schema error and is not one. Measured, not assumed.
+TASK_XML_ENCODING = "utf-16"
+
+#: How the scheduler restarts a service that dies. This is the native
+#: replacement for the 462-line watchdog process: the previous implementation
+#: registered no restart policy at all, so the watchdog was doing by hand what
+#: nothing had ever asked the scheduler to do.
+RESTART_INTERVAL = "PT1M"
+RESTART_COUNT = 3
+
+#: Task-folder names this adapter is willing to interpolate into a command.
+_SAFE_FOLDER = re.compile(r"[A-Za-z0-9 _.\-]+")
+
 
 class WindowsAdapter:
     """Windows implementation of :class:`~ragtools.platform.base.PlatformAdapter`."""
@@ -65,9 +97,11 @@ class WindowsAdapter:
         local_app_data: Optional[Path] = None,
         startup_dir: Optional[Path] = None,
         task_prefix: str = TASK_PREFIX,
+        user: Optional[str] = None,
     ):
         self._run = runner or default_runner
         self._task_prefix = task_prefix
+        self._user = user
         self._home = Path(home) if home else Path.home()
         self._lad = Path(local_app_data) if local_app_data else self._resolve_lad()
         self._startup = Path(startup_dir) if startup_dir else self._resolve_startup()
@@ -164,37 +198,55 @@ class WindowsAdapter:
         return self._task_prefix + "\\" + leaf
 
     def install_autostart(self, spec: AutostartSpec) -> Registration:
-        """Register one at-logon task. Replaces any same-named task (`/F`)."""
+        """Register one at-logon task from an XML definition. Replaces (`/F`).
+
+        The XML is written to a temp file rather than piped, because `schtasks`
+        takes a path and nothing else, and removed in a `finally` so a failed
+        registration does not leave a task definition — which names the account
+        it runs as — lying around in the temp directory.
+        """
+        import tempfile
+
         task = self._task_path(spec.kind)
-        command = " ".join(_quote(a) for a in spec.argv)
-        args = [
-            "schtasks", "/create", "/tn", task,
-            "/tr", command,
-            "/sc", "onlogon",
-            "/rl", "limited",          # never elevate: this is a per-user product
-            "/f",
-        ]
-        if spec.delay_seconds:
-            args += ["/delay", _delay_hhmm(spec.delay_seconds)]
-        result = self._run(args)
+        document = render_task_xml(spec, user=self.current_user(), task_path=task)
+
+        handle, raw = tempfile.mkstemp(prefix="ragtools-task-", suffix=".xml")
+        os.close(handle)
+        definition = Path(raw)
+        try:
+            definition.write_text(document, encoding=TASK_XML_ENCODING)
+            result = self._run(
+                ["schtasks", "/create", "/tn", task, "/xml", str(definition), "/f"])
+        finally:
+            try:
+                definition.unlink()
+            except OSError:
+                pass
+
         if not result.ok:
             raise RuntimeError(
                 f"failed to register {task}: {result.stderr.strip() or result.stdout.strip()}"
             )
         return Registration(
             name=task, kind=spec.kind, mechanism="task-scheduler",
-            target=command, enabled=True,
+            target=_command_line(spec.argv), enabled=True,
         )
+
+    def current_user(self) -> str:
+        """The account autostart is registered for. Injectable for tests."""
+        return self._user or _current_user()
 
     def remove_autostart(self, name: str) -> list[Registration]:
         """Remove a registration by name. Idempotent — absent is success."""
         removed: list[Registration] = []
+        pruneable = False
         for existing in self.find_autostart(KIND_SERVICE) + self.find_autostart(KIND_TRAY):
             if existing.name != name:
                 continue
             if existing.mechanism == "task-scheduler":
                 if self._run(["schtasks", "/delete", "/tn", existing.name, "/f"]).ok:
                     removed.append(existing)
+                    pruneable = existing.name.startswith(self._task_prefix + "\\")
             elif existing.path is not None:
                 try:
                     existing.path.unlink()
@@ -203,7 +255,33 @@ class WindowsAdapter:
                     removed.append(existing)      # already gone == removed
                 except OSError:
                     pass
+        if pruneable:
+            self._prune_task_folder()
         return removed
+
+    def _prune_task_folder(self) -> None:
+        """Drop the product's task folder once its last task is gone.
+
+        Task Scheduler keeps a folder after everything inside it is deleted, so
+        removing both registrations still leaves a ``RAGTools`` node in the
+        scheduler tree — residue that an uninstall claiming "nothing survives"
+        would be wrong about.
+
+        ``DeleteFolder`` refuses a folder that still has contents, which makes
+        this self-guarding: it can only succeed when there is genuinely nothing
+        left. Best effort throughout — failing to tidy a folder must never turn
+        a successful removal into an error.
+        """
+        folder = self._task_prefix.strip("\\")
+        # The prefix is ours, not user input; the pattern is belt-and-braces
+        # against ever interpolating a quote or a statement separator.
+        if not folder or not _SAFE_FOLDER.fullmatch(folder):
+            return
+        self._run([
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "$s = New-Object -ComObject Schedule.Service; $s.Connect(); "
+            f"try {{ $s.GetFolder('\\').DeleteFolder('{folder}', 0) }} catch {{ }}",
+        ])
 
     def find_autostart(self, kind: str = KIND_SERVICE) -> list[Registration]:
         found: list[Registration] = []
@@ -275,14 +353,118 @@ class WindowsAdapter:
 
 
 def _quote(arg: str) -> str:
-    """Quote one argv element for a schtasks `/tr` command string."""
+    """Quote one argv element for a Windows command line."""
     return f'"{arg}"' if " " in arg and not arg.startswith('"') else arg
 
 
-def _delay_hhmm(seconds: int) -> str:
-    """schtasks wants a delay as ``mmmm:ss`` (up to 9999 minutes)."""
-    seconds = max(0, min(seconds, 9999 * 60))
-    return f"{seconds // 60:04d}:{seconds % 60:02d}"
+def _command_line(argv: Sequence[str]) -> str:
+    return " ".join(_quote(a) for a in argv)
+
+
+def _current_user() -> str:
+    """``DOMAIN\\user`` for the account this process runs as.
+
+    Resolved through ``GetUserNameExW`` rather than ``%USERDOMAIN%\\%USERNAME%``
+    because the environment is inherited and can be stale or overridden, and a
+    logon trigger naming the wrong account is a task that never fires — a
+    failure that only shows up at the next login, on someone else's machine.
+    The environment is the fallback, and the only path on non-Windows hosts
+    (the suite renders this XML on Linux and macOS runners).
+    """
+    import ctypes
+
+    windll = getattr(ctypes, "windll", None)
+    if windll is not None:
+        NAME_SAM_COMPATIBLE = 2
+        size = ctypes.c_ulong(0)
+        try:
+            windll.secur32.GetUserNameExW(NAME_SAM_COMPATIBLE, None, ctypes.byref(size))
+            buffer = ctypes.create_unicode_buffer(max(size.value, 256))
+            size.value = len(buffer)
+            if windll.secur32.GetUserNameExW(NAME_SAM_COMPATIBLE, buffer,
+                                             ctypes.byref(size)) and buffer.value:
+                return buffer.value
+        except (AttributeError, OSError):
+            pass
+
+    domain = os.environ.get("USERDOMAIN", "").strip()
+    user = os.environ.get("USERNAME", "").strip()
+    return f"{domain}\\{user}" if domain and user else user
+
+
+def _iso_duration(seconds: int) -> str:
+    """Seconds as an ISO-8601 duration, which is what the task schema wants."""
+    seconds = max(0, int(seconds))
+    if seconds and seconds % 60 == 0:
+        return f"PT{seconds // 60}M"
+    return f"PT{seconds}S"
+
+
+def render_task_xml(spec: AutostartSpec, *, user: str, task_path: str) -> str:
+    """The task definition, as a pure function so the suite can assert on it.
+
+    Element order mirrors what Task Scheduler itself emits on a round trip
+    rather than what the published schema implies — the two disagree, and the
+    scheduler is the one that has to accept the file.
+    """
+    from xml.sax.saxutils import escape
+
+    trigger_delay = (f"\n      <Delay>{_iso_duration(spec.delay_seconds)}</Delay>"
+                     if spec.delay_seconds else "")
+    working_dir = (f"\n      <WorkingDirectory>{escape(str(spec.working_dir))}"
+                   "</WorkingDirectory>" if spec.working_dir else "")
+    arguments = (f"\n      <Arguments>{escape(_command_line(spec.argv[1:]))}</Arguments>"
+                 if len(spec.argv) > 1 else "")
+    description = (f"\n    <Description>{escape(spec.description)}</Description>"
+                   if spec.description else "")
+
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>{description}
+    <URI>{escape(task_path)}</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{escape(user)}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <RestartOnFailure>
+      <Interval>{RESTART_INTERVAL}</Interval>
+      <Count>{RESTART_COUNT}</Count>
+    </RestartOnFailure>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+  </Settings>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{escape(user)}</UserId>{trigger_delay}
+    </LogonTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{escape(spec.argv[0])}</Command>{arguments}{working_dir}
+    </Exec>
+  </Actions>
+</Task>
+"""
 
 
 def _task_target(query_output: str) -> str:

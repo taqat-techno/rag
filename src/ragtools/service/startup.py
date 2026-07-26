@@ -40,6 +40,11 @@ STARTUP_FILENAME = "RAGTools.vbs"
 #: racing the rest of the login makes both slower.
 DEFAULT_DELAY_SECONDS = 30
 
+#: What autostart starts. Registering "start at login" means the installed
+#: profile — a login-time service on a developer's dev data root is not what
+#: anyone asked for, and leaving it implicit made the answer depend on the OS.
+AUTOSTART_PROFILE = "installed"
+
 
 def _service_argv(settings: Settings) -> list[str]:
     """The command the OS should run at login.
@@ -52,10 +57,16 @@ def _service_argv(settings: Settings) -> list[str]:
 
     host = settings.service_host
     port = str(settings.service_port)
+    # `--profile` rather than only an environment variable: a Windows scheduled
+    # task has nowhere to put one, so the profile declared below was honoured on
+    # Linux and macOS and silently dropped on Windows — where a source checkout
+    # then falls back to `dev` and the autostarted service comes up on a
+    # different data root than the one that registered it. An argument is
+    # carried by every mechanism.
+    tail = ["--host", host, "--port", port, "--profile", AUTOSTART_PROFILE]
     if is_packaged():
-        return [sys.executable, "service", "run", "--host", host, "--port", port]
-    return [sys.executable, "-m", "ragtools.cli", "service", "run",
-            "--host", host, "--port", port]
+        return [sys.executable, "service", "run", *tail]
+    return [sys.executable, "-m", "ragtools.cli", "service", "run", *tail]
 
 
 def _spec(settings: Settings, delay_seconds: int | None = None) -> AutostartSpec:
@@ -66,7 +77,9 @@ def _spec(settings: Settings, delay_seconds: int | None = None) -> AutostartSpec
         argv=_service_argv(settings),
         description="RAG Tools — local knowledge-base service",
         delay_seconds=delay if delay_seconds is None else delay_seconds,
-        environment={"RAG_PROFILE": "installed"},
+        # Kept for the mechanisms that CAN express it (systemd, launchd); the
+        # argv flag is what makes it true everywhere, including Windows.
+        environment={"RAG_PROFILE": AUTOSTART_PROFILE},
     )
 
 
