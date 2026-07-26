@@ -27,14 +27,35 @@ def store(tmp_path):
     s.close()
 
 
-def _wait_for(store, job_id, states, timeout=5.0):
+def _wait_for(store, job_id, states, timeout=30.0):
+    """Wait for a job to reach one of ``states``, or fail saying exactly that.
+
+    Two defects, both paid for on a release candidate:
+
+    The old version **returned the job anyway** on timeout, in whatever state it
+    happened to be in. The caller then asserted on that state, so a slow runner
+    surfaced as ``assert 'running' == 'succeeded'`` — a scheduling failure
+    wearing the costume of a state-machine bug. It reads like a product defect
+    and is not one, and diagnosing it cost a full CI cycle.
+
+    And 5 seconds was too tight. The throttling test performs 200 progress
+    writes against SQLite: comfortable locally, not on a contended shared
+    runner. A timeout generous enough never to fire spuriously costs nothing
+    when the code is correct, because the wait returns the moment the state is
+    reached — only a genuine hang pays the full 30s.
+    """
     end = time.time() + timeout
+    last = None
     while time.time() < end:
-        j = store.get_job(job_id)
-        if j and j.state in states:
-            return j
+        last = store.get_job(job_id)
+        if last and last.state in states:
+            return last
         time.sleep(0.02)
-    return store.get_job(job_id)
+    raise AssertionError(
+        f"job {job_id} did not reach {states} within {timeout}s — last observed "
+        f"state {getattr(last, 'state', None)!r}. This is a TIMEOUT, not a "
+        "wrong-state bug."
+    )
 
 
 def test_worker_runs_a_job_to_success(store):
