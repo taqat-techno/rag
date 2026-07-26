@@ -449,8 +449,8 @@ def test_linux_reports_lingering_because_headless_service_death_is_silent(tmp_pa
     an SSH-only box that reads as "indexing randomly broke"."""
     on = _linux(tmp_path, FakeRunner({"show-user": CommandResult(0, "Linger=yes", "")}))
     off = _linux(tmp_path, FakeRunner({"show-user": CommandResult(0, "Linger=no", "")}))
-    assert on.linger_enabled("ahmed") is True
-    assert off.linger_enabled("ahmed") is False
+    assert on.linger_enabled("testuser") is True
+    assert off.linger_enabled("testuser") is False
 
 
 def test_linux_desktop_session_detected_for_x11_and_wayland(tmp_path, monkeypatch):

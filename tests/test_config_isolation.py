@@ -89,3 +89,38 @@ def test_the_worktree_config_is_not_what_tests_see():
 def test_storage_env_vars_are_cleared(var):
     """An ambient value here would point tests at a real engine."""
     assert var not in os.environ
+
+
+# --- the .env a foreign CWD must never supply ----------------------------
+
+
+def test_the_env_file_is_ragtools_own_not_the_working_directory_s(monkeypatch):
+    """Launching from another repo must not load THAT repo's `.env`.
+
+    A bare relative ".env" is resolved by pydantic-settings against the CWD, so
+    starting the MCP server from an application repo loaded the application's
+    .env. With pydantic-settings' default `extra="forbid"` its unrelated keys
+    raised ValidationError — and pydantic echoed each rejected VALUE into the
+    error text, turning any unrelated app's .env into a secret leak in the
+    caller's output.
+
+    Regression guard: this landed on master as uncommitted work while v3 was in
+    flight, and v3 branched before it. Merging v3 would have silently restored
+    the bare ".env" and the leak with it.
+    """
+    from ragtools.config import Settings, _default_env_file
+
+    monkeypatch.setenv("RAG_ENV_FILE", "/explicit/path/.env")
+    assert _default_env_file() == "/explicit/path/.env", "explicit override wins"
+
+    monkeypatch.delenv("RAG_ENV_FILE", raising=False)
+    monkeypatch.setattr("ragtools.config.is_packaged", lambda: False)
+    assert _default_env_file() == ".env", "dev mode stays CWD-local"
+
+    monkeypatch.setattr("ragtools.config.is_packaged", lambda: True)
+    monkeypatch.setattr("ragtools.config._get_app_dir", lambda: Path("/app/RAGTools"))
+    assert _default_env_file().endswith(".env")
+    assert "RAGTools" in _default_env_file(), "packaged mode anchors to the app dir"
+
+    # And extras must never raise: the ValidationError text was the leak.
+    assert Settings.model_config.get("extra") == "ignore"

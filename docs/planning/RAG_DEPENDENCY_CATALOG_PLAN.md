@@ -33,7 +33,7 @@ config holds *intent* (id, path); identity is recomputed at every sync.
 [[dependencies]]
 id = "odoo-18-pearl"
 name = "Odoo 18 (pearl-pixels)"
-path = "C:\\TQ-WorkSpace\\odoo\\pearl-pixels-18\\odoo"
+path = "C:\\Workspace\\odoo\\pearl-pixels-18\\odoo"
 
 [[projects]]
 id = "khayrgate"

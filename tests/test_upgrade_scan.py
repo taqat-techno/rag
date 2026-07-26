@@ -59,7 +59,7 @@ class FakeAdapter:
 def test_sixteen_duplicate_entries_collapse_to_one():
     """The measured state. `NeedsAddPath` returned true on every upgrade and
     appended again, sixteen times, for one directory."""
-    install = r"C:\Users\ahmed\AppData\Local\Programs\RAGTools"
+    install = r"C:\Users\testuser\AppData\Local\Programs\RAGTools"
     value = SEP.join([r"C:\Windows\system32"] + [install] * 16 + [r"C:\Git\cmd"])
 
     repair = repair_path(value)
@@ -122,19 +122,19 @@ def test_a_development_path_is_not_deduplicated_as_a_product_entry(tmp_path):
 
 
 @pytest.mark.parametrize("path", [
-    r"C:\Users\ahmed\AppData\Local\RAGTools-dev",
-    r"C:\Users\ahmed\AppData\Local\rag-v3-dev\src",
-    r"C:\Users\ahmed\AppData\Local\rag-v3-e2e\gui",
-    "/home/ahmed/.local/share/RAGTools-dev",
+    r"C:\Users\testuser\AppData\Local\RAGTools-dev",
+    r"C:\Users\testuser\AppData\Local\rag-v3-dev\src",
+    r"C:\Users\testuser\AppData\Local\rag-v3-e2e\gui",
+    "/home/testuser/.local/share/RAGTools-dev",
 ])
 def test_development_environments_are_recognised(path):
     assert is_development_path(path) is True
 
 
 @pytest.mark.parametrize("path", [
-    r"C:\Users\ahmed\AppData\Local\RAGTools",
-    r"C:\Users\ahmed\AppData\Local\Programs\RAGTools",
-    "/home/ahmed/.local/share/RAGTools",
+    r"C:\Users\testuser\AppData\Local\RAGTools",
+    r"C:\Users\testuser\AppData\Local\Programs\RAGTools",
+    "/home/testuser/.local/share/RAGTools",
 ])
 def test_installed_locations_are_not_mistaken_for_development(path):
     assert is_development_path(path) is False

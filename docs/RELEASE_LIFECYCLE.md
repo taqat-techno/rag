@@ -55,10 +55,20 @@ These **must** survive upgrade and default uninstall:
 |---|---|---|---|
 | Install dir (replaceable) | `%LOCALAPPDATA%\Programs\RAGTools\` (user install) or `C:\Program Files\RAGTools\` (system install) | `/Applications/RAGTools.app/` | `/opt/rag/` (system) or `~/.local/opt/rag/` (user) — user chooses when extracting the tar.gz |
 | Persistent data dir | `%LOCALAPPDATA%\RAGTools\` | `~/Library/Application Support/RAGTools/` | `$XDG_DATA_HOME/RAGTools/` or `~/.local/share/RAGTools/` (XDG Base Directory) |
-| Login auto-start | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\RAGTools.vbs` | `~/Library/LaunchAgents/com.taqatechno.ragtools.plist` (roadmap) | systemd user unit / `.desktop` autostart (roadmap — deferred in v2.5.1) |
+| Login auto-start | Task Scheduler task `\RAGTools\Service` (at-logon, per-user, `LeastPrivilege`) | `~/Library/LaunchAgents/com.ragtools.service.plist` | systemd **user** unit `~/.config/systemd/user/ragtools.service`, plus a `.desktop` autostart entry for the tray |
 
-**Resolution is enforced in code**, not by convention. The authoritative
-functions are in `src/ragtools/config.py`:
+> **Changed in 3.0.0.** Windows autostart is a scheduled task, not a
+> Startup-folder `.vbs`; the task names the user in its logon trigger so a
+> standard account can register it without elevation, and carries a
+> `RestartOnFailure` policy in place of the retired watchdog process. macOS and
+> Linux are **implemented**, not roadmap — this table described them as
+> "roadmap — deferred in v2.5.1" until 3.0.0.
+
+**Resolution is enforced in code**, not by convention. Every path above is
+produced by the platform adapter for that OS (`ragtools/platform/{windows,
+darwin,linux}.py`), which is the only place in the package permitted to branch
+on the operating system. The authoritative functions are in
+`src/ragtools/config.py`:
 
 - `is_packaged()` — single source of truth for "installed vs dev"
 - `_get_app_dir()` — returns the persistent dir per platform

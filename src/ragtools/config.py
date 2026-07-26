@@ -243,6 +243,30 @@ def _find_config_path() -> Path | None:
     return None
 
 
+def _default_env_file() -> str:
+    """Resolve ragtools' OWN .env — never the current working directory's.
+
+    A bare relative ``".env"`` is resolved by pydantic-settings against the CWD,
+    so launching from an application repo made Settings load THAT application's
+    .env. Its unrelated keys were then rejected by ``extra="forbid"``, and
+    pydantic echoed each rejected VALUE into the ValidationError text — turning
+    any unrelated app's .env into a secret leak in the caller's output.
+
+    Mirrors :func:`_find_config_path`'s mode isolation: packaged mode anchors to
+    the app dir, dev mode stays CWD-local.
+    """
+    explicit = os.environ.get("RAG_ENV_FILE")
+    if explicit:
+        return explicit
+
+    if is_packaged():
+        app_dir = _get_app_dir()
+        if app_dir:
+            return str(app_dir / ".env")
+
+    return ".env"
+
+
 def get_config_write_path() -> Path:
     """Get the correct path for writing config, even if it doesn't exist yet.
 
@@ -496,7 +520,16 @@ class Settings(BaseSettings):
         "list_indexed_paths":       False,
     })
 
-    model_config = {"env_prefix": "RAG_", "env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {
+        "env_prefix": "RAG_",
+        "env_file": _default_env_file(),
+        "env_file_encoding": "utf-8",
+        # Never fail on keys we do not own. With the pydantic-settings default of
+        # extra="forbid", a foreign .env raised ValidationError AND echoed the
+        # offending VALUES into the error text, turning any unrelated app's .env
+        # into a secret leak. Ignoring extras fails safe and keeps values silent.
+        "extra": "ignore",
+    }
 
     @model_validator(mode="after")
     def _anchor_data_dir(self):

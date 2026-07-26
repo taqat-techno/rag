@@ -74,12 +74,19 @@ Filename: "cmd.exe"; Parameters: "/c mkdir ""{localappdata}\RAGTools\data"" 2>nu
 Filename: "{app}\rag.exe"; Parameters: "service install"; StatusMsg: "Registering startup task..."; Tasks: startup; Flags: runhidden
 ; Register tray autostart (same login-startup checkbox, mirrors service install)
 Filename: "{app}\rag.exe"; Parameters: "tray install"; StatusMsg: "Registering tray autostart..."; Tasks: startup; Flags: runhidden
-; Repair the watchdog Scheduled Task ONLY if the user already opted into it on a
-; prior install. Pre-v2.5.3 the task action was the bare console exe, so every
-; firing flashed a conhost window. Re-running `service watchdog install` writes
-; the silent VBS launcher and overwrites the task action via `schtasks /create /f`.
-; Never installs the watchdog for users who never opted in — see HasRAGToolsWatchdogTask().
-Filename: "{app}\rag.exe"; Parameters: "service watchdog install"; StatusMsg: "Repairing watchdog task..."; Flags: runhidden; Check: HasRAGToolsWatchdogTask
+; NO watchdog step here, deliberately. v3 removed the watchdog entirely — module,
+; CLI command group and tests — because Task Scheduler, systemd and launchd all
+; restart a failed service natively; the registered task now carries a
+; RestartOnFailure policy instead. The legacy "RAGTools Watchdog" task is REMOVED
+; by the upgrade engine (LEGACY_TASKS in ragtools/platform/windows.py), not
+; repaired here.
+;
+; Until v3.0.0 this ran `rag.exe service watchdog install`, gated on
+; HasRAGToolsWatchdogTask() — a Check true precisely on machines carrying the
+; legacy task, i.e. every upgrading user. With the command gone that is an
+; unknown-command exit, and because the step was `runhidden` WITHOUT `nowait` the
+; installer waited for it and surfaced the failure. Two subsystems with opposite
+; intentions: one removing the task, the other reinstalling it.
 ; Start service now (ON by default)
 Filename: "{app}\rag.exe"; Parameters: "service start"; StatusMsg: "Starting service..."; Tasks: startnow; Flags: runhidden nowait
 ; Open admin panel in browser after a delay (let service start)
@@ -125,26 +132,11 @@ begin
   Result := Pos(';' + Param + ';', ';' + OrigPath + ';') = 0;
 end;
 
-// Detect whether the user already opted into the optional watchdog Scheduled
-// Task on a prior install. Returns True when `schtasks /query` succeeds for
-// "RAGTools Watchdog" (exit code 0). Used as a [Run] Check so we ONLY repair
-// the task for users who already had it — never auto-install for users who
-// declined. Pre-v2.5.3 the task action was the bare console exe and flashed a
-// conhost window every 15 minutes; v2.5.3 introduced a silent VBS launcher
-// but the installer never re-registered the existing task, leaving affected
-// users stuck with the popup. This Check fixes that gap on upgrade.
-function HasRAGToolsWatchdogTask(): Boolean;
-var
-  ResultCode: Integer;
-begin
-  Result := False;
-  if Exec(ExpandConstant('{sys}\schtasks.exe'),
-          '/query /tn "RAGTools Watchdog"',
-          '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-  begin
-    Result := (ResultCode = 0);
-  end;
-end;
+// HasRAGToolsWatchdogTask() lived here. It detected the legacy "RAGTools
+// Watchdog" scheduled task so the installer could re-register it, and was
+// removed with its only call site in v3.0.0: the watchdog no longer exists, and
+// the upgrade engine now REMOVES that task rather than repairing it. Leaving a
+// dead detector behind is how the next person re-adds the [Run] step.
 
 // Force-kill every rag.exe process tree on the machine. Belt-and-suspenders
 // pass after the graceful 'service stop' — covers the tray, the supervisor,

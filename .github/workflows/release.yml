@@ -108,10 +108,21 @@ jobs:
       - name: Build with model
         run: python scripts/build.py
 
-      - name: Create tar.gz of bundle
+      - name: Create zip of bundle
+        # `macOS-arm64.zip`, not `macos-arm64.tar.gz`. The release gate
+        # (/release-ship Phase D) requires
+        #     ^RAGTools-X\.Y\.Z-macOS-arm64\.(zip|dmg)$
+        # and the old name missed on BOTH case and extension — so a release whose
+        # macOS bundle built perfectly would still have been failed for a missing
+        # artifact, with nothing in the build log to explain it.
+        #
+        # `ditto` rather than `zip`: it is the macOS-native archiver and preserves
+        # symlinks and extended attributes inside the bundle, which a plain `zip`
+        # flattens.
         run: |
           cd dist
-          tar -czf "RAGTools-${{ steps.version.outputs.version }}-macos-arm64.tar.gz" rag/
+          ditto -c -k --sequesterRsrc --keepParent \
+            rag "RAGTools-${{ steps.version.outputs.version }}-macOS-arm64.zip"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -120,7 +131,7 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            dist/RAGTools-${{ steps.version.outputs.version }}-macos-arm64.tar.gz
+            dist/RAGTools-${{ steps.version.outputs.version }}-macOS-arm64.zip
 
   build-linux:
     runs-on: ubuntu-22.04

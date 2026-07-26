@@ -13,7 +13,7 @@ _Nothing yet._
 
 ---
 
-## [3.0.0] — unreleased
+## [3.0.0] — 2026-07-26
 
 **Upgrading rebuilds your search index.** Projects, configuration and source
 files are preserved; the vector store is not convertible. See
@@ -50,8 +50,11 @@ files are preserved; the vector store is not convertible. See
   native to Task Scheduler, systemd and launchd; a polling task that flashed a
   console every fifteen minutes and had no non-Windows counterpart is replaced by
   the platform's own supervision.
-- `.vbs` launchers. Hiding a console is a process-creation flag, not a reason to
-  ship an interpreted shim.
+- **`.vbs` shims from autostart.** Hiding a console is a process-creation flag,
+  not a reason to ship an interpreted shim, so neither the service nor the tray
+  registration goes through one any more. The Start Menu shortcut still uses
+  `launch.vbs` — it starts the service if needed and opens the panel, which is a
+  launcher's job rather than a workaround.
 
 ### Fixed
 - **Windows autostart could not be registered by a standard user.** Registration
