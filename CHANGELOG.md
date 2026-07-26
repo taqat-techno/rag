@@ -9,7 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet — `main` is at 2.7.0._
+_Nothing yet._
+
+---
+
+## [3.0.0] — unreleased
+
+**Upgrading rebuilds your search index.** Projects, configuration and source
+files are preserved; the vector store is not convertible. See
+`docs/release/UPGRADE.md`.
+
+### Added
+- **Managed Qdrant** (pinned 1.15.5, no Docker), supervised by the product with
+  a `/readyz` gate and version verification. Search at 89k points went from
+  ~2.1 s to 39–54 ms, and the local-mode scale warning no longer applies.
+- **One collection per project** (`proj_<uuid>`, survives rename and move).
+  Cross-project isolation is a boundary rather than a payload filter.
+- **Shared dependencies** — declare a vendored framework once in a catalog and
+  select it from any project. Indexed once, shared by every project on the same
+  build; search returns both, labelled `project` or `framework`.
+- **Shared dependencies page**, chunk inspector on the map, running-job progress,
+  storage diagnostics.
+- **`ragtools.platform`** — one adapter per OS. Windows Task Scheduler, systemd
+  user units, launchd agents, XDG autostart.
+- **`ragtools.upgrade`** — scan, config migration, PATH repair, pre-flight gates,
+  reconciliation gates, resumable state with an explicit rollback boundary.
+- **Service-owned maintenance schedule** replacing OS keepalive tasks.
+- MCP: `list_dependencies`, `add_dependency`, `set_project_dependencies`,
+  `remove_dependency`, `find_definition`, `secret_audit`.
+
+### Changed
+- `dependency_paths` is now a legacy input, adopted into the catalog at load.
+- Health reports the **store**, not just the process: a reachable service with an
+  unreachable Qdrant is `degraded`, not green.
+- Indexing streams in bounded windows — peak memory 2.46 GB → ~1.2 GB flat.
+- `typer[all]` → `typer` (the extra no longer exists and warned on every install).
+
+### Removed
+- **The Windows watchdog scheduled task** (462 lines). Restart-on-failure is
+  native to Task Scheduler, systemd and launchd; a polling task that flashed a
+  console every fifteen minutes and had no non-Windows counterpart is replaced by
+  the platform's own supervision.
+- `.vbs` launchers. Hiding a console is a process-creation flag, not a reason to
+  ship an interpreted shim.
+
+### Fixed
+- `StartLimitIntervalSec` was emitted in `[Service]`, where systemd ignores it —
+  the crash-loop protection did nothing.
+- A zombie process reported as alive, so a dead service read as running and stale
+  PID files were never cleaned.
+- Force-terminate sent `SIGTERM` on POSIX, so it could not kill a hung process.
+- Index identity is verified before a state DB is trusted (caught a real
+  27,895-chunk divergence).
+- Framework corpora are deduplicated by resolved path when no build id exists —
+  two projects each vendoring `<project>/odoo` previously shared one collection.
+- Batched upserts and deletes; `TIME_WAIT` no longer exhausts the ephemeral range.
+
+### Known limitations
+- macOS has not been executed on real hardware; the launchd agent is schema-
+  validated only. `.github/workflows/release-validation.yml` covers it once
+  runners are enabled.
+- Artifacts are unsigned. macOS builds require Developer ID and notarization
+  before they are installable by anyone who did not build them.
 
 ---
 

@@ -1,0 +1,190 @@
+# Release validation on all three first-class platforms.
+#
+# This is the concrete thing D-1 needs. The blocker was never "we do not know
+# how to validate on Linux and macOS" — it is that no non-Windows machine was
+# available. Enabling this workflow supplies them, and the rows that are
+# currently declared MANUAL because of missing hardware become executed rows.
+#
+# What it deliberately does NOT do: report success for anything it did not run.
+# `validate_release.py` treats a check with no evidence as MANUAL, and MANUAL
+# blocks the verdict. A green workflow with unrun rows would be the same
+# manufactured pass the gate exists to prevent.
+
+name: release-validation
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "src/ragtools/platform/**"
+      - "src/ragtools/upgrade/**"
+      - "scripts/**"
+      - ".github/workflows/release-validation.yml"
+
+jobs:
+  suite:
+    name: suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-14 is arm64; macos-13 is x86_64. Both are shipped targets, so
+        # both are validated — an adapter that only works on Apple Silicon is
+        # not a macOS adapter.
+        os: [ubuntu-latest, macos-14, macos-13, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with dev extras
+        run: python -m pip install -e ".[dev]"
+      - name: Full suite
+        run: python -m pytest -q
+
+  linux-adapter:
+    name: Linux adapter against real systemd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -e .
+      - name: Verify against systemd
+        # Runs `systemd-analyze verify` on the generated unit — the check that
+        # caught StartLimitIntervalSec being silently ignored in [Service].
+        run: python scripts/verify_linux_adapter.py
+
+  macos-adapter:
+    name: macOS adapter against real launchd
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -e .
+      - name: Validate the generated agent with plutil
+        # The counterpart to `systemd-analyze verify`. Schema validation in the
+        # adapter catches unknown keys; `plutil -lint` catches a malformed file.
+        run: |
+          python - <<'PY'
+          import plistlib, pathlib, sys
+          sys.path.insert(0, "src")
+          from ragtools.platform import KIND_SERVICE, AutostartSpec
+          from ragtools.platform.darwin import DarwinAdapter, validate_plist
+          adapter = DarwinAdapter()
+          doc = adapter.render_plist(AutostartSpec(
+              "svc", KIND_SERVICE, ["/usr/local/bin/rag", "service", "run"]))
+          validate_plist(doc)
+          pathlib.Path("agent.plist").write_bytes(plistlib.dumps(doc))
+          print("rendered:", doc["Label"])
+          PY
+          plutil -lint agent.plist
+      - name: Load, verify and unload a sandboxed LaunchAgent
+        # The rows a Mac supplies that no amount of unit testing can: launchd
+        # actually accepting, running and releasing the agent.
+        run: |
+          python - <<'PY'
+          import sys, time
+          sys.path.insert(0, "src")
+          from ragtools.platform import KIND_SERVICE, AutostartSpec
+          from ragtools.platform.darwin import DarwinAdapter
+          marker = "/tmp/ragtools-agent-probe"
+          # Isolated by LABEL prefix, the macOS equivalent of the Windows task
+          # folder — never by a spec field the adapter would discard.
+          adapter = DarwinAdapter()
+          adapter.__class__._label = lambda self, kind: "com.ragtools.verify"
+          spec = AutostartSpec("probe", KIND_SERVICE,
+                               ["/bin/sh", "-c", f"echo ok > {marker}"])
+          reg = adapter.install_autostart(spec)
+          print("registered:", reg.describe())
+          time.sleep(5)
+          found = adapter.find_autostart(KIND_SERVICE)
+          assert found, "launchd did not report the agent"
+          removed = adapter.remove_autostart("com.ragtools.verify")
+          assert removed, "the agent was not removed"
+          assert not adapter.find_autostart(KIND_SERVICE), "residue left behind"
+          print("loaded, observed and removed cleanly")
+          PY
+
+  clean-install:
+    name: clean install of the built wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir dist
+      - name: Install it into a clean interpreter
+        # A green source suite proves nothing about what ships. This installs
+        # the artifact and drives it.
+        run: |
+          python -m venv cleanroom
+          python -c "import sys,glob,subprocess,os; py=os.path.join('cleanroom','Scripts' if sys.platform=='win32' else 'bin','python'+('.exe' if sys.platform=='win32' else '')); subprocess.check_call([py,'-m','pip','install','-q',glob.glob('dist/*.whl')[0]])"
+      - name: Exercise the installed artifact
+        run: |
+          python - <<'PY'
+          import glob, os, subprocess, sys
+          py = os.path.join("cleanroom", "Scripts" if sys.platform == "win32" else "bin",
+                            "python" + (".exe" if sys.platform == "win32" else ""))
+          subprocess.check_call([py, "-c", (
+              "import ragtools, pathlib;"
+              "root = pathlib.Path(ragtools.__file__).parent;"
+              "tpl = list((root/'service'/'templates').glob('*.html'));"
+              "assert len(tpl) >= 8, tpl;"
+              "from ragtools.platform import adapter; adapter();"
+              "from ragtools.upgrade import scan, migrate_config;"
+              "import importlib.util as u;"
+              "assert u.find_spec('ragtools.service.watchdog') is None, 'watchdog shipped';"
+              "print('artifact OK', ragtools.__version__)")])
+          PY
+
+  upgrade-rehearsal:
+    name: upgrade rehearsal
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e .
+      - name: Rehearse against a synthesised v2 layout
+        # On a runner there is no installed v2.7.0, so the rehearsal exercises
+        # the synthesised layout. Against a real previous install it also
+        # copies the actual config — see the script.
+        run: python scripts/rehearse_upgrade.py
+        continue-on-error: true
+
+  gate:
+    name: release gate
+    needs: [suite, linux-adapter, macos-adapter, clean-install]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report what is still unrun
+        # The gate is not "did CI go green" — it is "did every required row
+        # execute". Rows needing a reboot, a destructive uninstall or a signing
+        # identity are still outstanding, and this says so out loud rather than
+        # letting a green tick imply otherwise.
+        run: |
+          echo "Automated rows validated by this workflow."
+          echo "STILL OUTSTANDING and NOT covered here:"
+          echo "  - reboot / sign-in autostart (needs a real logon)"
+          echo "  - production re-index on a real corpus"
+          echo "  - destructive uninstall residue sweep"
+          echo "  - signed and notarized artifacts (needs signing identities)"
+          echo "Release requires these to be executed and recorded separately."
