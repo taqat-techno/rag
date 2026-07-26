@@ -484,3 +484,35 @@ def test_darwin_refuses_a_label_less_plist():
 
     with pytest.raises(InvalidAgent, match="Label is required"):
         validate_plist({"ProgramArguments": ["/usr/local/bin/rag"]})
+
+
+def test_windows_ignores_spec_name_for_the_registration_target(tmp_path, allow_platform_writes):
+    """`spec.name` is a DISPLAY name; the target comes from `kind`.
+
+    Found by a verification probe that passed a sandbox name, was silently given
+    the real `\RAGTools\Service` path, and would have overwritten the user's
+    actual registration had the account been allowed to create tasks. Isolation
+    has to come from adapter configuration, not from a field the adapter drops.
+    """
+    runner = FakeRunner({"schtasks /create": OK})
+    adapter, _ = _win(tmp_path, runner)
+
+    adapter.install_autostart(AutostartSpec(
+        name="something-else-entirely", kind=KIND_SERVICE, argv=["rag.exe"]))
+
+    assert runner.saw(r"\RAGTools\Service")
+    assert not runner.saw("something-else-entirely")
+
+
+def test_windows_task_prefix_is_injectable_for_isolation(tmp_path, allow_platform_writes):
+    """The only mechanism that genuinely prevents a probe touching production."""
+    runner = FakeRunner({"schtasks /create": OK})
+    startup = tmp_path / "Startup"
+    startup.mkdir(parents=True, exist_ok=True)
+    adapter = WindowsAdapter(runner, home=tmp_path, local_app_data=tmp_path / "L",
+                             startup_dir=startup, task_prefix=r"\RAGToolsVerify")
+
+    adapter.install_autostart(AutostartSpec("probe", KIND_SERVICE, ["cmd.exe"]))
+
+    assert runner.saw(r"\RAGToolsVerify\Service")
+    assert not runner.saw(r"\RAGTools\Service"), "a probe reached the real registration"

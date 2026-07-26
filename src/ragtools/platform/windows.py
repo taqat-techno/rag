@@ -32,9 +32,13 @@ from ragtools.platform.base import (
     default_runner,
 )
 
-#: Task Scheduler paths for the new, one-per-concern registrations.
-TASK_SERVICE = r"\RAGTools\Service"
-TASK_TRAY = r"\RAGTools\Tray"
+#: Task Scheduler folder for the product's registrations. Injectable so a
+#: verification probe can register somewhere it is IMPOSSIBLE to collide with a
+#: real entry — `spec.name` cannot serve that purpose, because the target is
+#: derived from `kind` to keep "exactly one registration per concern" true.
+TASK_PREFIX = r"\RAGTools"
+TASK_SERVICE = TASK_PREFIX + r"\Service"
+TASK_TRAY = TASK_PREFIX + r"\Tray"
 
 #: Registrations created by superseded versions. Enumerated so the upgrade can
 #: remove them; never created.
@@ -60,8 +64,10 @@ class WindowsAdapter:
         home: Optional[Path] = None,
         local_app_data: Optional[Path] = None,
         startup_dir: Optional[Path] = None,
+        task_prefix: str = TASK_PREFIX,
     ):
         self._run = runner or default_runner
+        self._task_prefix = task_prefix
         self._home = Path(home) if home else Path.home()
         self._lad = Path(local_app_data) if local_app_data else self._resolve_lad()
         self._startup = Path(startup_dir) if startup_dir else self._resolve_startup()
@@ -146,7 +152,16 @@ class WindowsAdapter:
         return True
 
     def _task_path(self, kind: str) -> str:
-        return TASK_TRAY if kind == KIND_TRAY else TASK_SERVICE
+        """The registration target. Derived from `kind`, never from `spec.name`.
+
+        `spec.name` is a DISPLAY name. Treating it as the target would let a
+        caller create a second service registration under another name, which
+        is exactly the duplication this design exists to prevent — and a probe
+        that thought it had chosen a sandbox name would in fact have overwritten
+        the real one.
+        """
+        leaf = "Tray" if kind == KIND_TRAY else "Service"
+        return self._task_prefix + "\\" + leaf
 
     def install_autostart(self, spec: AutostartSpec) -> Registration:
         """Register one at-logon task. Replaces any same-named task (`/F`)."""
