@@ -187,6 +187,19 @@ def _upgrade_rehearsal(ctx: dict) -> tuple[bool, str]:
     return failed == 0, f"{result.get('passed', 0)} passed, {failed} failed"
 
 
+def _storage_recovery(ctx: dict):
+    """Kill the store; health must say so; the service must recover.
+
+    The failure this guards is a service answering `ready` while Qdrant is
+    unreachable — everything downstream then reports success against a store
+    that is not there.
+    """
+    r = ctx.get("storage_recovery")
+    if r is None:
+        return None, "not run — see scripts/verify_storage_recovery.py"
+    return r.get("failed", 0) == 0, f"{r.get('passed', 0)} check(s) passed"
+
+
 def _reindex_reconciled(ctx: dict):
     """Every reconciliation gate, run against the real migrated corpus."""
     r = ctx.get("reindex")
@@ -232,8 +245,7 @@ ROWS = [
     Row("V09", "state and store counts reconcile", _counts_reconcile),
     Row("V10", "framework corpora deduplicated", _frameworks_deduplicated),
     Row("V11", "scale warning matches the engine", _scale_matches_engine),
-    Row("V12", "storage kill -> honest degraded -> recovery",
-        manual_reason="destructive; run scripts/verify_storage_recovery.py"),
+    Row("V12", "storage kill -> honest degraded -> recovery", _storage_recovery),
     Row("V13", "re-index reconciled on a real corpus", _reindex_reconciled,
         platforms=("windows",)),
     Row("V14", "zero cross-project leakage", _no_cross_project_leakage),
@@ -304,6 +316,8 @@ def main(argv=None) -> int:
     parser.add_argument("--reindex-failed", type=int, default=None)
     parser.add_argument("--uninstall-passed", type=int, default=None)
     parser.add_argument("--uninstall-failed", type=int, default=None)
+    parser.add_argument("--storage-recovery-passed", type=int, default=None)
+    parser.add_argument("--storage-recovery-failed", type=int, default=None)
     args = parser.parse_args(argv)
 
     from ragtools.platform import current_platform
@@ -315,6 +329,9 @@ def main(argv=None) -> int:
     if args.clean_install_passed is not None:
         ctx["clean_install"] = {"passed": args.clean_install_passed,
                                 "failed": args.clean_install_failed or 0}
+    if args.storage_recovery_passed is not None:
+        ctx["storage_recovery"] = {"passed": args.storage_recovery_passed,
+                                   "failed": args.storage_recovery_failed or 0}
     if args.reindex_passed is not None:
         ctx["reindex"] = {"passed": args.reindex_passed, "failed": args.reindex_failed or 0}
     if args.uninstall_passed is not None:

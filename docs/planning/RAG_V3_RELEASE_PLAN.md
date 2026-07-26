@@ -549,7 +549,8 @@ Cross-project isolation (V14)              0 foreign documents across 4 probes
 Storage kill -> degraded -> recovery (V12) honest degraded; new Qdrant; 160,630 points intact
 Uninstall residue sweep (V15)              12/12   install -> uninstall -> scan finds nothing
 Re-index reconciliation (V13)              8/8     real corpus: 38,482 files / 160,642 points
-Validation matrix                          11 pass / 0 fail / 4 manual
+Storage kill / recovery (V12)              7/7     degraded honestly; new engine; index intact
+Validation matrix                          12 pass / 0 fail / 3 manual
 ```
 
 **The gate refuses to pass a row it did not run.** Twice this had to be fixed:
@@ -577,8 +578,7 @@ pinned by tests.
 
 | Row | Blocker |
 |---|---|
-| V03 reboot autostart · V04 tray registration | this account cannot create scheduled tasks — `schtasks` returns *Access is denied* |
-| V12 storage kill | executed by hand (honest degraded, recovery, 160,630 points intact); destructive to automate in the matrix |
+| V03 reboot autostart · V04 tray registration | this account cannot create scheduled tasks. Tested both root-level and folder targets through Python (no shell mangling): `schtasks /create` returns *Access is denied* either way. Needs an elevated session |
 | V16 signing | Apple Developer ID + Windows Authenticode certificate |
 | macOS execution | no Mac; `.github/workflows/release-validation.yml` covers it the moment runners are enabled |
 
