@@ -18,7 +18,7 @@ Every test below is one of those, turned into something the code can see.
 from __future__ import annotations
 
 import os
-import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -48,11 +48,25 @@ PLAIN_DIR = r"C:\Windows" if WINDOWS_PATHS else "/usr/bin"
 INSTALL_DIR = (r"C:\Users\testuser\AppData\Local\Programs\RAGTools"
                if WINDOWS_PATHS else "/home/testuser/.local/opt/RAGTools")
 
-#: Two spellings differing only in case name ONE directory on Windows and macOS
-#: and TWO on Linux, so collapsing them is correct on the first and destructive
-#: on the second. `_key()` follows the filesystem deliberately; these tests
-#: assert the case-insensitive half.
-CASE_INSENSITIVE_FS = os.name == "nt" or sys.platform == "darwin"
+def _detect_case_insensitive_fs() -> bool:
+    """Ask this filesystem whether it folds case. Do not infer it.
+
+    `os.name == "nt" or sys.platform == "darwin"` was the first version, and it
+    is the same mistake the product had: case-sensitivity belongs to the
+    FILESYSTEM, not the OS. A case-sensitive APFS volume — supported, and what
+    some developers deliberately choose — would have run the case-insensitive
+    assertions and failed them, on a Mac, for being right.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "CaseProbe").mkdir()
+        return (Path(td) / "caseprobe").exists()
+
+
+#: Two spellings differing only in case name ONE directory where the filesystem
+#: folds and TWO where it does not, so collapsing them is correct on the first
+#: and destructive on the second. `directory_identity()` asks the filesystem;
+#: so does this.
+CASE_INSENSITIVE_FS = _detect_case_insensitive_fs()
 
 
 class FakeAdapter:
