@@ -127,7 +127,36 @@ class PathRepair:
         return (separator or os.pathsep).join(self.entries)
 
 
+def fold_for_match(text: str) -> str:
+    """Case-fold and normalise separators, for NAME MATCHING, on every platform.
+
+    ``os.path.normcase`` looks like the right tool and is not: it lowercases on
+    Windows and is the **identity function** on POSIX. Every "is this one of
+    ours?" check built on it therefore worked on Windows and silently matched
+    nothing on Linux or macOS — where the product's own directories are
+    ``RAGTools`` and ``RAGTools-dev``, capitalised.
+
+    The consequences were not cosmetic. PATH cleanup recognised no product
+    entries at all off Windows, and ``scan.is_development_path`` failed to
+    recognise a developer's isolated store — so the guard whose entire purpose
+    is "never delete a dev environment" was inert on two of three platforms.
+
+    Kept separate from :func:`_key` deliberately. Identity ("are these the same
+    directory?") *should* follow the filesystem: ``/opt/RAGTools`` and
+    ``/opt/ragtools`` are two directories on Linux and one on Windows. Matching
+    ("does this name look like ours?") should not, and over-matching is the safe
+    direction for a protective check.
+    """
+    return str(text).replace("\\", "/").casefold()
+
+
 def _key(entry: str) -> str:
+    """Identity of a directory, for de-duplication.
+
+    Uses ``normcase`` ON PURPOSE — unlike :func:`fold_for_match`. Two spellings
+    differing only in case name one directory on Windows and two on Linux, and
+    collapsing them there would drop a legitimate PATH entry.
+    """
     try:
         resolved = str(Path(entry).expanduser().resolve())
     except OSError:
@@ -162,7 +191,7 @@ def repair_path(path_value: str, *, keep: Optional[str] = None) -> PathRepair:
             out.append(entry)
             continue
         key = _key(stripped)
-        is_product = "ragtools" in os.path.normcase(stripped)
+        is_product = "ragtools" in fold_for_match(stripped)
         if not is_product:
             out.append(entry)
             continue

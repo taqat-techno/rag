@@ -18,6 +18,7 @@ Every test below is one of those, turned into something the code can see.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,24 @@ from ragtools.upgrade.scan import (
 )
 
 SEP = os.pathsep
+
+#: PATH fixtures have to be shaped like the HOST's PATH, not like Windows'.
+#: These tests joined `C:\...` entries with `os.pathsep` — which is `:` on POSIX,
+#: so every drive letter became its own entry and `C:\Windows` arrived as
+#: ['C', '\Windows']. They passed on Windows and failed on Linux and macOS, and
+#: nobody saw it because the suite only ever ran on Windows.
+WINDOWS_PATHS = os.name == "nt"
+SYSTEM_DIR = r"C:\Windows\system32" if WINDOWS_PATHS else "/usr/bin"
+OTHER_DIR = r"C:\Git\cmd" if WINDOWS_PATHS else "/usr/local/bin"
+PLAIN_DIR = r"C:\Windows" if WINDOWS_PATHS else "/usr/bin"
+INSTALL_DIR = (r"C:\Users\testuser\AppData\Local\Programs\RAGTools"
+               if WINDOWS_PATHS else "/home/testuser/.local/opt/RAGTools")
+
+#: Two spellings differing only in case name ONE directory on Windows and macOS
+#: and TWO on Linux, so collapsing them is correct on the first and destructive
+#: on the second. `_key()` follows the filesystem deliberately; these tests
+#: assert the case-insensitive half.
+CASE_INSENSITIVE_FS = os.name == "nt" or sys.platform == "darwin"
 
 
 class FakeAdapter:
@@ -59,20 +78,37 @@ class FakeAdapter:
 def test_sixteen_duplicate_entries_collapse_to_one():
     """The measured state. `NeedsAddPath` returned true on every upgrade and
     appended again, sixteen times, for one directory."""
-    install = r"C:\Users\testuser\AppData\Local\Programs\RAGTools"
-    value = SEP.join([r"C:\Windows\system32"] + [install] * 16 + [r"C:\Git\cmd"])
+    value = SEP.join([SYSTEM_DIR] + [INSTALL_DIR] * 16 + [OTHER_DIR])
 
     repair = repair_path(value)
 
     assert repair.changed
     assert len(repair.removed) == 15
-    assert repair.entries.count(install) == 1
+    assert repair.entries.count(INSTALL_DIR) == 1
     # Everything else keeps its position — a PATH cleanup that reorders
     # unrelated entries is a far worse bug than the one being fixed.
-    assert repair.entries[0] == r"C:\Windows\system32"
-    assert repair.entries[-1] == r"C:\Git\cmd"
+    assert repair.entries[0] == SYSTEM_DIR
+    assert repair.entries[-1] == OTHER_DIR
 
 
+def test_product_entries_are_recognised_whatever_their_casing():
+    """The bug CI caught on every POSIX runner.
+
+    `is_product` used `os.path.normcase`, which lowercases on Windows and is the
+    IDENTITY on POSIX — so on Linux and macOS the check `"ragtools" in ...`
+    never matched the product's own `RAGTools` directory, and PATH cleanup
+    silently found nothing to clean on two of three platforms.
+    """
+    upper = f"{SYSTEM_DIR}{SEP}{INSTALL_DIR}{SEP}{INSTALL_DIR}"
+    repair = repair_path(upper)
+
+    assert repair.changed, "a capitalised RAGTools entry must still be ours"
+    assert len(repair.removed) == 1
+
+
+@pytest.mark.skipif(not CASE_INSENSITIVE_FS,
+                    reason="two casings are two directories on a case-sensitive "
+                           "filesystem; collapsing them there would drop a real entry")
 def test_two_casings_of_one_directory_are_one_entry(tmp_path):
     """`where rag` resolved a DIFFERENT casing than the other fifteen entries,
     so the two spellings decided which executable ran."""
@@ -85,6 +121,8 @@ def test_two_casings_of_one_directory_are_one_entry(tmp_path):
     assert len(repair.entries) == 1
 
 
+@pytest.mark.skipif(not CASE_INSENSITIVE_FS,
+                    reason="the two spellings are distinct directories here")
 def test_a_preferred_spelling_wins_so_the_installer_and_path_agree(tmp_path):
     canonical = tmp_path / "Programs" / "RAGTools"
     canonical.mkdir(parents=True)
@@ -95,8 +133,29 @@ def test_a_preferred_spelling_wins_so_the_installer_and_path_agree(tmp_path):
     assert repair.entries == [str(canonical)]
 
 
+def test_a_case_sensitive_filesystem_keeps_both_spellings(tmp_path):
+    """The other half of the same rule, asserted where it actually applies.
+
+    On Linux `/opt/RAGTools` and `/opt/ragtools` are two directories. Folding
+    them into one would silently delete a working PATH entry — which is why
+    `_key()` follows the filesystem while name-matching does not.
+    """
+    if CASE_INSENSITIVE_FS:
+        pytest.skip("this filesystem treats the two spellings as one directory")
+    lower = tmp_path / "programs" / "ragtools"
+    upper = tmp_path / "programs" / "RAGTools"
+    lower.mkdir(parents=True)
+    upper.mkdir(parents=True)
+
+    repair = repair_path(SEP.join([str(lower), str(upper)]))
+
+    assert len(repair.entries) == 2, "two real directories must both survive"
+    assert not repair.removed
+
+
 def test_non_product_entries_are_never_touched():
-    value = SEP.join([r"C:\Windows", r"C:\Python", r"C:\Windows"])
+    other = OTHER_DIR if OTHER_DIR != PLAIN_DIR else SYSTEM_DIR
+    value = SEP.join([PLAIN_DIR, other, PLAIN_DIR])
     repair = repair_path(value)
     assert not repair.changed
     assert repair.entries == value.split(SEP)
@@ -105,8 +164,8 @@ def test_non_product_entries_are_never_touched():
 def test_empty_segments_survive():
     """A trailing separator is normal on Windows; removing it is a visible,
     pointless diff in the user's environment."""
-    value = SEP.join([r"C:\Windows", ""])
-    assert repair_path(value).entries == [r"C:\Windows", ""]
+    value = SEP.join([PLAIN_DIR, ""])
+    assert repair_path(value).entries == [PLAIN_DIR, ""]
 
 
 def test_a_development_path_is_not_deduplicated_as_a_product_entry(tmp_path):
@@ -125,7 +184,13 @@ def test_a_development_path_is_not_deduplicated_as_a_product_entry(tmp_path):
     r"C:\Users\testuser\AppData\Local\RAGTools-dev",
     r"C:\Users\testuser\AppData\Local\rag-v3-dev\src",
     r"C:\Users\testuser\AppData\Local\rag-v3-e2e\gui",
+    # The POSIX rows are the regression. DEV_MARKERS are lowercase and the match
+    # went through os.path.normcase, which is the IDENTITY on POSIX — so these
+    # returned False on Linux and macOS, exactly where the platform adapters
+    # create `RAGTools-dev`. The guard against deleting a developer's isolated
+    # store was inert on two of three platforms.
     "/home/testuser/.local/share/RAGTools-dev",
+    "/Users/testuser/Library/Application Support/RAGTools-dev",
 ])
 def test_development_environments_are_recognised(path):
     assert is_development_path(path) is True
@@ -135,6 +200,7 @@ def test_development_environments_are_recognised(path):
     r"C:\Users\testuser\AppData\Local\RAGTools",
     r"C:\Users\testuser\AppData\Local\Programs\RAGTools",
     "/home/testuser/.local/share/RAGTools",
+    "/Users/testuser/Library/Application Support/RAGTools",
 ])
 def test_installed_locations_are_not_mistaken_for_development(path):
     assert is_development_path(path) is False
