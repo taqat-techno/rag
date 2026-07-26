@@ -541,13 +541,20 @@ Each phase: **entry → actions → tests → rollback boundary → exit gate.**
 ### Executed on this machine
 
 ```
+Clean install of the BUILT WHEEL (V01)     wheel -> fresh venv -> service -> index -> search
+                                           HIGH 0.808, scope field present; torn down clean
 Linux adapter (WSL2, real systemd)         22/22   incl. systemd-analyze verify
 Upgrade rehearsal (real v2.7.0 config)     16/16   detection, protection, PATH, migration
 Cross-project isolation (V14)              0 foreign documents across 4 probes
 Storage kill -> degraded -> recovery (V12) honest degraded; new Qdrant; 160,630 points intact
-Validation matrix                          8 pass / 0 fail / 7 manual
-Suite                                      1806 passed, 13 skipped, 0 failures
+Validation matrix                          9 pass / 0 fail / 6 manual
 ```
+
+**The gate refuses to pass a row it did not run.** Twice this had to be fixed:
+once when `Matrix.validated` reported VALIDATED with nine unrun MANUAL rows, and
+again when two checks returned PASS while their own detail said "not run". Both
+are the same defect — converting *unverified* into *verified* — and both are now
+pinned by tests.
 
 ### Defects found by executing rather than reading
 

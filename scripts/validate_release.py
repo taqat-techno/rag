@@ -157,10 +157,24 @@ def _no_cross_project_leakage(ctx: dict) -> tuple[bool, str]:
     """
     leaks = ctx.get("leakage")
     if leaks is None:
-        return True, "not probed (pass --deep)"
+        return None, "not probed — supply --leakage from the isolation probe"
     if leaks:
         return False, f"{leaks} foreign document(s) returned"
     return True, "0 foreign documents across all probes"
+
+
+def _clean_install(ctx: dict):
+    """A clean install of the BUILT artifact — not a run from source.
+
+    The gate is explicit that a green source suite proves nothing about what
+    ships, so this row is only satisfied by evidence from a wheel installed
+    into a fresh interpreter.
+    """
+    result = ctx.get("clean_install")
+    if result is None:
+        return None, "not run — see scripts/verify_clean_install.py"
+    failed = result.get("failed", 0)
+    return failed == 0, f"{result.get('passed', 0)} check(s) passed, {failed} failed"
 
 
 def _upgrade_rehearsal(ctx: dict) -> tuple[bool, str]:
@@ -168,7 +182,7 @@ def _upgrade_rehearsal(ctx: dict) -> tuple[bool, str]:
     against a copy of the real previous installation."""
     result = ctx.get("rehearsal")
     if result is None:
-        return True, "not run (scripts/rehearse_upgrade.py)"
+        return None, "not run — supply --rehearsal-passed from scripts/rehearse_upgrade.py"
     failed = result.get("failed", 0)
     return failed == 0, f"{result.get('passed', 0)} passed, {failed} failed"
 
@@ -188,7 +202,7 @@ def _scale_matches_engine(ctx: dict) -> tuple[bool, str]:
 
 
 ROWS = [
-    Row("V01", "clean installation", manual_reason="needs a fresh machine or VM"),
+    Row("V01", "clean install of the built artifact", _clean_install),
     Row("V02", "upgrade rehearsal against the previous release", _upgrade_rehearsal,
         platforms=("windows",)),
     Row("V03", "reboot and sign-in -> service autostarts",
@@ -251,6 +265,11 @@ def run(platform: str, ctx: dict, rows=None) -> Matrix:
         except Exception as exc:  # noqa: BLE001
             matrix.results.append(Result(row, FAIL, f"check raised: {exc}"))
             continue
+        if ok is None:
+            # No evidence supplied. Reporting PASS here would be the same
+            # manufactured pass as counting an unrun MANUAL row.
+            matrix.results.append(Result(row, MANUAL, detail or row.manual_reason))
+            continue
         matrix.results.append(Result(row, PASS if ok else FAIL, detail))
     return matrix
 
@@ -263,6 +282,8 @@ def main(argv=None) -> int:
                         help="foreign documents found by the isolation probe")
     parser.add_argument("--rehearsal-passed", type=int, default=None)
     parser.add_argument("--rehearsal-failed", type=int, default=None)
+    parser.add_argument("--clean-install-passed", type=int, default=None)
+    parser.add_argument("--clean-install-failed", type=int, default=None)
     args = parser.parse_args(argv)
 
     from ragtools.platform import current_platform
@@ -271,6 +292,9 @@ def main(argv=None) -> int:
     ctx = collect(args.url)
     if args.leakage is not None:
         ctx["leakage"] = args.leakage
+    if args.clean_install_passed is not None:
+        ctx["clean_install"] = {"passed": args.clean_install_passed,
+                                "failed": args.clean_install_failed or 0}
     if args.rehearsal_passed is not None:
         ctx["rehearsal"] = {"passed": args.rehearsal_passed,
                             "failed": args.rehearsal_failed or 0}

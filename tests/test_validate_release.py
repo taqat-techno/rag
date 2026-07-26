@@ -129,3 +129,23 @@ def test_an_unreachable_service_fails_rather_than_erroring(monkeypatch):
     ctx = collect("http://127.0.0.1:1", fetch=_fetch)
     matrix = run("windows", ctx, _rows("V06", "V07"))
     assert all(r.status == FAIL for r in matrix.results)
+
+
+def test_a_check_without_evidence_does_not_pass():
+    """The same manufactured pass as counting an unrun MANUAL row, one level
+    down: a check that answers "I was not given the data" must not be green."""
+    matrix = run("windows", {}, _rows("V01", "V02", "V14"))
+    assert all(r.status == MANUAL for r in matrix.results)
+    assert matrix.validated is False
+
+
+def test_supplied_evidence_makes_the_row_pass():
+    ctx = {**HEALTHY, "clean_install": {"passed": 6, "failed": 0},
+           "rehearsal": {"passed": 16, "failed": 0}, "leakage": 0}
+    matrix = run("windows", ctx, _rows("V01", "V02", "V14"))
+    assert all(r.status == PASS for r in matrix.results)
+
+
+def test_evidence_of_failure_fails_the_row():
+    ctx = {**HEALTHY, "clean_install": {"passed": 4, "failed": 2}}
+    assert run("windows", ctx, _rows("V01")).results[0].status == FAIL
