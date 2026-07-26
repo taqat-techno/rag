@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+from ragtools.upgrade.migrate import fold_for_match
+
 #: Directory names that mark a NON-installed environment. Matching any of these
 #: anywhere in a path disqualifies it from every cleanup action.
 DEV_MARKERS = (
@@ -118,9 +120,15 @@ def is_development_path(path: Path | str) -> bool:
     Checked before every removal. An installer that deletes an isolated dev
     store because the name looked close enough has done more damage than the
     stale files it was cleaning up.
+
+    Matching goes through :func:`~ragtools.upgrade.migrate.fold_for_match`, not
+    ``os.path.normcase``. normcase is the identity on POSIX, so with lowercase
+    DEV_MARKERS this returned False for ``~/.local/share/RAGTools-dev`` — the
+    exact directory the Linux adapter creates. The one guard standing between an
+    upgrade and a developer's isolated store was inert on Linux and macOS.
     """
-    text = os.path.normcase(str(path))
-    return any(marker in text for marker in (os.path.normcase(m) for m in DEV_MARKERS))
+    text = fold_for_match(path)
+    return any(fold_for_match(marker) in text for marker in DEV_MARKERS)
 
 
 def scan(
@@ -194,7 +202,7 @@ def scan(
         entry = entry.strip()
         if not entry:
             continue
-        if "ragtools" in os.path.normcase(entry) and not is_development_path(entry):
+        if "ragtools" in fold_for_match(entry) and not is_development_path(entry):
             result.path_entries.append(entry)
 
     # --- autostart registrations ----------------------------------------
