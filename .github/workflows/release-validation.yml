@@ -202,8 +202,51 @@ jobs:
         #     violated, and a property of a directory that only exists here.
         run: python scripts/verify_bundle.py --bundle dist/rag --require-windowed
 
+  real-upgrade:
+    name: packaged v2.7.0 -> this build, on a real machine
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[build]"
+
+      - name: Extract version
+        id: version
+        shell: bash
+        run: echo "version=$(python -c 'import tomllib;print(tomllib.load(open(\"pyproject.toml\",\"rb\"))[\"project\"][\"version\"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Build the bundle and the installer
+        # With the model: the previous release ships one, and an upgrade that
+        # only works for a model-less bundle is not the upgrade users run.
+        run: |
+          python scripts/build.py
+          choco install innosetup -y --no-progress
+          & "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ steps.version.outputs.version }} installer.iss
+
+      - name: Install a genuine v2.7.0, start it, then upgrade over it
+        # The check every previous upgrade test could not make. The others
+        # synthesise a v2 layout and call migrate_config() directly; this runs
+        # one PACKAGED installer over another with the previous version's
+        # processes alive and holding their own binaries, which is the only
+        # state in which a locked-file failure can happen at all.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/verify_upgrade_install.py `
+            --installer dist/RAGTools-Setup-${{ steps.version.outputs.version }}.exe `
+            --version ${{ steps.version.outputs.version }} `
+            --from-version 2.7.0
+
+      - name: Uninstall and sweep for residue
+        if: always()
+        run: python scripts/verify_uninstall_residue.py
+        continue-on-error: true
+
   upgrade-rehearsal:
-    name: upgrade rehearsal
+    name: upgrade rehearsal (synthesised layout)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -220,7 +263,7 @@ jobs:
 
   gate:
     name: release gate
-    needs: [suite, linux-adapter, macos-adapter, clean-install, windows-autostart, bundle-contract]
+    needs: [suite, linux-adapter, macos-adapter, clean-install, windows-autostart, bundle-contract, real-upgrade]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

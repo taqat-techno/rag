@@ -17,7 +17,7 @@
 ; nothing, and the release published WITHOUT its installer while every step
 ; reported success.
 #ifndef MyAppVersion
-  #define MyAppVersion "3.0.1"
+  #define MyAppVersion "3.0.2"
 #endif
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
@@ -187,20 +187,80 @@ end;
 procedure ForceKillRagProcesses();
 var
   ResultCode: Integer;
+  Images: array[0..2] of string;
+  I: Integer;
 begin
-  Exec(ExpandConstant('{sys}\taskkill.exe'),
-       '/F /IM rag.exe /T',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // EVERY image an installation owns, not just the one it used to ship.
+  //
+  // This killed `rag.exe` alone until v3.0.2 — written when that was the only
+  // executable. v3.0.1 then added `ragw.exe` and pointed BOTH scheduled tasks
+  // at it, so from that release on the service and tray at login are `ragw.exe`
+  // and the kill missed them entirely. A running image holds its own file, so
+  // the very processes an upgrade must stop were the ones it left alone: the
+  // copy would skip locked files and the installer would report success over a
+  // half-replaced tree. `CloseApplications=yes` catches some of this through
+  // Restart Manager, but it is a prompt, not a guarantee, and it does not cover
+  // a process holding a file it did not open by name.
+  //
+  // `qdrant.exe` is owned too: managed storage supervises one, and it holds
+  // handles under the data dir that a reconciling upgrade may need.
+  Images[0] := 'rag.exe';
+  Images[1] := 'ragw.exe';
+  Images[2] := 'qdrant.exe';
+
+  for I := 0 to 2 do
+  begin
+    // /F force, /T whole tree, /IM by image name. Errors ignored: taskkill
+    // returns 128 when nothing matches, which is the fresh-install path.
+    Exec(ExpandConstant('{sys}\taskkill.exe'),
+         '/F /IM ' + Images[I] + ' /T',
+         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+
   // Short delay for NTFS file handles to fully release so the copy step
   // doesn't hit a "file is in use" error immediately after kill.
   Sleep(1500);
 end;
 
+// End every scheduled task this product owns before touching its files.
+//
+// Killing the process is not enough on its own: Task Scheduler can start it
+// again between the kill and the copy — the registration carries
+// RestartOnFailure, and a force-kill is exactly the failure it reacts to. So
+// the task is ended first, then the processes are killed.
+//
+// `/end` rather than `/delete`: the [Run] section re-registers both tasks from
+// the new binaries, and deleting here would strand a user who cancels the
+// wizard between the two steps with no autostart at all.
+procedure StopOwnedTasks();
+var
+  ResultCode: Integer;
+  Tasks: array[0..2] of string;
+  I: Integer;
+begin
+  Tasks[0] := '\RAGTools\Service';
+  Tasks[1] := '\RAGTools\Tray';
+  Tasks[2] := 'RAGTools Watchdog';   // legacy v2 registration, still present on upgrades
+  for I := 0 to 2 do
+    Exec(ExpandConstant('{sys}\schtasks.exe'),
+         '/end /tn "' + Tasks[I] + '"',
+         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+// Forward declaration: the verifier is defined below, next to the reasoning
+// that explains it, but CurStepChanged has to reach it. Pascal resolves this
+// with a declaration, not by demanding the reader meet the mechanism first.
+procedure VerifyInstallation(); forward;
+
 // Pre-install: stop running service and force-close any remaining rag.exe.
+// Post-install (ssDone, after [Run] has re-registered the tasks): verify.
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
 begin
+  if CurStep = ssDone then
+    VerifyInstallation();
+
   if CurStep = ssInstall then
   begin
     // Phase 1: ask the service to stop gracefully (if upgrading).
@@ -209,9 +269,55 @@ begin
       Exec(ExpandConstant('{app}\rag.exe'), 'service stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
       Exec(ExpandConstant('{app}\rag.exe'), 'service uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;
-    // Phase 2: force-kill anything that's still holding the exe open.
+    // Phase 2: end the scheduled tasks BEFORE killing, so the scheduler cannot
+    // restart what we are about to kill. The registration carries
+    // RestartOnFailure and a force-kill is precisely the failure it reacts to.
+    StopOwnedTasks();
+    // Phase 3: force-kill every owned image still holding a file open.
     ForceKillRagProcesses();
   end;
+end;
+
+// After the files are in place: prove the machine actually moved.
+//
+// Everything above is best-effort — a graceful stop that timed out, a kill that
+// raced a restart, a file that stayed locked. None of it reports failure, and
+// an installer that copied files has only proven that it copied files. So the
+// newly installed binary is asked to audit its own installation: its version,
+// its sibling `ragw.exe`, the uninstall registry entry, the scheduled-task
+// targets, and any owned process still running from somewhere else.
+//
+// Non-zero exit means the machine is in a mixed state, and saying so is the
+// entire point — a silent half-upgrade is indistinguishable from success until
+// the user's service fails to start.
+procedure VerifyInstallation();
+var
+  ResultCode: Integer;
+  Verifier: string;
+begin
+  Verifier := ExpandConstant('{app}\rag.exe');
+  if not FileExists(Verifier) then
+  begin
+    MsgBox('Installation problem: ' + Verifier + ' is missing after setup.' + #13#10 + #13#10 +
+           'The installation is incomplete. Please re-run this installer and, if it fails '
+           + 'again, restart Windows first so no old files remain locked.',
+           mbCriticalError, MB_OK);
+    Exit;
+  end;
+
+  if not Exec(Verifier, 'selfcheck --quiet --expect-version {#MyAppVersion}',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Exit;   // could not run the check at all; do not invent a verdict
+
+  if ResultCode <> 0 then
+    MsgBox('RAG Tools {#MyAppVersion} was installed, but verification found that this '
+           + 'machine is NOT fully running it.' + #13#10 + #13#10 +
+           'This usually means a process from the previous version was still running '
+           + 'while files were replaced, so some files were skipped.' + #13#10 + #13#10 +
+           'To fix it: restart Windows, then run this installer again. Your projects, '
+           + 'configuration and index are not affected.' + #13#10 + #13#10 +
+           'For details run:  rag selfcheck',
+           mbCriticalError, MB_OK);
 end;
 
 // Copy the configuration out of the data root before anything deletes it.

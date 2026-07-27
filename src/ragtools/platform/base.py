@@ -144,6 +144,35 @@ class PlatformAdapter(Protocol):
         """Start a process that outlives this one, with no console window."""
         ...
 
+    #: Filename of the windowless sibling this platform ships, or ``None`` where
+    #: the concept does not exist. Declarative rather than a method because it is
+    #: a fact about the build, and a caller asking "should there be one?" must
+    #: not have to branch on the OS to find out.
+    windowed_executable_name: Optional[str]
+
+    def recorded_version(self) -> Optional[str]:
+        """The version the OS's own package database says is installed.
+
+        Distinct from ``ragtools.__version__``, which is what this *process* is.
+        When they disagree, an upgrade replaced files without updating the
+        record the rest of the system reads — Add/Remove Programs, winget and
+        the installer's own upgrade detection all consult it.
+
+        ``None`` means this platform keeps no such record, which is not a
+        failure and must not be reported as agreement.
+        """
+        ...
+
+    def owned_processes(self) -> Optional[list[tuple[int, str, str]]]:
+        """``(pid, image, executable path)`` for every running process this
+        product owns, or ``None`` when the platform cannot be enumerated.
+
+        The distinction matters: an empty list means "looked, found none" and
+        ``None`` means "could not look". Collapsing them would let a machine
+        report a clean installation precisely because nothing could be checked.
+        """
+        ...
+
     def background_executable(self, executable: str) -> str:
         """Which image the **OS itself** should launch for a windowless run.
 

@@ -187,3 +187,101 @@ def test_windows_startup_entry_points_at_the_windowless_executable(script):
         assert "ragw.exe" in line, (
             "the tray is launched through the console-subsystem binary"
         )
+
+
+# --- v3.0.2: stopping what actually holds the files ----------------------
+
+
+def test_every_owned_image_is_killed_not_just_the_original_one(script):
+    """The defect v3.0.1 introduced into its own upgrade path.
+
+    v3.0.1 pointed both scheduled tasks at `ragw.exe`, so from that release on
+    the service and tray at login run under that image. `ForceKillRagProcesses`
+    still killed only `rag.exe` — leaving the very processes an upgrade must
+    stop holding their own binaries, which is how a copy silently skips files
+    and the installer reports success over a half-replaced tree.
+    """
+    body = re.search(r"procedure ForceKillRagProcesses.*?^end;", script,
+                     re.DOTALL | re.MULTILINE)
+    assert body, "ForceKillRagProcesses is gone"
+    text = body.group(0)
+
+    for image in ("rag.exe", "ragw.exe", "qdrant.exe"):
+        assert image in text, f"{image} is never killed before files are replaced"
+
+
+def test_scheduled_tasks_are_ended_before_the_processes_are_killed(script):
+    """Order matters, and the registration is what makes it matter.
+
+    The task carries RestartOnFailure, and a force-kill is exactly the failure
+    it reacts to — so killing first lets the scheduler start a replacement
+    between the kill and the copy.
+    """
+    install = re.search(r"if CurStep = ssInstall then.*?^  end;", script,
+                        re.DOTALL | re.MULTILINE)
+    assert install, "the pre-install step is gone"
+    text = install.group(0)
+
+    stop = text.find("StopOwnedTasks()")
+    kill = text.find("ForceKillRagProcesses()")
+    assert stop != -1, "scheduled tasks are never stopped before replacement"
+    assert kill != -1
+    assert stop < kill, "processes are killed before the tasks that restart them"
+
+
+def test_the_tasks_are_ended_rather_than_deleted(script):
+    """`/end`, not `/delete`: [Run] re-registers both tasks from the new
+    binaries, and deleting here would strand a user who cancels the wizard
+    in between with no autostart at all."""
+    body = re.search(r"procedure StopOwnedTasks.*?^end;", script,
+                     re.DOTALL | re.MULTILINE)
+    assert body, "StopOwnedTasks is gone"
+    assert "/end" in body.group(0)
+    assert "/delete" not in body.group(0)
+
+
+# --- v3.0.2: the installer must not claim success it has not verified ----
+
+
+def test_the_installer_verifies_the_installation_afterwards(script):
+    """An installer that copied files has proven it copied files.
+
+    Whether the MACHINE now runs the new version is a different question, and
+    every way it can fail — a locked file, a task still naming the old path, a
+    surviving process — looks identical from inside the installer: no error.
+    """
+    assert "VerifyInstallation" in script, "no post-install verification"
+    assert re.search(r"selfcheck[^']*--expect-version", script), (
+        "verification does not pin the expected version, so it cannot detect "
+        "that the machine is still on the old one"
+    )
+
+
+def test_verification_runs_after_the_tasks_are_registered(script):
+    """At ssDone, not ssPostInstall.
+
+    [Run] is what re-registers the scheduled tasks from the new binaries, and it
+    executes AFTER ssPostInstall. Verifying before that would check targets that
+    do not exist yet and pass for the wrong reason.
+    """
+    assert re.search(r"if CurStep = ssDone then\s*\n\s*VerifyInstallation\(\);", script), (
+        "verification is not wired to ssDone"
+    )
+
+
+def test_a_failed_verification_is_reported_as_an_error(script):
+    """Silence here is the whole defect class. A mixed installation must say so."""
+    # The name appears twice — a `forward;` declaration and the definition. Take
+    # the body, not the declaration; matching the first occurrence silently
+    # tested CurStepChanged instead, which is its own small lesson about
+    # structural assertions.
+    bodies = [m.group(0) for m in
+              re.finditer(r"procedure VerifyInstallation\(\);.*?^end;", script,
+                          re.DOTALL | re.MULTILINE)
+              if "forward;" not in m.group(0).splitlines()[0]]
+    assert bodies, "VerifyInstallation has no definition"
+    text = bodies[0]
+    assert "mbCriticalError" in text, "a failed verification does not surface as an error"
+    assert re.search(r"ResultCode\s*<>\s*0", text), (
+        "the verifier's exit code is never checked"
+    )

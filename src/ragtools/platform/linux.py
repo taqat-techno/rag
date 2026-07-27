@@ -93,6 +93,22 @@ class LinuxAdapter:
         kwargs.setdefault("close_fds", True)
         return subprocess.Popen(list(argv), **kwargs).pid
 
+
+    #: No windowless variant exists; ELF has no console-vs-GUI subsystem split.
+    windowed_executable_name = None
+
+    def recorded_version(self):
+        """systemd keeps no per-application version record this product
+        writes, so there is nothing to disagree with. None means "no record",
+        never "agrees"."""
+        return None
+
+    def owned_processes(self):
+        """Not enumerated here. Returning None rather than an empty list is
+        deliberate: an empty list would let a caller conclude "no stray
+        processes" from a check that never ran."""
+        return None
+
     def background_executable(self, executable: str) -> str:
         """Unchanged — ELF has no console-vs-GUI subsystem split.
 

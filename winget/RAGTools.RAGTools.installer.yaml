@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 PackageIdentifier: RAGTools.RAGTools
-PackageVersion: 3.0.1
+PackageVersion: 3.0.2
 InstallerType: inno
 Scope: user
 InstallerSwitches:
@@ -8,7 +8,7 @@ InstallerSwitches:
   SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/taqat-techno/rag/releases/download/v3.0.1/RAGTools-Setup-3.0.1.exe
-    InstallerSha256: C912E65D4B25571AB3539A326A6B5C799F58657DCBC8AFFD25FC7B6BC74051FE
+    InstallerUrl: https://github.com/taqat-techno/rag/releases/download/v3.0.2/RAGTools-Setup-3.0.2.exe
+    InstallerSha256: PLACEHOLDER_REPLACE_WITH_RELEASE_SHA256
 ManifestType: installer
 ManifestVersion: 1.6.0

@@ -75,6 +75,19 @@ LEGACY_STARTUP_FILES = {
 #: whether a terminal window appears at login. See `background_executable`.
 WINDOWED_EXE_NAME = "ragw.exe"
 
+#: Inno's AppId for RAG Tools. Its uninstall key is `{AppId}_is1`, and that key
+#: is what Add/Remove Programs, winget and Inno's own upgrade detection read —
+#: so an upgrade that replaces files without updating it leaves the rest of the
+#: system describing the previous version.
+APP_ID = "{7E4B2A3C-F1D8-4A5E-B9C0-1234567890AB}"
+UNINSTALL_KEY = (r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+                 rf"\{APP_ID}_is1")
+
+#: Images an installation owns. `qdrant.exe` counts: managed storage supervises
+#: one, and it holds handles an upgrade may need released.
+OWNED_IMAGES = ("rag.exe", "ragw.exe", "qdrant.exe")
+_POWERSHELL_OWNED_IMAGES = ",".join(f"'{name}'" for name in OWNED_IMAGES)
+
 #: Task Scheduler accepts nothing but UTF-16 for `/xml`. A UTF-8 file — even
 #: with a BOM — is rejected outright as "The task XML is malformed", which reads
 #: like a schema error and is not one. Measured, not assumed.
@@ -142,6 +155,48 @@ class WindowsAdapter:
         kwargs.setdefault("creationflags", CREATE_NO_WINDOW | DETACHED_PROCESS)
         kwargs.setdefault("close_fds", True)
         return subprocess.Popen(list(argv), **kwargs).pid
+
+    #: Windows ships one; see WINDOWED_EXE_NAME.
+    windowed_executable_name = WINDOWED_EXE_NAME
+
+    def recorded_version(self) -> Optional[str]:
+        """`DisplayVersion` from Inno's uninstall key, or None if absent.
+
+        Read from both hives: an install can be per-user or machine-wide, and
+        looking in only one is how a present entry reads as missing.
+        """
+        try:
+            import winreg
+        except ImportError:  # pragma: no cover — Windows always has it
+            return None
+
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(hive, UNINSTALL_KEY) as key:
+                    value, _ = winreg.QueryValueEx(key, "DisplayVersion")
+            except OSError:
+                continue
+            return str(value)
+        return None
+
+    def owned_processes(self) -> Optional[list[tuple[int, str, str]]]:
+        """Running rag/ragw/qdrant processes and the images they came from."""
+        script = (
+            "Get-CimInstance Win32_Process | "
+            f"Where-Object {{ $_.Name -in {_POWERSHELL_OWNED_IMAGES} }} | "
+            "ForEach-Object { \"$($_.ProcessId)|$($_.Name)|$($_.ExecutablePath)\" }"
+        )
+        result = self._run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", script])
+        if not result.ok:
+            # Could not look. Saying so is the point — see the contract.
+            return None
+        found: list[tuple[int, str, str]] = []
+        for line in (result.stdout or "").splitlines():
+            parts = line.strip().split("|")
+            if len(parts) == 3 and parts[0].isdigit():
+                found.append((int(parts[0]), parts[1], parts[2]))
+        return found
 
     def background_executable(self, executable: str) -> str:
         """Swap in the windowless sibling when the bundle ships one.

@@ -90,6 +90,7 @@ def test_every_adapter_satisfies_the_same_contract(tmp_path):
     """A contract only one implementation satisfies is not a contract."""
     required = [
         "app_dir", "dev_dir", "spawn_detached", "background_executable",
+        "recorded_version", "owned_processes",
         "pid_alive", "terminate",
         "supports_autostart", "install_autostart", "remove_autostart",
         "find_autostart", "has_desktop_session", "open_url", "open_path", "copy_text",
@@ -98,6 +99,44 @@ def test_every_adapter_satisfies_the_same_contract(tmp_path):
         impl = resolve_adapter(name, home=tmp_path, runner=FakeRunner())
         missing = [m for m in required if not callable(getattr(impl, m, None))]
         assert not missing, f"{name} adapter missing {missing}"
+        assert hasattr(impl, "windowed_executable_name"), (
+            f"{name} adapter cannot answer whether it ships a windowless binary"
+        )
+
+
+def test_unenumerable_is_none_and_empty_is_a_real_answer(tmp_path):
+    """`None` and `[]` must not collapse.
+
+    `owned_processes()` returning an empty list means "looked, found none".
+    Returning None means "could not look". A caller that cannot tell them apart
+    reports a clean installation precisely when nothing could be verified —
+    which is the false success `rag selfcheck` exists to prevent.
+    """
+    for name in ("linux", "darwin"):
+        impl = resolve_adapter(name, home=tmp_path, runner=FakeRunner())
+        assert impl.owned_processes() is None, (
+            f"{name} claims to have enumerated processes it never looked for"
+        )
+        assert impl.recorded_version() is None
+        assert impl.windowed_executable_name is None
+
+
+def test_windows_reports_a_failed_process_probe_as_unknown(tmp_path):
+    """A probe that could not run must not read as 'no stray processes'."""
+    adapter, _ = _win(tmp_path, FakeRunner(default=CommandResult(1, "", "denied")))
+
+    assert adapter.owned_processes() is None
+
+
+def test_windows_parses_the_process_listing_it_asks_for(tmp_path):
+    """The pipe-delimited shape the adapter itself requests."""
+    listing = "1234|ragw.exe|C:\\P\\RAGTools\\ragw.exe\r\n99|rag.exe|C:\\Old\\rag.exe\r\n"
+    adapter, _ = _win(tmp_path, FakeRunner(default=CommandResult(0, listing, "")))
+
+    assert adapter.owned_processes() == [
+        (1234, "ragw.exe", "C:\\P\\RAGTools\\ragw.exe"),
+        (99, "rag.exe", "C:\\Old\\rag.exe"),
+    ]
 
 
 def test_data_roots_differ_per_platform_and_never_collide_with_dev(tmp_path):

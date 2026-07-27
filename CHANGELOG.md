@@ -13,6 +13,64 @@ _Nothing yet._
 
 ---
 
+## [3.0.2] — 2026-07-27
+
+Hardens the Windows upgrade path and makes the installer prove its own result.
+The trigger was an investigation into a reported failed upgrade; that specific
+report turned out to be an installer that never ran (see below), but the
+investigation found a real defect that 3.0.1 had introduced into its own future
+upgrade path, plus a class of failure the installer could not detect at all.
+
+### Fixed
+- **The installer now stops every process an installation owns, not just the
+  one it used to ship.** `ForceKillRagProcesses()` killed only `rag.exe`. 3.0.1
+  moved both scheduled tasks to `ragw.exe`, so from that release forward the
+  service and tray running at login were images the pre-install step did not
+  touch — and a running image holds its own file open. The processes an upgrade
+  most needs to stop were the ones it left alone, so a copy would skip locked
+  files and setup would report success over a half-replaced tree. `ragw.exe` and
+  `qdrant.exe` are now stopped as well.
+- **Scheduled tasks are ended before the processes are killed.** The
+  registration carries `RestartOnFailure`, and a force-kill is exactly the
+  failure it reacts to — so killing first let the scheduler start a replacement
+  between the kill and the copy.
+
+### Added
+- **`rag selfcheck`** — verifies the *installation*, not the executable: its
+  version, the `ragw.exe` sibling, the uninstall registry entry, that no owned
+  process runs from outside the install directory, that every autostart
+  registration targets it, and that a responding service reports this version.
+  Exits non-zero so a caller can refuse to claim success.
+- **The installer runs it after installing** (`ssDone`, after the tasks are
+  re-registered) and reports a clear error if the machine is in a mixed state,
+  instead of reporting success. An installer that copied files has proven it
+  copied files; every way an upgrade half-fails looks identical from inside it.
+- **A real upgrade regression test** — `scripts/verify_upgrade_install.py`
+  downloads the published **v2.7.0 installer**, installs it, starts it so its
+  binaries are genuinely locked, runs the newly built installer over it, then
+  asserts the binary, uninstall registry, running process paths, scheduled-task
+  targets, `/health` and `rag selfcheck` all belong to the new release — and
+  that user config survived. Runs as the `real-upgrade` job and gates the
+  release. Every previous upgrade check used a synthesised layout and called
+  `migrate_config()` directly, which is why none of them could see the
+  `ragw.exe` defect above.
+- **CI asserts the built binary reports the tag being released** before it is
+  packaged, closing the remaining version-injection direction (a correctly named
+  installer wrapping a bundle built from stale sources).
+
+### Note on the reported incident
+The upgrade failure that prompted this work could not be reproduced, and the
+evidence says it did not occur: on the affected machine `unins000.dat` and the
+uninstall registry entry were both unchanged since 2026-06-30, no `3.0.x` string
+appeared anywhere in a 4.2 MB service log spanning three months, no `ragw.exe`
+existed, and the only RAGTools installer present was `RAGTools-Setup-3.0.0-rc.4.exe`
+— `RAGTools-Setup-3.0.1.exe` had never been downloaded. **Artifacts remain
+unsigned**, so Windows SmartScreen blocks execution unless the user explicitly
+clicks through, which is the most likely reason an installer run leaves no trace.
+Signing (V16) is still open and is now the highest-value remaining work.
+
+---
+
 ## [3.0.1] — 2026-07-27
 
 Fixes four defects found by installing 3.0.0 over 2.7.0 on a real machine.

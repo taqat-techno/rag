@@ -615,6 +615,46 @@ def version():
 
 
 @app.command()
+def selfcheck(
+    expect_version: str = typer.Option(
+        None, "--expect-version",
+        help="Fail unless the installation is this version. Defaults to this build's."),
+    port: int = typer.Option(None, "--port", help="Service port to probe for /health."),
+    quiet: bool = typer.Option(False, "--quiet", help="Print only on failure."),
+):
+    """Verify the INSTALLATION on this machine, not just this executable.
+
+    Run by the Windows installer after copying files. An installer that copied
+    files has proven it copied files; it has not proven the machine now runs the
+    new version, and the two come apart whenever an old process was still
+    holding its own binaries or a scheduled task still names the old path.
+
+    Exits non-zero if any check fails, so a caller can refuse to report success.
+    """
+    from ragtools import __version__
+    from ragtools.selfcheck import failures, format_report, run_selfcheck
+
+    expected = expect_version or __version__
+    checks = run_selfcheck(expected, port=port)
+    broken = failures(checks)
+
+    if broken and quiet:
+        console.print(f"[red]Installation verification FAILED[/red] (expected {expected})")
+    if not quiet:
+        console.print(f"Verifying the RAG Tools installation against {expected}\n")
+    if broken or not quiet:
+        console.print(format_report(checks))
+
+    if broken:
+        console.print(
+            "\n[red]This machine is NOT fully running "
+            f"{expected}.[/red] The most common cause is a process from the "
+            "previous version still running while files were replaced."
+        )
+        raise typer.Exit(1)
+
+
+@app.command()
 def serve():
     """Start the MCP server for Claude CLI integration.
 
