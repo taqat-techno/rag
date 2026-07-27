@@ -98,21 +98,63 @@ def index(
     if _probe_service(settings):
         import httpx
         try:
-            r = httpx.post(
-                f"{_service_url(settings)}/api/index",
-                json={"project": project, "full": full},
-                timeout=300.0,
-            )
+            url = _service_url(settings)
+            r = httpx.post(f"{url}/api/index",
+                           json={"project": project, "full": full}, timeout=60.0)
             r.raise_for_status()
-            stats = r.json()["stats"]
-            elapsed = time.time() - start
-            _print_index_stats(stats, full, elapsed)
+            job = r.json()
+
+            # `/api/index` ENQUEUES; it does not index inline. This used to read
+            # `r.json()["stats"]`, a key the endpoint stopped returning when
+            # indexing became a job — so `rag index` died with KeyError: 'stats'
+            # against any running service, on every platform. Found by running
+            # the shipped Linux bundle rather than the source tree.
+            job_id = job["job_id"]
+            terminal = {"succeeded", "failed", "cancelled"}
+            last_phase = None
+            while job.get("state") not in terminal:
+                time.sleep(0.5)
+                job = httpx.get(f"{url}/api/jobs/{job_id}", timeout=30.0).json()
+                progress = job.get("progress") or {}
+                phase, done, total = (progress.get("phase"),
+                                      progress.get("done") or 0,
+                                      progress.get("total") or 0)
+                if phase and (phase, done // 200) != last_phase:
+                    console.print(f"  [dim]{phase}: {done}"
+                                  + (f"/{total}" if total else "") + "[/dim]")
+                    last_phase = (phase, done // 200)
+
+            if job["state"] != "succeeded":
+                console.print(f"[red]Indexing {job['state']}:[/red] "
+                              f"{job.get('error') or 'no reason reported'}")
+                raise typer.Exit(1)
+
+            _print_index_stats(job.get("result") or {}, full, time.time() - start)
+        except typer.Exit:
+            raise
         except Exception as e:
             console.print(f"[red]Indexing via service failed:[/red] {e}")
             raise typer.Exit(1)
     else:
         console.print("[yellow]Service is not running.[/yellow] Start with: [bold]rag service start[/bold]")
         raise typer.Exit(1)
+
+
+def _suggest_projects(settings) -> None:
+    """Name the projects the user could scope to. A refusal without a next step
+    is just a wall."""
+    import httpx
+
+    try:
+        payload = httpx.get(f"{_service_url(settings)}/api/projects", timeout=15.0).json()
+        ids = [p["project_id"] for p in payload.get("projects") or []]
+    except Exception:  # noqa: BLE001 — advice is best-effort, never fatal
+        ids = []
+    if ids:
+        console.print("\n[bold]Available projects:[/bold] " + ", ".join(sorted(ids)))
+        console.print(f"[dim]Try: rag search \"...\" -p {sorted(ids)[0]}[/dim]")
+    else:
+        console.print("[dim]No projects are indexed yet. Run: rag index[/dim]")
 
 
 @app.command()
@@ -132,6 +174,17 @@ def search(
                 params={"query": query, "project": project, "top_k": top_k},
                 timeout=10.0,
             )
+            # The service is fail-closed on scope: an unscoped search is refused
+            # with 422 SCOPE_UNRESOLVED rather than silently widened to
+            # everything. That is deliberate — but `rag search "q"` with no -p
+            # used to surface the raw HTTP error, which tells the user nothing
+            # about what to do. Say what the service said, and what to pass.
+            if r.status_code == 422:
+                detail = (r.json().get("detail") or {})
+                if detail.get("error_code") == "SCOPE_UNRESOLVED":
+                    console.print(f"[yellow]{detail.get('error', 'scope unresolved')}[/yellow]")
+                    _suggest_projects(settings)
+                    raise typer.Exit(2)
             r.raise_for_status()
             data = r.json()
             if data["count"] == 0:
@@ -144,6 +197,8 @@ def search(
                 text = result["text"]
                 console.print(f"    {text[:200]}{'...' if len(text) > 200 else ''}")
                 console.print()
+        except typer.Exit:
+            raise          # our own controlled exit, not a transport failure
         except Exception as e:
             console.print(f"[red]Search via service failed:[/red] {e}")
             raise typer.Exit(1)
