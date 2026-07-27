@@ -37,7 +37,7 @@ from ragtools.platform.base import (
 
 __all__ = [
     "adapter", "resolve_adapter", "reset_adapter", "current_platform",
-    "host_system", "host_machine",
+    "host_system", "host_machine", "background_executable",
     "AutostartSpec", "Registration", "PlatformAdapter", "PlatformUnsupported",
     "CommandResult", "CommandRunner", "default_runner",
     "KIND_SERVICE", "KIND_TRAY", "KIND_SCHEDULE",
@@ -45,6 +45,26 @@ __all__ = [
 ]
 
 _cached: Optional[PlatformAdapter] = None
+
+
+def background_executable(executable: Optional[str] = None) -> str:
+    """``argv[0]`` for a registration the OS itself will launch.
+
+    A free function so the two callers that build autostart argv —
+    :mod:`ragtools.service.startup` and :mod:`ragtools.service.tray_startup` —
+    can ask the question without either importing the Windows adapter or
+    branching on ``sys.platform`` themselves. That branching is what put this
+    decision in thirteen modules before the platform package existed.
+
+    Degrades to the executable it was given on an unsupported platform: a
+    machine with no adapter has no autostart to register, so there is nothing
+    for a raise to protect.
+    """
+    resolved = sys.executable if executable is None else executable
+    try:
+        return adapter().background_executable(resolved)
+    except PlatformUnsupported:
+        return resolved
 
 
 def current_platform(platform_name: Optional[str] = None) -> str:

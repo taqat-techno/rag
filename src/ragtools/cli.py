@@ -5,9 +5,18 @@ import sys
 import time
 from pathlib import Path
 
-import typer
-from rich.console import Console
-from rich.table import Table
+# BEFORE rich, typer, or logging. `ragw.exe` — the GUI-subsystem sibling that
+# Task Scheduler launches so no console window appears at login — runs this very
+# script with `sys.stdout`/`sys.stderr` set to None. `rich.Console()` below
+# inspects its stream at construction, and a `logging.StreamHandler` binds one
+# permanently, so both have to find a real file object already in place.
+from ragtools._streams import ensure_std_streams
+
+ensure_std_streams()
+
+import typer  # noqa: E402
+from rich.console import Console  # noqa: E402
+from rich.table import Table  # noqa: E402
 
 app = typer.Typer(
     name="rag",

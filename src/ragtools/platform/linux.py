@@ -93,6 +93,15 @@ class LinuxAdapter:
         kwargs.setdefault("close_fds", True)
         return subprocess.Popen(list(argv), **kwargs).pid
 
+    def background_executable(self, executable: str) -> str:
+        """Unchanged — ELF has no console-vs-GUI subsystem split.
+
+        A systemd unit inherits the journal, not a terminal, so there is no
+        window to suppress and nothing to choose between. Present so the
+        decision has one shape on every platform and callers never branch.
+        """
+        return executable
+
     def pid_alive(self, pid: int) -> bool:
         """Whether ``pid`` is a RUNNING process.
 

@@ -27,6 +27,7 @@ from ragtools.platform import (
     PlatformUnsupported,
     adapter,
     assert_single_registration,
+    background_executable,
 )
 
 logger = logging.getLogger("ragtools.service")
@@ -52,6 +53,11 @@ def _service_argv(settings: Settings) -> list[str]:
     A packaged build launches its own executable; a source checkout launches the
     running interpreter with ``-m``, so a developer's registration points at
     their checkout rather than at an installed copy that may not exist.
+
+    The packaged executable is resolved through ``background_executable`` rather
+    than used directly: on Windows ``sys.executable`` is the console-subsystem
+    ``rag.exe``, and naming it in a scheduled task is what put a terminal window
+    on the desktop at every login in v3.0.0.
     """
     from ragtools.config import is_packaged
 
@@ -65,7 +71,7 @@ def _service_argv(settings: Settings) -> list[str]:
     # carried by every mechanism.
     tail = ["--host", host, "--port", port, "--profile", AUTOSTART_PROFILE]
     if is_packaged():
-        return [sys.executable, "service", "run", *tail]
+        return [background_executable(sys.executable), "service", "run", *tail]
     return [sys.executable, "-m", "ragtools.cli", "service", "run", *tail]
 
 

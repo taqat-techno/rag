@@ -84,9 +84,20 @@ class AutostartSpec:
 
     ``argv`` is a full command line rather than a script path: the Windows
     implementation used to write a ``.vbs`` shim purely to avoid a console
-    window, which is a launcher problem solved properly by process creation
-    flags. Shipping an interpreted shim to hide a window is how the
-    terminal-flash defect class was born.
+    window, and an interpreted shim in the startup path is its own defect class.
+
+    That much held. The reasoning printed here until v3.0.1 did not: it said
+    hiding a console "is a launcher problem solved properly by process creation
+    flags", meaning ``CREATE_NO_WINDOW``. That flag is a ``subprocess.Popen``
+    argument, so it governs processes **ragtools spawns** — and the process at
+    issue is spawned by the OS. Task Scheduler builds it from this spec's
+    ``argv`` and never sees a Python creation flag; no task-XML setting
+    suppresses a console either. v3.0.0 therefore shipped autostart that opened
+    a terminal window at every login, on the strength of a comment.
+
+    ``argv[0]`` is resolved through :meth:`PlatformAdapter.background_executable`
+    for exactly this reason — the answer is "which image should the OS start",
+    and only the platform knows.
     """
 
     name: str
@@ -131,6 +142,21 @@ class PlatformAdapter(Protocol):
     # --- process -------------------------------------------------------
     def spawn_detached(self, argv: Sequence[str], **kwargs) -> int:
         """Start a process that outlives this one, with no console window."""
+        ...
+
+    def background_executable(self, executable: str) -> str:
+        """Which image the **OS itself** should launch for a windowless run.
+
+        Distinct from :meth:`spawn_detached`, and the distinction is the whole
+        point: that method hides a window for a process *we* create, and can
+        pass a creation flag to do it. Nothing we can pass reaches a process the
+        OS creates from a scheduler entry, so on Windows the only lever left is
+        which executable the entry names — a console-subsystem image gets a
+        console, and a GUI-subsystem one does not.
+
+        Unix has no such split; those adapters return ``executable`` unchanged.
+        Callers must treat a passthrough as normal rather than as a failure.
+        """
         ...
 
     def pid_alive(self, pid: int) -> bool:

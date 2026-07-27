@@ -1,4 +1,32 @@
-# Upgrading to ragtools v3.0.0
+# Upgrading to ragtools v3
+
+## If v3.0.0 left you with a service that will not start
+
+Skip to this if the service crash-loops immediately after upgrading, and the log
+shows:
+
+```
+ImportError: safetensors>=0.8.0 is required for a normal functioning of this
+module, but found safetensors==0.7.0
+```
+
+**The message is misleading — the correct version is installed.** The 3.0.0
+installer extracted its payload over the previous one instead of replacing it,
+so package manifests from earlier releases survived. `importlib.metadata`
+returns the first name match it finds and `0.7.0` sorts before `0.8.0`, so a
+leftover manifest shadowed the version actually shipped.
+
+`pip install -U` cannot fix it. The bundle is self-contained and pip has no
+reach into it, which is exactly what the error message misdirects you toward.
+
+**Fix: install v3.0.1 or later.** It removes the previous payload before
+extracting, so the upgrade repairs the layering it inherits. No uninstall and no
+data loss.
+
+If you would rather clean out by hand, uninstalling and reinstalling also works —
+but read `UNINSTALL.md` first and **answer No when asked about deleting user
+data**, or take a copy of `config.toml` before you start. On 3.0.0 that prompt
+took the configuration along with the index. (3.0.1 copies it out for you.)
 
 ## What happens to your data
 

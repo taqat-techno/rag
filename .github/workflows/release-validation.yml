@@ -180,6 +180,28 @@ jobs:
         # hosted runner provides; keep verifying on one.
         run: python scripts/verify_autostart_lifecycle.py
 
+  bundle-contract:
+    name: built bundle contract (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[build]"
+      - name: Build the bundle without the model
+        # `--no-model` keeps this to a few minutes: the embedding model is ~90 MB
+        # of the payload and contributes nothing to either property under test.
+        run: python scripts/build.py --no-model
+      - name: Assert the properties that only exist after a build
+        # The two 3.0.0 defects a source test cannot reach:
+        #   * ragw.exe must actually be GUI-subsystem — decided by PyInstaller,
+        #     not by anything importable. A `console=` dropped in a spec
+        #     refactor passes every unit test and restores the login window.
+        #   * one .dist-info per distribution — the invariant the crash loop
+        #     violated, and a property of a directory that only exists here.
+        run: python scripts/verify_bundle.py --bundle dist/rag --require-windowed
+
   upgrade-rehearsal:
     name: upgrade rehearsal
     runs-on: windows-latest
@@ -198,7 +220,7 @@ jobs:
 
   gate:
     name: release gate
-    needs: [suite, linux-adapter, macos-adapter, clean-install, windows-autostart]
+    needs: [suite, linux-adapter, macos-adapter, clean-install, windows-autostart, bundle-contract]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

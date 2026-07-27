@@ -25,7 +25,34 @@ logger = logging.getLogger("ragtools.jobs")
 #: wait is short in practice; the ceiling exists so a genuinely stuck indexer
 #: surfaces as a failed job instead of a thread parked forever.
 _BUSY_RETRY_SECONDS = 5.0
-_BUSY_MAX_WAIT_SECONDS = 900.0
+
+#: Give up on SILENCE, not on elapsed time.
+#:
+#: This was a flat 900 s ceiling, and the message on hitting it asserted that
+#: "another indexing run is stuck". It had no evidence for that. A first index
+#: of a large corpus legitimately runs for hours — during the 3.0.0 startup sync
+#: of 25 projects a user's `rag index` waited out the ceiling and exited 1
+#: declaring a perfectly healthy run stuck, while that run went on to finish.
+#:
+#: Elapsed time cannot distinguish slow from dead; a heartbeat can. The holder
+#: reports progress through `QdrantOwner._beat` at every file and every upsert
+#: batch, so a run that has said nothing for this long is genuinely wedged, and
+#: one that is still ticking is worth waiting for however long it takes.
+#:
+#: Same magnitude as the ceiling it replaces, deliberately. Ticks are frequent
+#: once indexing starts, but the scan that precedes them is one call over the
+#: whole corpus and reports nothing while it walks 37,000 files. Measuring
+#: SILENCE rather than total elapsed time is the fix; choosing a tighter
+#: threshold on top of it would trade a false "stuck" on a slow run for a false
+#: "stalled" on a slow scan. At this value the rule is strictly more permissive
+#: than v3.0.0 in every case and never less.
+_STALL_SECONDS = 900.0
+
+#: Fallback ceiling for the case where the holder publishes no heartbeat at all
+#: — an older owner, or a lock held by something outside the index path. Without
+#: a liveness signal there is nothing to distinguish slow from dead, so the old
+#: time-based rule is all that is left. The message says which rule fired.
+_BLIND_MAX_WAIT_SECONDS = 900.0
 
 
 def _count_points(owner, project_id: str | None = None) -> int | None:
@@ -49,6 +76,66 @@ def _count_points(owner, project_id: str | None = None) -> int | None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("point count failed (verification will be unproven): %s", exc)
         return None
+
+
+def _index_activity(owner) -> dict | None:
+    """The running index's heartbeat, or ``None`` if it publishes none.
+
+    Tolerant of an owner without the method so a stub or an older object in a
+    test double does not turn a wait into an AttributeError.
+    """
+    probe = getattr(owner, "index_activity", None)
+    if probe is None:
+        return None
+    try:
+        return probe()
+    except Exception:  # noqa: BLE001 — liveness is advisory; never fatal
+        return None
+
+
+def _describe(active: dict) -> str:
+    """The running index in one clause, for a human reading a job error."""
+    what = active.get("what") or "an indexing run"
+    done, total = active.get("done") or 0, active.get("total") or 0
+    where = f"{done}/{total}" if total else f"{done}"
+    return f"{what} ({active.get('phase') or 'working'}, {where})"
+
+
+def _waiting_phase(active: dict | None) -> str:
+    """Progress text while queued. Names the holder so the UI shows a live run
+    rather than an unexplained pause."""
+    if active is None:
+        return "waiting for the running index"
+    return f"waiting for {_describe(active)}"
+
+
+def _refuse_if_wedged(active: dict | None, waited: float, project) -> None:
+    """Fail the job only when the holder is genuinely not moving.
+
+    Two rules, and the error says which one fired — because "I waited a fixed
+    period" and "the other run stopped responding" are different claims, and
+    v3.0.0 made the second one on the evidence of the first.
+    """
+    scope = project or "all projects"
+
+    if active is None:
+        # No heartbeat to read: fall back to elapsed time, and claim only that.
+        if waited >= _BLIND_MAX_WAIT_SECONDS:
+            raise RuntimeError(
+                f"index job for {scope} did not acquire the index lock within "
+                f"{_BLIND_MAX_WAIT_SECONDS:.0f}s, and the run holding it reports "
+                "no progress information, so it cannot be told apart from a "
+                "stalled one. Nothing was indexed."
+            )
+        return
+
+    age = active.get("age") or 0.0
+    if age >= _STALL_SECONDS:
+        raise RuntimeError(
+            f"index job for {scope} was not started: {_describe(active)} holds "
+            f"the index lock and has reported no progress for {age:.0f}s, so it "
+            "appears stalled. Nothing was indexed."
+        )
 
 
 def make_handlers(get_owner) -> dict:
@@ -84,14 +171,11 @@ def make_handlers(get_owner) -> dict:
                 stats = owner.run_incremental_index(project_id=project, progress=progress)
             if not stats.get("busy"):
                 break
-            if waited >= _BUSY_MAX_WAIT_SECONDS:
-                raise RuntimeError(
-                    f"index job for {project or 'all projects'} never acquired the "
-                    f"index lock ({_BUSY_MAX_WAIT_SECONDS:.0f}s); another indexing "
-                    "run is stuck. Nothing was indexed."
-                )
+
+            active = _index_activity(owner)
+            _refuse_if_wedged(active, waited, project)
             ctx.check_cancel()
-            ctx.progress(done=0, total=1, phase="waiting for the running index")
+            ctx.progress(done=0, total=1, phase=_waiting_phase(active))
             time.sleep(_BUSY_RETRY_SECONDS)
             waited += _BUSY_RETRY_SECONDS
 

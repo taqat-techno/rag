@@ -7,6 +7,7 @@ Protected by threading.RLock to serialize Qdrant + encoder access.
 import logging
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -219,6 +220,10 @@ class QdrantOwner:
         # Non-blocking: a second caller is TOLD it was skipped rather than
         # queueing up behind a run that may take half an hour.
         self._index_mutex = threading.Lock()
+        #: Heartbeat for the run currently holding the mutex, or None when idle.
+        #: Written only under the mutex, read without it — a waiter must be able
+        #: to ask "is the holder alive" precisely because it cannot take the lock.
+        self._index_run: dict | None = None
         self._registry = None
         self._frameworks = None
         self._capabilities = None
@@ -258,6 +263,44 @@ class QdrantOwner:
         """True while an indexing run is in progress anywhere in this process."""
         return self._index_mutex.locked()
 
+    def index_activity(self) -> dict | None:
+        """What the running index has done most recently, or ``None`` if idle.
+
+        The point is to let a *waiter* distinguish a slow run from a dead one.
+        :attr:`indexing` answers "is the mutex held", which cannot tell those
+        apart — and a caller that cannot tell them apart has to guess, which is
+        how a queued job came to announce that a perfectly healthy startup sync
+        was "stuck" after waiting a fixed 900 seconds for it.
+
+        ``age`` is seconds since the run last reported progress. Silence is the
+        signal that matters; elapsed time is not, because a legitimate first
+        index of a large corpus runs for hours.
+        """
+        run = self._index_run
+        if run is None:
+            return None
+        return {**run, "age": max(0.0, time.time() - run["last_tick"])}
+
+    def _begin_index_run(self, what: str) -> None:
+        self._index_run = {"what": what, "started_at": time.time(),
+                           "last_tick": time.time(),
+                           "done": 0, "total": 0, "phase": "starting"}
+
+    def _beat(self, done, total, phase) -> None:
+        """Record that the running index is alive and where it has got to.
+
+        Called from the single progress funnel of both indexers, so it cannot
+        drift out of sync with the work: anything that reports progress to a
+        caller reports liveness here by the same call.
+        """
+        run = self._index_run
+        if run is None:  # a run that beats outside its own context; ignore
+            return
+        run["last_tick"] = time.time()
+        run["done"] = done or 0
+        run["total"] = total or 0
+        run["phase"] = phase
+
     @contextmanager
     def _exclusive_index(self, what: str):
         """Hold the index mutex, or yield ``None`` if a run is already going.
@@ -270,9 +313,13 @@ class QdrantOwner:
             logger.info("%s skipped: an indexing run is already in progress", what)
             yield None
             return
+        self._begin_index_run(what)
         try:
             yield True
         finally:
+            # Cleared before the mutex is released, so a waiter that wakes on
+            # the release never reads the finished run's heartbeat as a live one.
+            self._index_run = None
             self._index_mutex.release()
 
     # ------------------------------------------------------------------
@@ -1210,9 +1257,15 @@ class QdrantOwner:
         log_activity("info", "indexer", "Full index started")
 
         def _tick(done, total, phase):
+            self._beat(done, total, phase)
             if progress is not None:
                 progress(done, total, phase)
 
+        # Before the scan, not only after it. `_scan_files` is one call over the
+        # whole corpus and reports nothing while it walks tens of thousands of
+        # files; a waiter reading the heartbeat would otherwise see the run go
+        # quiet for the entire walk and have no idea it was scanning.
+        _tick(0, 0, "scan")
         files = self._scan_files(project_id)
         total_files = len(files)
         _tick(0, total_files, "scan")
@@ -1273,10 +1326,14 @@ class QdrantOwner:
     def _run_incremental_index_locked(self, project_id: str | None = None,
                                       progress=None) -> dict:
         def _tick(done, total, phase):
+            self._beat(done, total, phase)
             if progress is not None:
                 progress(done, total, phase)
 
         # --- Phase 1: outside lock — scan, hash, chunk, detect changes ---
+        # Beat first: the scan reports nothing while it runs, and a job waiting
+        # on this lock reads silence as a possible stall. See `_STALL_SECONDS`.
+        _tick(0, 0, "scan")
         files = self._scan_files(project_id)
 
         # Open a read-only state connection for change detection

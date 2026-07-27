@@ -46,6 +46,18 @@ jobs:
       - name: Build with model
         run: python scripts/build.py
 
+      - name: Verify the bundle before it becomes an installer
+        # Gates the artifact that actually ships, not a rebuild of it. Both
+        # properties are invisible to `pytest` and both took the service down
+        # in 3.0.0:
+        #   * ragw.exe must be GUI-subsystem — if PyInstaller silently built it
+        #     console-subsystem, every user gets a terminal window at login and
+        #     nothing else in this workflow would notice.
+        #   * one .dist-info per distribution — a layered manifest is what made
+        #     `transformers` read a safetensors version the bundle never shipped.
+        # Failing here costs a re-tag. Failing in the field cost a crash loop.
+        run: python scripts/verify_bundle.py --bundle dist/rag --require-windowed
+
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 
@@ -114,6 +126,11 @@ jobs:
 
       - name: Build with model
         run: python scripts/build.py
+
+      - name: Verify the bundle before it is archived
+        # The windowed-executable checks self-skip off Windows; what runs here is
+        # the layered-manifest invariant, which is build hygiene on any platform.
+        run: python scripts/verify_bundle.py --bundle dist/rag
 
       - name: Create zip of bundle
         # `macOS-arm64.zip`, not `macos-arm64.tar.gz`. The release gate
@@ -189,6 +206,10 @@ jobs:
 
       - name: Build with model
         run: python scripts/build.py
+
+      - name: Verify the bundle before it is archived
+        # See the macOS job: the layered-manifest invariant applies everywhere.
+        run: python scripts/verify_bundle.py --bundle dist/rag
 
       - name: Create tar.gz of bundle
         run: |

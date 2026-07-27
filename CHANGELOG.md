@@ -13,6 +13,67 @@ _Nothing yet._
 
 ---
 
+## [3.0.1] — 2026-07-27
+
+Fixes four defects found by installing 3.0.0 over 2.7.0 on a real machine.
+**Three of the four are reachable only on the upgrade path**, which is why a
+release with three green clean installs shipped a service that could not start.
+
+Upgrading from 3.0.0 needs no special steps. If 3.0.0 left you with a service
+that crash-loops on `ImportError: safetensors>=0.8.0 is required`, this release
+is the fix — the installer now removes the stale payload rather than layering
+on top of it.
+
+### Fixed
+- **The installer no longer inherits the previous bundle's payload.** It
+  extracted the new `_internal` over the old one without removing it, so package
+  manifests accumulated across releases — 86 `.dist-info` directories, 27
+  packages carrying more than one version. `importlib.metadata` returns the
+  first normalized-name match, and `0.7.0` sorts before `0.8.0`, so a stale
+  `safetensors-0.7.0.dist-info` beside the correct 0.8.0 made `transformers`
+  fail its import-time version guard. The service crashed 76 times and the
+  supervisor stopped respawning it. Not user-recoverable: the bundle is
+  self-contained, so the `pip install -U` the error message recommends could
+  never have helped.
+- **Autostart no longer opens a console window at login.** `rag.exe` is a
+  console-subsystem image and Task Scheduler creates the process itself, so
+  Windows gave it a console — two terminal windows on the desktop at every
+  login, one streaming uvicorn logs, and closing it killed the service.
+  `CREATE_NO_WINDOW` does not apply: it is a `subprocess.Popen` flag governing
+  processes ragtools spawns, and no task-XML setting suppresses a console. The
+  bundle now ships `ragw.exe`, a GUI-subsystem sibling — the
+  `python.exe`/`pythonw.exe` pattern — and both registrations point at it.
+- **Uninstalling can no longer destroy a configuration it failed to preserve.**
+  Choosing to delete user data removed `config.toml` along with the index, with
+  no backup and nothing in the Recycle Bin. The index costs hours to rebuild;
+  the project list, ignore rules and per-project modes cannot be rebuilt at all.
+  The configuration is now copied to a timestamped directory outside the data
+  root before anything is deleted, the prompt separates what is replaceable from
+  what is not, and a backup that fails cancels the deletion.
+- **`rag index` no longer reports a healthy indexing run as a stuck one.** A
+  queued job waited a fixed 900 s for the index lock and then asserted that
+  "another indexing run is stuck", with no evidence. During a startup sync of 25
+  projects that run was perfectly healthy and simply slower. Waiting now ends on
+  *silence* rather than elapsed time: the running index publishes a heartbeat,
+  a job waits as long as that heartbeat keeps moving, and the error says which
+  rule fired and what was measured.
+- **The post-install tray launch no longer depends on a file v3 deletes.** It
+  invoked `RAGTools-Tray.vbs` from the Startup folder — written by v2 and removed
+  by v3's upgrade — so on a fresh install it launched nothing and the tray icon
+  did not appear until the next login.
+
+### Added
+- `scripts/verify_bundle.py` — asserts properties of the **built** bundle:
+  that `ragw.exe` is genuinely GUI-subsystem (read from the PE header), that
+  `rag.exe` is still console-subsystem, and that no distribution in `_internal`
+  ships two versions. Run by `release-validation.yml`. Both fixed defects were
+  invisible to the source suite, and 3.0.0 shipped four artifacts that passed
+  every name and size check.
+- `tests/test_installer_contract.py` — the two Inno Setup invariants as
+  structural assertions. Seven of its nine checks fail against 3.0.0.
+
+---
+
 ## [3.0.0] — 2026-07-26
 
 **Upgrading rebuilds your search index.** Projects, configuration and source

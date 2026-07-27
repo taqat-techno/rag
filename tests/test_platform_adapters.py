@@ -89,7 +89,8 @@ def test_each_supported_platform_resolves_to_its_adapter(name, cls, tmp_path):
 def test_every_adapter_satisfies_the_same_contract(tmp_path):
     """A contract only one implementation satisfies is not a contract."""
     required = [
-        "app_dir", "dev_dir", "spawn_detached", "pid_alive", "terminate",
+        "app_dir", "dev_dir", "spawn_detached", "background_executable",
+        "pid_alive", "terminate",
         "supports_autostart", "install_autostart", "remove_autostart",
         "find_autostart", "has_desktop_session", "open_url", "open_path", "copy_text",
     ]
@@ -154,9 +155,16 @@ def _rendered(spec, user="TESTHOST\\tester", task_path=r"\RAGTools\Service"):
 
 
 def test_windows_registers_one_at_logon_task_without_a_vbs_shim(tmp_path, allow_platform_writes):
-    """The `.vbs` shims existed to hide a console window — which is what
-    CREATE_NO_WINDOW is for. Shipping an interpreted script to work around a
-    process-creation flag is how the terminal-flash defect shipped."""
+    """One scheduled task, and no interpreted script in the startup path.
+
+    The reason given here until v3.0.1 was that hiding a console "is what
+    CREATE_NO_WINDOW is for". It is not, for this process: that flag is a
+    `subprocess.Popen` argument and Task Scheduler builds the process itself.
+    Acting on that belief shipped autostart which opened a terminal window at
+    every login. The task is still the right mechanism — see
+    `test_windows_autostart_prefers_the_windowless_executable` for what actually
+    suppresses the window.
+    """
     runner = FakeRunner({"schtasks /create": OK})
     adapter, _ = _win(tmp_path, runner)
 
@@ -656,3 +664,97 @@ def test_windows_task_prefix_is_injectable_for_isolation(tmp_path, allow_platfor
 
     assert runner.saw(r"\RAGToolsVerify\Service")
     assert not runner.saw(r"\RAGTools\Service"), "a probe reached the real registration"
+
+
+# --- the windowless executable (v3.0.1) ----------------------------------
+#
+# Windows gives a console-subsystem image a console whenever the OS starts it,
+# and Task Scheduler starts the autostart entry itself. No creation flag and no
+# task-XML setting reaches that decision — the only lever is which executable the
+# task names. v3.0.0 named `rag.exe` and put two terminal windows on the desktop
+# at every login, one of them streaming uvicorn logs; closing it killed the
+# service.
+
+
+def test_windows_autostart_prefers_the_windowless_executable(tmp_path):
+    """`ragw.exe` beside `rag.exe` is the whole fix."""
+    runner = FakeRunner({})
+    adapter, _ = _win(tmp_path, runner)
+    bundle = tmp_path / "Programs" / "RAGTools"
+    bundle.mkdir(parents=True)
+    (bundle / "rag.exe").write_bytes(b"console")
+    (bundle / "ragw.exe").write_bytes(b"windowed")
+
+    resolved = adapter.background_executable(str(bundle / "rag.exe"))
+
+    assert Path(resolved).name == "ragw.exe"
+    assert Path(resolved).parent == bundle, "must stay in the bundle it was asked about"
+
+
+def test_windows_falls_back_when_the_bundle_has_no_windowless_sibling(tmp_path):
+    """A pre-3.0.1 bundle, a pip shim and a source checkout all land here.
+
+    Presence is the test, not `is_packaged()`: every one of those cases has a
+    `rag` executable with no `ragw.exe` beside it, and every one of them must
+    keep registering autostart that works. Degrading to the console binary costs
+    a visible window; refusing would cost the service.
+    """
+    runner = FakeRunner({})
+    adapter, _ = _win(tmp_path, runner)
+    bundle = tmp_path / "old-bundle"
+    bundle.mkdir()
+    (bundle / "rag.exe").write_bytes(b"console")
+
+    assert adapter.background_executable(str(bundle / "rag.exe")) == str(bundle / "rag.exe")
+
+
+def test_windows_background_executable_survives_a_path_it_cannot_resolve(tmp_path):
+    """`with_name` raises on an empty or drive-only path. A cosmetic
+    improvement must never be the thing that breaks registration."""
+    runner = FakeRunner({})
+    adapter, _ = _win(tmp_path, runner)
+
+    assert adapter.background_executable("") == ""
+
+
+def test_windows_does_not_mistake_a_directory_for_the_windowless_binary(tmp_path):
+    """`is_file()`, not `exists()` — a `ragw.exe` directory would otherwise be
+    written into the task and fail at login, where nobody is watching."""
+    runner = FakeRunner({})
+    adapter, _ = _win(tmp_path, runner)
+    bundle = tmp_path / "b"
+    bundle.mkdir()
+    (bundle / "rag.exe").write_bytes(b"console")
+    (bundle / "ragw.exe").mkdir()
+
+    assert adapter.background_executable(str(bundle / "rag.exe")) == str(bundle / "rag.exe")
+
+
+@pytest.mark.parametrize("build", [
+    lambda tmp: LinuxAdapter(FakeRunner({}), home=tmp),
+    lambda tmp: DarwinAdapter(FakeRunner({}), home=tmp),
+])
+def test_unix_adapters_pass_the_executable_through(tmp_path, build):
+    """ELF and Mach-O have no console-vs-GUI subsystem split, so there is
+    nothing to choose. The method exists on every adapter so the two callers
+    that build autostart argv never branch on the platform themselves."""
+    adapter = build(tmp_path)
+    # Even with a sibling present, Unix must not invent a second binary.
+    (tmp_path / "rag").write_bytes(b"x")
+    (tmp_path / "ragw").write_bytes(b"x")
+
+    assert adapter.background_executable(str(tmp_path / "rag")) == str(tmp_path / "rag")
+
+
+def test_background_executable_helper_survives_an_unsupported_platform(monkeypatch):
+    """The free function is what `startup.py` and `tray_startup.py` call. A
+    machine with no adapter has no autostart to register, so there is nothing a
+    raise here would protect — and plenty it would break."""
+    import ragtools.platform as platform_pkg
+
+    def _no_adapter():
+        raise PlatformUnsupported("no adapter for plan9")
+
+    monkeypatch.setattr(platform_pkg, "adapter", _no_adapter)
+
+    assert platform_pkg.background_executable("/opt/rag/rag") == "/opt/rag/rag"

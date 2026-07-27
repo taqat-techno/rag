@@ -125,27 +125,63 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name="rag",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,  # Don't compress — causes AV false positives
-    icon=os.path.join(PROJECT_ROOT, "app.ico"),
-    console=True,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
+def _executable(name, *, console):
+    """One bootloader over the shared Analysis.
+
+    Both images run the SAME script and share one ``_internal``; the only
+    difference is the PE subsystem, which is why this is a parameter and not a
+    second Analysis. A second Analysis would double a 500 MB bundle to ship one
+    differing byte-range in a 1 MB stub.
+    """
+    return EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name=name,
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,  # Don't compress — causes AV false positives
+        icon=os.path.join(PROJECT_ROOT, "app.ico"),
+        console=console,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+    )
+
+
+#: The command-line image. Everything a human types resolves to this.
+exe = _executable("rag", console=True)
+
+#: The windowless image, and the reason it exists.
+#
+# Windows gives a console-subsystem process a console whenever *the OS* creates
+# it, and Task Scheduler creates the autostart process itself. `CREATE_NO_WINDOW`
+# does not help: it is a `subprocess.Popen` creation flag, so it governs
+# processes ragtools spawns, and the task XML has no equivalent — there is no
+# setting that suppresses a console for an `<Exec>` action. So v3.0.0 opened two
+# terminal windows on the desktop at every login, one of them streaming uvicorn
+# logs, and closing the window killed the service.
+#
+# This is the `python.exe` / `pythonw.exe` pattern: same code, same bundle, GUI
+# subsystem, no console. `ragtools/_streams.py` handles the consequence — a
+# windowed build starts with `sys.stdout is None`.
+#
+# Windows only, and deliberately so. `console=False` is not a no-op elsewhere:
+# on macOS it selects windowed-app semantics, which is a different build shape
+# for a binary nothing on that platform would launch. systemd and launchd
+# redirect streams themselves and have no console to suppress, so there is
+# nothing for a second image to fix. `background_executable()` resolves by
+# checking for the file, so its absence here needs no counterpart there.
+targets = [exe]
+if sys.platform == "win32":
+    targets.append(_executable("ragw", console=False))
 
 coll = COLLECT(
-    exe,
+    *targets,
     a.binaries,
     a.zipfiles,
     a.datas,

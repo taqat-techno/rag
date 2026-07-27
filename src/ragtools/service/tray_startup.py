@@ -20,6 +20,7 @@ from ragtools.platform import (
     AutostartSpec,
     PlatformUnsupported,
     adapter,
+    background_executable,
 )
 
 logger = logging.getLogger("ragtools.service")
@@ -29,10 +30,13 @@ TRAY_STARTUP_FILENAME = "RAGTools-Tray.vbs"
 
 
 def _tray_argv() -> list[str]:
+    """What login should start. See :func:`ragtools.service.startup._service_argv`
+    for why the packaged executable is resolved rather than used directly — the
+    tray was the *second* console window v3.0.0 opened at every login."""
     from ragtools.config import is_packaged
 
     if is_packaged():
-        return [sys.executable, "tray"]
+        return [background_executable(sys.executable), "tray"]
     return [sys.executable, "-m", "ragtools.cli", "tray"]
 
 

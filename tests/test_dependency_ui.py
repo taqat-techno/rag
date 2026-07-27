@@ -437,32 +437,103 @@ def test_an_index_job_waits_for_the_lock_instead_of_reporting_a_no_op_as_success
     assert "busy" not in result
 
 
+class _BusyOwner:
+    """An owner whose index lock is never free. ``beat`` is the heartbeat the
+    waiter reads; ``None`` means the holder publishes nothing at all."""
+
+    def __init__(self, beat=None):
+        self._beat = beat
+
+    def run_incremental_index(self, project_id=None, progress=None):
+        return {"indexed": 0, "busy": True}
+
+    def index_activity(self):
+        return self._beat
+
+
+class _Ctx:
+    verified = False
+
+    def progress(self, **kw):
+        pass
+
+    def check_cancel(self):
+        pass
+
+
+class _Job:
+    scope = {"project": "rag-docs", "full": False}
+
+
+def _run_index_job(owner):
+    from ragtools.service.job_handlers import make_handlers
+    return make_handlers(lambda: owner)["index"](_Job(), _Ctx())
+
+
 def test_an_index_job_fails_loudly_when_the_lock_never_frees(monkeypatch):
     """Waiting forever is its own failure. A permanently stuck indexer must
-    surface as a failed job, not a parked thread."""
+    surface as a failed job, not a parked thread.
+
+    Still true; the trigger changed in v3.0.1. It used to be a flat 900 s of
+    elapsed time, which cannot tell a wedged run from a slow one — see
+    `test_an_index_job_waits_for_a_run_that_is_still_moving`.
+    """
     from ragtools.service import job_handlers
 
     monkeypatch.setattr(job_handlers, "_BUSY_RETRY_SECONDS", 0.0)
-    monkeypatch.setattr(job_handlers, "_BUSY_MAX_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(job_handlers, "_STALL_SECONDS", 0.0)
 
-    class _Ctx:
-        verified = False
+    owner = _BusyOwner({"what": "Full index", "phase": "chunk",
+                        "done": 10, "total": 100, "age": 999.0})
 
-        def progress(self, **kw):
-            pass
+    with pytest.raises(RuntimeError, match="appears stalled"):
+        _run_index_job(owner)
 
-        def check_cancel(self):
-            pass
 
-    class _Job:
-        scope = {"project": "rag-docs", "full": False}
+def test_an_index_job_still_gives_up_when_the_holder_says_nothing(monkeypatch):
+    """No heartbeat means no way to tell slow from dead, so elapsed time is all
+    that is left — and the message must claim only that."""
+    from ragtools.service import job_handlers
 
-    class _Owner:
-        def run_incremental_index(self, project_id=None, progress=None):
-            return {"indexed": 0, "busy": True}
+    monkeypatch.setattr(job_handlers, "_BUSY_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(job_handlers, "_BLIND_MAX_WAIT_SECONDS", 0.0)
 
-    with pytest.raises(RuntimeError, match="never acquired the index lock"):
-        job_handlers.make_handlers(lambda: _Owner())["index"](_Job(), _Ctx())
+    with pytest.raises(RuntimeError, match="no progress information"):
+        _run_index_job(_BusyOwner(None))
+
+
+def test_an_index_job_waits_for_a_run_that_is_still_moving(monkeypatch):
+    """The 3.0.0 defect, as a test.
+
+    A healthy startup sync of 25 projects outlives any fixed ceiling. Under the
+    old rule this job failed after 900 s and announced that the other run was
+    "stuck"; the other run went on to finish normally.
+    """
+    from ragtools.service import job_handlers
+
+    monkeypatch.setattr(job_handlers, "_BUSY_RETRY_SECONDS", 0.0)
+    # Elapsed time far past ANY ceiling the old code would have applied.
+    monkeypatch.setattr(job_handlers, "_BLIND_MAX_WAIT_SECONDS", 0.0)
+
+    beat = {"what": "Full index", "phase": "chunk", "done": 0, "total": 37637,
+            "age": 0.5}
+    owner = _BusyOwner(beat)
+    # Free the lock only after many rounds, exactly as a long index would.
+    rounds = {"n": 0}
+    real = owner.run_incremental_index
+
+    def _eventually(project_id=None, progress=None):
+        rounds["n"] += 1
+        if rounds["n"] > 500:
+            return {"indexed": 3, "chunks_indexed": 9, "projects": ["rag-docs"]}
+        return real(project_id=project_id, progress=progress)
+
+    owner.run_incremental_index = _eventually
+
+    stats = _run_index_job(owner)
+
+    assert stats["indexed"] == 3, "a progressing run must be waited for, not failed"
+    assert rounds["n"] > 500
 
 
 def test_the_sync_handler_summarises_both_directions():

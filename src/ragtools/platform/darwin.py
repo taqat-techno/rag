@@ -123,6 +123,16 @@ class DarwinAdapter:
         kwargs.setdefault("close_fds", True)
         return subprocess.Popen(list(argv), **kwargs).pid
 
+    def background_executable(self, executable: str) -> str:
+        """Unchanged — Mach-O has no console-vs-GUI subsystem split.
+
+        launchd starts an agent with stdout/stderr redirected to the paths in
+        the plist; no terminal is involved and none can be suppressed. Present
+        so the decision has one shape on every platform and callers never
+        branch.
+        """
+        return executable
+
     def pid_alive(self, pid: int) -> bool:
         """Whether ``pid`` is a RUNNING process.
 

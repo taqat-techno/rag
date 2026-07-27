@@ -17,7 +17,7 @@
 ; nothing, and the release published WITHOUT its installer while every step
 ; reported success.
 #ifndef MyAppVersion
-  #define MyAppVersion "3.0.0"
+  #define MyAppVersion "3.0.1"
 #endif
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
@@ -61,6 +61,29 @@ Name: "addtopath"; Description: "Add to PATH (recommended)"; GroupDescription: "
 Name: "startup"; Description: "Start automatically on Windows login"; GroupDescription: "Additional options:"
 Name: "startnow"; Description: "Start service and open admin panel after installation"; GroupDescription: "Additional options:"
 
+[InstallDelete]
+; Remove the previous bundle's payload BEFORE extracting the new one.
+;
+; Without this, Inno overlays the new `_internal` on the old one and every
+; package manifest a previous release wrote survives — v3.0.0 shipped onto a
+; tree carrying 86 `.dist-info` directories, 27 packages with more than one
+; version, and `fastapi` in six. `importlib.metadata` returns the FIRST
+; normalized-name match it finds, and `0.7.0` sorts before `0.8.0`, so a stale
+; `safetensors-0.7.0.dist-info` beside the correct 0.8.0 made `transformers`
+; read the version it version-guards at import. ImportError on every start,
+; 76 crashes, supervisor gave up. Unrecoverable by the user: the bundle is
+; self-contained, so the `pip install -U` the error recommends cannot reach it.
+;
+; Targeted at the payload, not at `{app}`, so a user file dropped in the program
+; directory is not collateral. `ignoreversion` was never the problem — the
+; problem is files the new bundle does not name at all, which no copy flag can
+; reach. Runs after CurStepChanged(ssInstall) has stopped and killed rag.exe.
+Type: filesandordirs; Name: "{app}\_internal"
+; Pre-6.x PyInstaller put the payload at the root; sweep those layouts too so an
+; upgrade from a much older install is not shadowed by the same mechanism.
+Type: filesandordirs; Name: "{app}\*.dist-info"
+Type: filesandordirs; Name: "{app}\*.egg-info"
+
 [Files]
 ; Main application (PyInstaller one-dir output)
 Source: "dist\rag\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -101,11 +124,19 @@ Filename: "{app}\rag.exe"; Parameters: "service start"; StatusMsg: "Starting ser
 ; Open admin panel in browser after a delay (let service start)
 Filename: "cmd.exe"; Parameters: "/c timeout /t 15 /nobreak >nul & start http://localhost:21420"; StatusMsg: "Opening admin panel..."; Tasks: startnow; Flags: runhidden nowait
 ; Launch the tray once after install/upgrade so the icon appears WITHOUT requiring
-; logout or restart. Runs the same Startup-folder VBS Windows would invoke at next
-; login (15 s WScript.Sleep + hidden shell.Run rag.exe tray). Hidden + nowait so
-; the installer never blocks on it. Gated on `Tasks: startup` so we never run a
-; non-existent VBS for users who declined autostart registration.
-Filename: "{sys}\wscript.exe"; Parameters: """{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\RAGTools-Tray.vbs"""; StatusMsg: "Starting tray icon..."; Tasks: startup; Flags: runhidden nowait
+; logout or restart. Gated on `Tasks: startup` so nothing starts for users who
+; declined autostart registration.
+;
+; This ran `wscript.exe "<Startup folder>\RAGTools-Tray.vbs"` until v3.0.1 — a
+; path v2 wrote and v3 REMOVES (tray_startup.py:28 keeps the name only so the
+; upgrade can delete it). On a fresh v3 install the file has never existed, so
+; the step silently launched nothing and the tray icon did not appear until the
+; user next logged in. Pointing at the shipped executable removes the dependency
+; on a legacy artifact entirely.
+;
+; `ragw.exe`, not `rag.exe`: same bundle, GUI subsystem, so no console flashes
+; even though the installer already passes `runhidden`.
+Filename: "{app}\ragw.exe"; Parameters: "tray"; StatusMsg: "Starting tray icon..."; Tasks: startup; Flags: runhidden nowait
 
 [UninstallRun]
 ; Stop service before uninstall
@@ -183,6 +214,58 @@ begin
   end;
 end;
 
+// Copy the configuration out of the data root before anything deletes it.
+//
+// The prompt below bundles two very different things under "user data". The
+// index and the model cache are DERIVED — expensive to rebuild (hours) but
+// rebuildable from the machine itself. `config.toml` is NOT: it is the list of
+// projects, ignore rules and per-project modes a user assembled by hand over
+// months, and nothing regenerates it. In the 3.0.0 incident it took 25 project
+// definitions with it, and only a precautionary manual copy made minutes
+// earlier saved them.
+//
+// So the small, precious file is copied out unconditionally on the delete path,
+// to a sibling directory the wipe cannot reach. Returns the backup directory,
+// or '' when there was nothing to save. Sets Failed when a config file existed
+// and could NOT be copied — the caller must then refuse to delete, because
+// destroying what you have just failed to preserve is the one outcome with no
+// recovery.
+function BackupConfig(DataDir: string; var Failed: Boolean): string;
+var
+  Target: string;
+  Names: array[0..1] of string;
+  I: Integer;
+  Source: string;
+  Saved: Boolean;
+begin
+  Result := '';
+  Failed := False;
+  Saved := False;
+  Names[0] := 'config.toml';
+  Names[1] := 'ragtools.toml';
+  // Sibling of the data root, not inside it: a backup within DataDir would be
+  // deleted by the very DelTree it exists to survive.
+  Target := ExpandConstant('{localappdata}\RAGTools-config-backup-') +
+            GetDateTimeString('yyyymmdd-hhnnss', '-', '-');
+
+  for I := 0 to 1 do
+  begin
+    Source := AddBackslash(DataDir) + Names[I];
+    if FileExists(Source) then
+    begin
+      if not DirExists(Target) then
+        ForceDirectories(Target);
+      if FileCopy(Source, AddBackslash(Target) + Names[I], False) then
+        Saved := True
+      else
+        Failed := True;
+    end;
+  end;
+
+  if Saved then
+    Result := Target;
+end;
+
 // Uninstall: ask about deleting user data. Default is KEEP (safe).
 // The user must explicitly choose "Yes" to delete their indexed content,
 // configuration, logs and caches. "No" (default), pressing Enter or closing
@@ -191,6 +274,8 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Response: Integer;
   DataDir: string;
+  Backup: string;
+  BackupFailed: Boolean;
 begin
   // Force-kill rag.exe processes BEFORE the uninstaller starts removing files —
   // same reasoning as CurStepChanged(ssInstall). The [UninstallRun] graceful
@@ -211,18 +296,47 @@ begin
     Response := MsgBox(
       'RAG Tools has been uninstalled.' + #13#10 + #13#10 +
       'Do you ALSO want to DELETE your user data?' + #13#10 + #13#10 +
-      'This includes:' + #13#10 +
+      'CANNOT be rebuilt:' + #13#10 +
+      '  - Your configuration — the project list, ignore rules and' + #13#10 +
+      '    per-project modes you set up by hand' + #13#10 + #13#10 +
+      'Can be rebuilt, but it takes time:' + #13#10 +
       '  - Indexed content (vector database)' + #13#10 +
-      '  - Configuration (ragtools.toml / config.toml)' + #13#10 +
-      '  - Logs' + #13#10 +
-      '  - Model cache' + #13#10 + #13#10 +
+      '  - Model cache' + #13#10 +
+      '  - Logs' + #13#10 + #13#10 +
       'Location: ' + DataDir + #13#10 + #13#10 +
-      'Default is NO (keep your data). Choose YES only if you want a full wipe.',
+      'A copy of your configuration is saved either way, and this dialog will' + #13#10 +
+      'tell you where. Nothing goes to the Recycle Bin.' + #13#10 + #13#10 +
+      'Default is NO (keep everything). Choose YES only for a full wipe.',
       mbConfirmation, MB_YESNO or MB_DEFBUTTON2);
 
     if Response = IDYES then
     begin
+      Backup := BackupConfig(DataDir, BackupFailed);
+
+      // A config we could not copy is a config we must not delete. Keeping
+      // everything is always a recoverable outcome; this is the only branch
+      // that is not.
+      if BackupFailed then
+      begin
+        MsgBox(
+          'Your user data was NOT deleted.' + #13#10 + #13#10 +
+          'The configuration file could not be copied to a backup, and' + #13#10 +
+          'deleting it without one cannot be undone.' + #13#10 + #13#10 +
+          'Everything is still at:' + #13#10 + DataDir + #13#10 + #13#10 +
+          'Delete that folder by hand if you are sure you want it gone.',
+          mbError, MB_OK);
+        Exit;
+      end;
+
       DelTree(DataDir, True, True, True);
+
+      if Backup <> '' then
+        MsgBox(
+          'Your user data has been deleted.' + #13#10 + #13#10 +
+          'Your configuration was copied to:' + #13#10 + Backup + #13#10 + #13#10 +
+          'Keep this if you might reinstall — it holds your project list,' + #13#10 +
+          'and the index rebuilds itself from it.',
+          mbInformation, MB_OK);
     end;
   end;
 end;

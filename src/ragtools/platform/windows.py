@@ -68,6 +68,13 @@ LEGACY_STARTUP_FILES = {
     "RAGTools-Tray.vbs": KIND_TRAY,
 }
 
+#: The GUI-subsystem sibling of `rag.exe`, built from the same bundle by
+#: `rag.spec`. Windows allocates a console for a console-subsystem image
+#: whenever the OS starts it, and Task Scheduler starts the autostart entry
+#: itself — so the executable named in the task is the only thing that decides
+#: whether a terminal window appears at login. See `background_executable`.
+WINDOWED_EXE_NAME = "ragw.exe"
+
 #: Task Scheduler accepts nothing but UTF-16 for `/xml`. A UTF-8 file — even
 #: with a BOM — is rejected outright as "The task XML is malformed", which reads
 #: like a schema error and is not one. Measured, not assumed.
@@ -135,6 +142,27 @@ class WindowsAdapter:
         kwargs.setdefault("creationflags", CREATE_NO_WINDOW | DETACHED_PROCESS)
         kwargs.setdefault("close_fds", True)
         return subprocess.Popen(list(argv), **kwargs).pid
+
+    def background_executable(self, executable: str) -> str:
+        """Swap in the windowless sibling when the bundle ships one.
+
+        Presence, not configuration: a source checkout points at `python.exe`
+        and a pip shim at `Scripts\\rag.exe`, and neither has a `ragw.exe`
+        beside it, so both fall through with no `is_packaged()` question asked.
+        A bundle built before v3.0.1 has no sibling either — its registrations
+        keep working exactly as they did, minus the fix.
+
+        Falling back rather than raising is the deliberate choice: the failure
+        this replaces is cosmetic, and refusing to register autostart because a
+        window might appear would trade an ugly login for no service at all.
+        """
+        try:
+            candidate = Path(executable).with_name(WINDOWED_EXE_NAME)
+        except (ValueError, OSError):
+            # `with_name` refuses on an empty or drive-only path. Nothing to
+            # resolve against, so there is nothing to improve.
+            return executable
+        return str(candidate) if candidate.is_file() else executable
 
     def pid_alive(self, pid: int) -> bool:
         if pid <= 0:
