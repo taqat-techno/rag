@@ -216,15 +216,30 @@ jobs:
       - name: Extract version
         id: version
         shell: bash
-        run: echo "version=$(python -c 'import tomllib;print(tomllib.load(open(\"pyproject.toml\",\"rb\"))[\"project\"][\"version\"])')" >> "$GITHUB_OUTPUT"
+        # Read it from the installed package rather than parsing TOML inline:
+        # the nested-quote form produced an EMPTY version, which then reached
+        # ISCC as a bare `/DMyAppVersion=` and failed there instead of here.
+        run: |
+          v="$(python -c 'from ragtools import __version__; print(__version__)')"
+          test -n "$v"    # an empty version must fail HERE, loudly
+          echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Build the bundle and the installer
         # With the model: the previous release ships one, and an upgrade that
         # only works for a model-less bundle is not the upgrade users run.
+        #
+        # PATH += the Inno directory, matching release.yml. `$env:ProgramFiles(x86)`
+        # does NOT parse the way it reads — PowerShell takes `$env:ProgramFiles`
+        # and then a literal `(x86)`, yielding `C:\Program Files(x86)`. The
+        # variable form needs braces; the literal path is plainer still.
         run: |
           python scripts/build.py
           choco install innosetup -y --no-progress
-          & "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ steps.version.outputs.version }} installer.iss
+          $env:PATH += ";C:\Program Files (x86)\Inno Setup 6"
+          iscc /DMyAppVersion=${{ steps.version.outputs.version }} installer.iss
+          if (-not (Test-Path "dist/RAGTools-Setup-${{ steps.version.outputs.version }}.exe")) {
+            throw "installer was not produced"
+          }
 
       - name: Install a genuine v2.7.0, start it, then upgrade over it
         # The check every previous upgrade test could not make. The others
