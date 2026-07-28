@@ -134,9 +134,27 @@ def main() -> int:
         except OSError:
             return False
 
+    def _inside_preserved_data(path) -> bool:
+        """Is this inside the directory the uninstaller deliberately keeps?
+
+        The check below and the one above ("the data directory is left alone")
+        were contradicting each other: one required the data directory to
+        survive intact, the other counted a file inside it as residue. A v2
+        leftover such as `data\\RAGTools-Watchdog.vbs` is dead weight, but it is
+        dead weight inside the folder we chose not to touch — that is a
+        housekeeping matter, not a failed uninstall, and blaming the uninstaller
+        for it would mean the only way to pass is to delete user data.
+        """
+        try:
+            Path(path).relative_to(DATA_DIR)
+            return True
+        except ValueError:
+            return False
+
     residue = [f for f in result.findings
                if f.layout in (L_INSTALL_USER, L_INSTALL_MACHINE, L_LEGACY_ARTIFACT)
-               and not _only_the_uninstaller(f.path)]
+               and not _only_the_uninstaller(f.path)
+               and not _inside_preserved_data(f.path)]
     check("a fresh scan finds no packaged installation", not residue,
           "; ".join(f"{f.layout}: {f.path}" for f in residue) or "clean")
     check("a fresh scan finds no registrations", not result.registrations,
