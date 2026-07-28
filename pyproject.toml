@@ -19,7 +19,15 @@ dependencies = [
     "python-frontmatter>=1.0.0",
     "markdown-it-py>=3.0.0",
     "rich>=13.0.0",
-    "mcp>=1.26.0",
+    # Capped below 2.0.0 deliberately. `mcp` 2.0.0 (released 2026-07-28)
+    # removes `mcp.server.fastmcp`, which this project imports at module
+    # level in integration/mcp_server.py — so an unbounded constraint made
+    # every FRESH install resolve to a version the MCP server cannot import.
+    # Caught by CI the same day: three platform suites failed on a collection
+    # error while the developer machine, pinned at 1.27.0, stayed green.
+    # Porting to the 2.x API is real work and is not a release blocker; a
+    # shipping product that cannot import its own server is.
+    "mcp>=1.26.0,<2.0.0",
     "watchfiles>=1.0.0",
     "pathspec>=0.12.0",
     "tomli>=2.0.0; python_version < '3.11'",
