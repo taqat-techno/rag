@@ -220,24 +220,42 @@ begin
   // correctly everywhere else: `selfcheck` compares process paths against the
   // install directory precisely so it does not accuse a stranger's process.
   //
-  // WMIC-free: `wmic` is deprecated and absent from recent Windows builds.
-  // PowerShell's CIM query is present everywhere this installer runs, and the
-  // whole filter-and-kill happens in one call so no PID can be reused between
-  // deciding and acting.
-  for I := 0 to 2 do
-  begin
-    Filter :=
-      '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
-      '$ErrorActionPreference = ''SilentlyContinue''; ' +
-      '$app = ''' + ExpandConstant('{app}') + '''; ' +
-      '$data = ''' + ExpandConstant('{localappdata}\RAGTools') + '''; ' +
-      'Get-CimInstance Win32_Process -Filter ""Name=''' + Images[I] + '''"" | ' +
-      'Where-Object { $_.ExecutablePath -and ' +
-      '( $_.ExecutablePath.StartsWith($app, ''OrdinalIgnoreCase'') -or ' +
-      '  $_.ExecutablePath.StartsWith($data, ''OrdinalIgnoreCase'') ) } | ' +
-      'ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"';
-    Exec('powershell.exe', Filter, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  end;
+  // `Get-Process`, not `Get-CimInstance -Filter`, and NO embedded double
+  // quotes anywhere.
+  //
+  // The CIM form needs a quoted WQL filter (`-Filter "Name='rag.exe'"`), which
+  // has to reach PowerShell through Inno's Exec, through CommandLineToArgvW,
+  // as `""Name='rag.exe'""`. That survives only if every layer agrees on the
+  // escaping; when it does not, `Get-CimInstance` errors, the error is
+  // swallowed by SilentlyContinue, NOTHING is killed, and the upgrade fails
+  // later with a locked file — a silent failure that looks exactly like the
+  // defect this procedure exists to prevent.
+  //
+  // `Get-Process` takes bare names, so the whole command is single-quoted
+  // throughout and there is nothing to escape. It also matches all three images
+  // in ONE call, which removes the window in which a PID could be reused
+  // between deciding and acting.
+  //
+  // `wmic` is not an option: deprecated, and absent from recent Windows builds.
+  Filter :=
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
+    '$ErrorActionPreference = ''SilentlyContinue''; ' +
+    '$app = ''' + ExpandConstant('{app}') + '''; ' +
+    '$data = ''' + ExpandConstant('{localappdata}\RAGTools') + '''; ' +
+    // BASE names, not filenames. `Get-Process -Name` matches ProcessName, which
+    // carries no extension: `-Name rag.exe` matches NOTHING and reports no
+    // error, so passing the filenames would silently kill nothing and leave the
+    // upgrade to fail later on a locked file. Measured on a live machine:
+    // `-Name rag.exe,ragw.exe,qdrant.exe` -> 0 processes; `-Name rag,ragw,qdrant`
+    // -> 7. Derived with RemoveFileExt so the list above stays the single source.
+    'Get-Process -Name ' + RemoveFileExt(Images[0]) + ',' +
+    RemoveFileExt(Images[1]) + ',' + RemoveFileExt(Images[2]) +
+    ' -ErrorAction SilentlyContinue | ' +
+    'Where-Object { $_.Path -and ' +
+    '( $_.Path.StartsWith($app, ''OrdinalIgnoreCase'') -or ' +
+    '  $_.Path.StartsWith($data, ''OrdinalIgnoreCase'') ) } | ' +
+    'Stop-Process -Force"';
+  Exec('powershell.exe', Filter, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
   // Short delay for NTFS file handles to fully release so the copy step
   // doesn't hit a "file is in use" error immediately after kill.

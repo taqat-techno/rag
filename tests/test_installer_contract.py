@@ -395,7 +395,14 @@ def test_the_process_kill_is_scoped_by_path_not_by_image_name(script):
         "processes are still matched by image name, which reaches every "
         "process of that name on the machine"
     )
-    assert "ExecutablePath" in text, "the kill does not inspect process paths"
+    # Either process API is acceptable — `Get-Process` exposes `.Path`,
+    # `Get-CimInstance` exposes `.ExecutablePath`. What must not change is that
+    # the executable's LOCATION decides whether it is ours to kill.
+    assert re.search(r"\$_\.(Path|ExecutablePath)", text), (
+        "the kill does not inspect process paths, so it cannot tell our "
+        "processes from a stranger's with the same image name"
+    )
+    assert "StartsWith" in text, "paths are not compared against a root"
     assert "{app}" in text, "the kill is not scoped to the install directory"
 
 
@@ -416,3 +423,44 @@ def test_every_owned_image_is_still_covered(script):
     assert body
     for image in ("rag.exe", "ragw.exe", "qdrant.exe"):
         assert image in body.group(0), f"{image} is no longer stopped"
+
+
+def test_processes_are_matched_by_base_name_not_filename(script):
+    """`Get-Process -Name` matches ProcessName, which carries no extension.
+
+    `-Name rag.exe` matches nothing AND reports no error, so passing filenames
+    would silently kill nothing and leave the upgrade to fail later on a locked
+    file — indistinguishable from the defect this procedure exists to prevent.
+    Measured on a live machine: `-Name rag.exe,ragw.exe,qdrant.exe` returned 0
+    processes; `-Name rag,ragw,qdrant` returned 7.
+    """
+    code = _code_section(script)
+    body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
+                     re.DOTALL | re.MULTILINE)
+    assert body, "ForceKillRagProcesses has no definition"
+    text = body.group(0)
+
+    invocation = re.search(r"Get-Process -Name[^|]*", text)
+    assert invocation, "the kill no longer uses Get-Process"
+    assert ".exe" not in invocation.group(0), (
+        "process names are passed with their .exe extension, which matches "
+        f"nothing: {invocation.group(0).strip()}"
+    )
+    assert "RemoveFileExt" in text, (
+        "base names are hard-coded rather than derived, so the list of owned "
+        "images and the list actually killed can drift apart"
+    )
+
+
+def test_the_kill_needs_no_nested_double_quotes(script):
+    """A quoted WQL filter has to survive Inno's Exec, CommandLineToArgvW and
+    PowerShell's own parsing. When it does not, the query errors, the error is
+    swallowed, and nothing is killed."""
+    code = _code_section(script)
+    body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
+                     re.DOTALL | re.MULTILINE)
+    assert body
+    assert '""' not in body.group(0), (
+        "the kill embeds escaped double quotes, whose survival depends on every "
+        "layer agreeing about escaping"
+    )

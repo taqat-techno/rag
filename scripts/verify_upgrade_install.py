@@ -156,14 +156,33 @@ def _dump_inno_log(log_path: Path, label: str, *, tail: int = 120) -> None:
         print(f"    (no Inno log at {log_path})", flush=True)
         return
     try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        raw = log_path.read_bytes()
     except OSError as exc:
         print(f"    (could not read the Inno log: {exc})", flush=True)
         return
+
+    # Inno writes UTF-16LE with a BOM. Decoding it as UTF-8 yields a string
+    # whose first character is U+FEFF, and printing that to a cp1252 console —
+    # which is what a Windows runner gives you — raises UnicodeEncodeError. The
+    # first version of this helper did exactly that and crashed the script it
+    # was added to diagnose, destroying the evidence instead of reporting it.
+    for encoding in ("utf-16", "utf-8-sig", "utf-8"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    else:
+        text = raw.decode("latin-1")
+
+    lines = text.replace("﻿", "").splitlines()
     print(f"\n--- Inno log for {label} (last {tail} of {len(lines)} lines) ---",
           flush=True)
+    # Re-encode through the console's own codec so an unexpected character
+    # degrades to '?' rather than taking the whole run down with it.
+    codec = sys.stdout.encoding or "utf-8"
     for line in lines[-tail:]:
-        print(f"    {line}", flush=True)
+        print("    " + line.encode(codec, "replace").decode(codec), flush=True)
     print("--- end Inno log ---\n", flush=True)
 
 
