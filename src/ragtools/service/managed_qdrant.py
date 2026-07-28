@@ -70,7 +70,22 @@ class ManagedPlan:
 def _candidate_dirs(settings) -> list:
     """Where a bundled or downloaded Qdrant binary may live, in priority order."""
     dirs = []
-    # 1. Alongside the packaged application (the installer ships it here).
+    # 1. NEXT TO THE RUNNING EXECUTABLE — where the installer actually puts it.
+    #
+    # This looked only in `_get_app_dir()`, under a comment saying "the
+    # installer ships it here". It does not: `app_dir()` is the DATA directory
+    # (`%LOCALAPPDATA%\RAGTools`), and the bundle — engine included — installs
+    # to the PROGRAM directory (`%LOCALAPPDATA%\Programs\RAGTools\bin`). So the
+    # engine shipped correctly and was invisible, and a packaged upgrade
+    # adopted `embedded` while a perfectly good `qdrant.exe` sat beside the
+    # binary doing the looking.
+    try:
+        here = Path(sys.executable).resolve().parent
+        dirs += [here / "bin", here, here / "qdrant"]
+    except Exception:
+        pass
+    # 2. The data directory, which is where a future first-run download would
+    #    land — a different location for a different reason.
     try:
         from ragtools.config import _get_app_dir  # type: ignore
         app_dir = _get_app_dir()

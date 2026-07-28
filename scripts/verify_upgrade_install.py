@@ -134,6 +134,16 @@ def health(port: int = 21420, tries: int = 45) -> dict | None:
     return None
 
 
+
+def api_status(port: int = 21420) -> dict | None:
+    """`/api/status`, for the collection layout the machine actually ended on."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=10) as r:
+            return json.load(r)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 #: How long one silent install may take before we call it hung.
 #:
 #: The previous release installs in ~90 s on a hosted runner. 2400 s was chosen
@@ -336,21 +346,66 @@ def main(argv=None) -> int:
     #
     # Waiting also makes this the stronger assertion. It proves the whole
     # lifecycle — migrate, rebuild, become ready — instead of only the first step.
+    # "Only after completion" is half the claim, so prove the other half: while
+    # the rebuild is outstanding, the product's own verdict must be NEGATIVE.
+    # Read it here rather than reusing `after_health`, which is not assigned
+    # until the section below — the kind of forward reference that runs fine
+    # until the branch that needs it is the one that executes.
+    current = health() or {}
+    was_migrating = current.get("status") == "migrating"
+    if was_migrating:
+        early = run([str(install / "rag.exe"), "selfcheck",
+                     "--expect-version", args.version], timeout=600)
+        check("selfcheck REFUSES to pass while the rebuild is outstanding",
+              early.returncode != 0,
+              "exit 0 — it claimed readiness mid-rebuild")
+
+    # Bounded, and explicit about which way it ran out. A wait that simply
+    # expires tells you nothing about whether the rebuild was progressing
+    # slowly or not progressing at all.
     deadline = time.monotonic() + 900
-    last = None
+    last, stalled_at, progressed = None, None, False
     while time.monotonic() < deadline:
         last = health()
         if not last or last.get("status") != "migrating":
             break
-        done = (last.get("migration") or {}).get("done")
-        total = (last.get("migration") or {}).get("total")
+        state = last.get("migration") or {}
+        done, total = state.get("done"), state.get("total")
+        if stalled_at is not None and done != stalled_at:
+            progressed = True
+        stalled_at = done
         print(f"    rebuilding after migration: {done}/{total}", flush=True)
         time.sleep(10)
 
     migration = (last or {}).get("migration") or {}
+    completed = (last or {}).get("status") != "migrating"
     check("the post-migration rebuild completed",
-          (last or {}).get("status") != "migrating",
+          completed,
           json.dumps(migration) if migration else "no migration was pending")
+    if not completed:
+        check("the rebuild was making progress when the wait expired",
+              progressed, f"stalled at done={stalled_at} for the full 900s")
+
+    # Every captured unit, not merely "the plan finished".
+    if was_migrating:
+        final = health() or {}
+        residual = final.get("migration")
+        check("no unit was left pending or failed", residual is None,
+              json.dumps(residual))
+
+    status = api_status()
+    if was_migrating and status:
+        check("the final layout is per-project",
+              status.get("collection_strategy") == "per_project",
+              str(status.get("collection_strategy")))
+        collections = {c.get("name"): c.get("points", 0)
+                       for c in (status.get("collections") or [])}
+        check("every legacy project has its own populated collection",
+              len(collections) >= len(legacy_projects)
+              and all(v > 0 for v in collections.values()),
+              json.dumps(collections))
+        check("the old shared collection was retired",
+              "markdown_kb" not in collections, json.dumps(sorted(collections)))
 
     selfcheck = run([str(install / "rag.exe"), "selfcheck",
                      "--expect-version", args.version], timeout=600)

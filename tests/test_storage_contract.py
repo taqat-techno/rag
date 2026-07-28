@@ -21,6 +21,7 @@ The contract itself is small and worth stating plainly:
 from __future__ import annotations
 
 import itertools
+from pathlib import Path
 
 import pytest
 
@@ -135,3 +136,55 @@ def test_the_router_accepts_exactly_what_the_contract_declares(tmp_path):
         settings = build(tmp_path, collection_strategy=strategy)
         router = CollectionRouter(settings, registry=_Registry())
         assert router.strategy == strategy
+
+
+# --- the engine must be findable where it actually ships ------------------
+
+
+def test_the_engine_is_found_beside_the_running_executable(tmp_path, monkeypatch):
+    r"""Where the installer puts it, not where the finder used to look.
+
+    `_candidate_dirs` searched `_get_app_dir()` under a comment reading "the
+    installer ships it here". It does not: `app_dir()` is the DATA directory
+    (`%LOCALAPPDATA%\RAGTools`) and the bundle installs to the PROGRAM
+    directory (`%LOCALAPPDATA%\Programs\RAGTools`). So the engine shipped
+    correctly and was invisible — a packaged upgrade adopted `embedded` while a
+    perfectly good `qdrant.exe` sat next to the binary doing the looking.
+
+    Caught by a packaged CI run reporting `storage_backend: embedded` when the
+    bundle-contract job had already proven the engine was in the bundle. Two
+    green checks, one wrong conclusion between them.
+    """
+    from ragtools.service.managed_qdrant import _binary_name, find_qdrant_binary
+
+    program = tmp_path / "Programs" / "RAGTools"
+    (program / "bin").mkdir(parents=True)
+    engine = program / "bin" / _binary_name()
+    engine.write_bytes(b"MZ" + b"\0" * 64)
+
+    data = tmp_path / "RAGTools"
+    data.mkdir(parents=True)
+
+    monkeypatch.setattr("sys.executable", str(program / "rag.exe"))
+    found = find_qdrant_binary(build(tmp_path, data_dir=str(data)))
+
+    assert found, "the packaged engine was not found beside the executable"
+    assert Path(found).resolve() == engine.resolve()
+
+
+def test_the_data_directory_is_still_searched(tmp_path, monkeypatch):
+    """A future first-run download lands there; both locations must work."""
+    from ragtools.service.managed_qdrant import _binary_name, find_qdrant_binary
+
+    data = tmp_path / "RAGTools"
+    (data / "bin").mkdir(parents=True)
+    engine = data / "bin" / _binary_name()
+    engine.write_bytes(b"MZ" + b"\0" * 64)
+
+    elsewhere = tmp_path / "Programs" / "RAGTools"
+    elsewhere.mkdir(parents=True)
+    monkeypatch.setattr("sys.executable", str(elsewhere / "rag.exe"))
+
+    found = find_qdrant_binary(build(tmp_path, data_dir=str(data)))
+
+    assert found and Path(found).resolve() == engine.resolve()
