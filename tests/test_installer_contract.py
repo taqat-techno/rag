@@ -582,3 +582,43 @@ def test_this_suite_contains_no_stray_control_characters():
             f"{path.name} contains control bytes {sorted(strays)} — almost "
             "certainly a backslash escape that lost a backslash"
         )
+
+
+# --- F7: a silent install must never wait for a human ---------------------
+
+
+def test_no_dialog_can_block_a_silent_run(script):
+    """Plain `MsgBox` is NOT suppressed by /SUPPRESSMSGBOXES. `SuppressibleMsgBox` is.
+
+    Measured: a silent upgrade copied every file, registered both tasks, launched
+    the tray — and then stopped dead for the full 15-minute timeout on a dialog
+    nobody could see. Inno's own log said `Message box (OK):` rather than
+    `Defaulting to ... for suppressed message box`, which is the difference
+    between the two functions stated in one line.
+
+    This is not a CI-only concern. Every scripted deployment runs silently —
+    winget, MDM, an unattended reinstall — and every one of them would have hung
+    on an invisible dialog.
+    """
+    code = _code_section(script)
+    plain = [line.strip() for line in code.splitlines()
+             if re.search(r"(?<![A-Za-z])MsgBox\s*\(", line)
+             and "SuppressibleMsgBox" not in line]
+    assert not plain, (
+        "these dialogs block a silent install or uninstall:\n  "
+        + "\n  ".join(plain)
+    )
+
+
+def test_a_suppressed_uninstall_prompt_keeps_user_data(script):
+    """`SuppressibleMsgBox` RETURNS its Default when suppressed, so the default
+    is the answer every silent uninstall gives. For the data-wipe prompt that
+    answer must be No: the visible dialog already defaults to No, and a silent
+    run that quietly disagreed with it would delete a configuration nothing
+    regenerates."""
+    code = _code_section(script)
+    call = re.search(r"Response\s*:=\s*SuppressibleMsgBox\((.*?)\);", code, re.DOTALL)
+    assert call, "the uninstall data prompt is no longer a suppressible dialog"
+    assert call.group(1).rstrip().endswith("IDNO"), (
+        "a silent uninstall would answer YES to deleting user data"
+    )

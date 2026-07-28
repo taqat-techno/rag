@@ -375,10 +375,10 @@ begin
   Verifier := ExpandConstant('{app}\rag.exe');
   if not FileExists(Verifier) then
   begin
-    MsgBox('Installation problem: ' + Verifier + ' is missing after setup.' + #13#10 + #13#10 +
+    SuppressibleMsgBox('Installation problem: ' + Verifier + ' is missing after setup.' + #13#10 + #13#10 +
            'The installation is incomplete. Please re-run this installer and, if it fails '
            + 'again, restart Windows first so no old files remain locked.',
-           mbCriticalError, MB_OK);
+           mbCriticalError, MB_OK, IDOK);
     Exit;
   end;
 
@@ -395,14 +395,14 @@ begin
     Exit;   // could not run the check, or it overran; do not invent a verdict
 
   if ResultCode <> 0 then
-    MsgBox('RAG Tools {#MyAppVersion} was installed, but verification found that this '
+    SuppressibleMsgBox('RAG Tools {#MyAppVersion} was installed, but verification found that this '
            + 'machine is NOT fully running it.' + #13#10 + #13#10 +
            'This usually means a process from the previous version was still running '
            + 'while files were replaced, so some files were skipped.' + #13#10 + #13#10 +
            'To fix it: restart Windows, then run this installer again. Your projects, '
            + 'configuration and index are not affected.' + #13#10 + #13#10 +
            'For details run:  rag selfcheck',
-           mbCriticalError, MB_OK);
+           mbCriticalError, MB_OK, IDOK);
 end;
 
 // Copy the configuration out of the data root before anything deletes it.
@@ -484,7 +484,7 @@ begin
     if not DirExists(DataDir) then
       Exit;
 
-    Response := MsgBox(
+    Response := SuppressibleMsgBox(
       'RAG Tools has been uninstalled.' + #13#10 + #13#10 +
       'Do you ALSO want to DELETE your user data?' + #13#10 + #13#10 +
       'CANNOT be rebuilt:' + #13#10 +
@@ -498,7 +498,7 @@ begin
       'A copy of your configuration is saved either way, and this dialog will' + #13#10 +
       'tell you where. Nothing goes to the Recycle Bin.' + #13#10 + #13#10 +
       'Default is NO (keep everything). Choose YES only for a full wipe.',
-      mbConfirmation, MB_YESNO or MB_DEFBUTTON2);
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO);
 
     if Response = IDYES then
     begin
@@ -509,25 +509,25 @@ begin
       // that is not.
       if BackupFailed then
       begin
-        MsgBox(
+        SuppressibleMsgBox(
           'Your user data was NOT deleted.' + #13#10 + #13#10 +
           'The configuration file could not be copied to a backup, and' + #13#10 +
           'deleting it without one cannot be undone.' + #13#10 + #13#10 +
           'Everything is still at:' + #13#10 + DataDir + #13#10 + #13#10 +
           'Delete that folder by hand if you are sure you want it gone.',
-          mbError, MB_OK);
+          mbError, MB_OK, IDOK);
         Exit;
       end;
 
       DelTree(DataDir, True, True, True);
 
       if Backup <> '' then
-        MsgBox(
+        SuppressibleMsgBox(
           'Your user data has been deleted.' + #13#10 + #13#10 +
           'Your configuration was copied to:' + #13#10 + Backup + #13#10 + #13#10 +
           'Keep this if you might reinstall — it holds your project list,' + #13#10 +
           'and the index rebuilds itself from it.',
-          mbInformation, MB_OK);
+          mbInformation, MB_OK, IDOK);
     end;
   end;
 end;
