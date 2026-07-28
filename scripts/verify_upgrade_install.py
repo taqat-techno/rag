@@ -348,10 +348,24 @@ def main(argv=None) -> int:
     # lifecycle — migrate, rebuild, become ready — instead of only the first step.
     # "Only after completion" is half the claim, so prove the other half: while
     # the rebuild is outstanding, the product's own verdict must be NEGATIVE.
-    # Read it here rather than reusing `after_health`, which is not assigned
-    # until the section below — the kind of forward reference that runs fine
-    # until the branch that needs it is the one that executes.
-    current = health() or {}
+    # WAIT FOR THE SERVICE TO ANSWER AT ALL before asking what it is doing.
+    #
+    # `health()` returns None when nothing is listening, and reading that as
+    # "no migration is pending" is the same "could not determine == nothing to
+    # do" collapse this project keeps having to fix. It passed vacuously here:
+    # the service was still starting, the check reported "no migration was
+    # pending", and ten seconds later /health said `migrating, 0/2`.
+    current = None
+    service_deadline = time.monotonic() + 300
+    while time.monotonic() < service_deadline:
+        current = health(tries=1)
+        if current:
+            break
+        time.sleep(5)
+    if not check("the service answers after the upgrade", bool(current),
+                 "nothing responded within 300s — the state below cannot be read"):
+        current = {}
+    current = current or {}
     was_migrating = current.get("status") == "migrating"
     if was_migrating:
         early = run([str(install / "rag.exe"), "selfcheck",
@@ -364,10 +378,17 @@ def main(argv=None) -> int:
     # expires tells you nothing about whether the rebuild was progressing
     # slowly or not progressing at all.
     deadline = time.monotonic() + 900
-    last, stalled_at, progressed = None, None, False
+    last, stalled_at, progressed = current, None, False
     while time.monotonic() < deadline:
-        last = health()
-        if not last or last.get("status") != "migrating":
+        last = health(tries=3)
+        # A service that stops answering mid-rebuild is a finding, not a
+        # completion: treating silence as "finished" is how the check above
+        # passed while the rebuild had not started.
+        if last is None:
+            print("    service stopped answering during the rebuild", flush=True)
+            time.sleep(5)
+            continue
+        if last.get("status") != "migrating":
             break
         state = last.get("migration") or {}
         done, total = state.get("done"), state.get("total")
@@ -378,7 +399,8 @@ def main(argv=None) -> int:
         time.sleep(10)
 
     migration = (last or {}).get("migration") or {}
-    completed = (last or {}).get("status") != "migrating"
+    # Explicitly requires an ANSWER saying it is done — not the absence of one.
+    completed = bool(last) and last.get("status") != "migrating"
     check("the post-migration rebuild completed",
           completed,
           json.dumps(migration) if migration else "no migration was pending")
