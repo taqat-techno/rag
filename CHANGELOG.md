@@ -97,7 +97,30 @@ forever.
   runs the *previous* release's binary, whose behaviour this installer cannot
   control; unbounded, one that never returns stopped the upgrade before a single
   file was touched, silently. All such calls are now time-limited, and the
-  installer writes an Inno log that CI dumps on timeout.
+  installer writes an Inno log that CI dumps on timeout. Measured effect: an
+  upgrade that ran 40 minutes and timed out now completes in 23 seconds.
+- **Windows RestartManager no longer cancels the upgrade it was meant to help
+  (`CloseApplications=no`).** RM enumerates open files *before* the installer's
+  pre-install phase and shuts them down *after* it, so it acts on a list as
+  stale as that phase is long. Anything it then fails to close — including a
+  process the installer had already stopped correctly — raises an
+  Abort/Retry/Ignore box, and `/SUPPRESSMSGBOXES` answers with the **default**,
+  which is Abort. From Inno's own log:
+
+  ```
+  Shutting down applications using our files.
+  Some applications could not be shut down.
+  Defaulting to Abort for suppressed message box (Abort/Retry/Ignore)
+  User canceled the installation process.
+  ```
+
+  So a silent upgrade was refused, rolled back, and exited 5 — not because
+  anything was wrong, but because two mechanisms were closing the same
+  processes and the loser cancelled the install. RM predates this installer
+  having a kill of its own; it has one now, scoped by executable path, which
+  runs before `[InstallDelete]` and `[Files]` and **verifies its own result**
+  (kill, wait, re-scan, up to three rounds) rather than assuming a stop request
+  was honoured.
 
 ### Note on the reported incident — corrected
 The 3.0.2 notes stated that the reported v3.0.1 upgrade failure "did not occur".
