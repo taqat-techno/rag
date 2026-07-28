@@ -348,6 +348,23 @@ def main(argv=None) -> int:
     # lifecycle — migrate, rebuild, become ready — instead of only the first step.
     # "Only after completion" is half the claim, so prove the other half: while
     # the rebuild is outstanding, the product's own verdict must be NEGATIVE.
+    # START THE SERVICE. Nothing else will, on a runner.
+    #
+    # The installer only starts it under `Tasks: startnow`, which this test
+    # deliberately omits so no browser opens; the scheduled task that would
+    # start it fires at LOGON, and a hosted runner never logs anyone in. So
+    # after the upgrade the machine has a registered service and no running
+    # one — and the rebuild, which is the service's job, never begins.
+    #
+    # A previous run DID find a service answering here, which made this look
+    # unnecessary. That was incidental: the task carries RestartOnFailure, and
+    # force-killing the old service during the upgrade sometimes provoked a
+    # restart. Depending on that is depending on a race.
+    #
+    # Starting it explicitly is also what the real lifecycle does — the logon
+    # task starts the service, and the service resumes the migration.
+    run([str(install / "rag.exe"), "service", "start"], timeout=600)
+
     # WAIT FOR THE SERVICE TO ANSWER AT ALL before asking what it is doing.
     #
     # `health()` returns None when nothing is listening, and reading that as
