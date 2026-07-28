@@ -214,111 +214,64 @@ var
   ResultCode: Integer;
   Images: array[0..2] of string;
   Filter: string;
-  I: Integer;
 begin
-  // EVERY image an installation owns, not just the one it used to ship.
+  // TWO mechanisms, because the two problems are different.
   //
-  // This killed `rag.exe` alone until v3.1.0 — written when that was the only
-  // executable. v3.0.1 then added `ragw.exe` and pointed BOTH scheduled tasks
-  // at it, so from that release on the service and tray at login are `ragw.exe`
-  // and the kill missed them entirely. A running image holds its own file, so
-  // the very processes an upgrade must stop were the ones it left alone: the
-  // copy would skip locked files and the installer would report success over a
-  // half-replaced tree. `CloseApplications=yes` catches some of this through
-  // Restart Manager, but it is a prompt, not a guarantee, and it does not cover
-  // a process holding a file it did not open by name.
+  // `rag.exe` and `ragw.exe` are names this product owns outright — nothing
+  // else on a Windows machine ships them — so matching by image name is both
+  // safe and, decisively, PROVEN: v3.0.1 replaced a running `rag.exe` in place
+  // on a real machine using exactly this call. A path-scoped PowerShell
+  // equivalent was tried in its place and the upgrade failed with
+  // `DeleteFile failed; code 5` on `rag.exe`, with owned processes still alive
+  // afterwards. A mechanism that works is not replaced by a tidier one that
+  // does not.
   //
-  // `qdrant.exe` is owned too: managed storage supervises one, and it holds
-  // handles under the data dir that a reconciling upgrade may need.
-  // PROCESS names, which is what `Get-Process -Name` matches: `ProcessName`
-  // carries no extension. `-Name rag.exe` matches NOTHING and reports no error,
-  // so the filenames would silently kill nothing and leave the upgrade to fail
-  // later on a locked file — indistinguishable from the defect this procedure
-  // exists to prevent. Measured on a live machine: `-Name rag.exe,ragw.exe,
-  // qdrant.exe` -> 0 processes; `-Name rag,ragw,qdrant` -> 7.
+  // `qdrant.exe` is the opposite case and keeps the scoping: it is a common
+  // name, and `storage_backend = "external"` explicitly means "a server you run
+  // yourself". Killing every Qdrant on the machine would be data loss in
+  // someone else's application caused by installing this one.
   //
-  // Written out rather than derived. `RemoveFileExt` looked like the obvious
-  // helper and does not exist in Pascal Script — the compile failed on it — and
-  // a literal list needs no API at all. `tests/test_installer_contract.py`
-  // keeps this list and the owned-image list from drifting apart.
-  Images[0] := 'rag';      // rag.exe
-  Images[1] := 'ragw';     // ragw.exe
-  Images[2] := 'qdrant';   // qdrant.exe
+  // EVERY step logs its result. Inno records nothing about Exec, so a kill that
+  // silently does nothing looks exactly like one that worked — which is how two
+  // CI cycles went into fixing the wrong layer.
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM rag.exe /T',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Log('ForceKill: taskkill rag.exe -> ' + IntToStr(ResultCode));
 
-  // SCOPED BY PATH, not by image name.
-  //
-  // `/IM qdrant.exe` matches every Qdrant on the machine. Ours is one of them;
-  // the others are not ours to kill. `storage_backend = "external"` explicitly
-  // means "a server you run yourself", a second ragtools install has its own,
-  // and an unrelated product may simply ship a binary with the same common
-  // name. Killing those is data loss in someone else's application, caused by
-  // installing this one — and the product already draws this distinction
-  // correctly everywhere else: `selfcheck` compares process paths against the
-  // install directory precisely so it does not accuse a stranger's process.
-  //
-  // `Get-Process`, not `Get-CimInstance -Filter`, and NO embedded double
-  // quotes anywhere.
-  //
-  // The CIM form needs a quoted WQL filter (`-Filter "Name='rag.exe'"`), which
-  // has to reach PowerShell through Inno's Exec, through CommandLineToArgvW,
-  // as `""Name='rag.exe'""`. That survives only if every layer agrees on the
-  // escaping; when it does not, `Get-CimInstance` errors, the error is
-  // swallowed by SilentlyContinue, NOTHING is killed, and the upgrade fails
-  // later with a locked file — a silent failure that looks exactly like the
-  // defect this procedure exists to prevent.
-  //
-  // `Get-Process` takes bare names, so the whole command is single-quoted
-  // throughout and there is nothing to escape. It also matches all three images
-  // in ONE call, which removes the window in which a PID could be reused
-  // between deciding and acting.
-  //
-  // `wmic` is not an option: deprecated, and absent from recent Windows builds.
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM ragw.exe /T',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Log('ForceKill: taskkill ragw.exe -> ' + IntToStr(ResultCode));
+
   Filter :=
     '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
     '$ErrorActionPreference = ''SilentlyContinue''; ' +
     '$app = ''' + ExpandConstant('{app}') + '''; ' +
     '$data = ''' + ExpandConstant('{localappdata}\RAGTools') + '''; ' +
-    // Kill, wait, LOOK AGAIN — up to three rounds.
-    //
-    // With RestartManager disabled this is the only thing standing between a
-    // running process and a locked file, so "we sent a stop" is not good enough:
-    // a supervisor can respawn a child in the moment after its own death, and
-    // Stop-Process returns before the handle is actually released. The loop
-    // exits as soon as a scan finds nothing, so the common case costs one pass.
-    'for ($i = 0; $i -lt 3; $i++) { ' +
-    '  $found = @(Get-Process -Name ' + Images[0] + ',' + Images[1] + ',' +
-    Images[2] + ' -ErrorAction SilentlyContinue | ' +
+    '$mine = @(Get-Process -Name qdrant -ErrorAction SilentlyContinue | ' +
     'Where-Object { $_.Path -and ' +
     '( $_.Path.StartsWith($app, ''OrdinalIgnoreCase'') -or ' +
     '  $_.Path.StartsWith($data, ''OrdinalIgnoreCase'') ) }); ' +
-    '  if ($found.Count -eq 0) { break }; ' +
-    '  $found | Stop-Process -Force; ' +
-    '  Start-Sleep -Milliseconds 700; ' +
-    '}"';
+    'if ($mine.Count -gt 0) { $mine | Stop-Process -Force }; ' +
+    'exit $mine.Count"';
   Exec('powershell.exe', Filter, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Log('ForceKill: scoped qdrant.exe stopped -> ' + IntToStr(ResultCode));
 
-  // Short delay for NTFS file handles to fully release so the copy step
-  // doesn't hit a "file is in use" error immediately after kill.
-  Sleep(1500);
+  // Longer than it looks like it needs to be. `taskkill` returns once the
+  // signal is delivered, not once the kernel has released the image's file
+  // handle, and the copy that follows fails on exactly that gap.
+  Sleep(2500);
+
+  // Say plainly whether anything survived, one step BEFORE the copy would
+  // fail with "DeleteFile failed; code 5" and leave the reason to be inferred.
+  Filter :=
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
+    '$ErrorActionPreference = ''SilentlyContinue''; ' +
+    'exit @(Get-Process -Name rag,ragw,qdrant -ErrorAction SilentlyContinue).Count"';
+  Exec('powershell.exe', Filter, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Log('ForceKill: owned processes still running afterwards -> ' + IntToStr(ResultCode));
 end;
 
-// Run a program with a hard time limit, and carry on when it overruns.
-//
-// `Exec(..., ewWaitUntilTerminated, ...)` waits forever. That is tolerable when
-// the callee is this release's own binary; it is not when the callee is the
-// PREVIOUS release's binary, whose behaviour this installer cannot control and
-// cannot fix. A `service stop` that never returns hangs the upgrade before a
-// single file has been replaced — and in a silent install there is no output to
-// say so. It simply stops, which is indistinguishable from a wedged machine.
-//
-// Overrunning is not an error here. Every bounded call below is a courtesy step
-// whose job is done more forcefully a moment later by StopOwnedTasks and
-// ForceKillRagProcesses; the point is to give the graceful path a chance, not to
-// depend on it.
-//
-// PowerShell is the mechanism because it is the only always-present way to wait
-// with a timeout and then kill: `timeout.exe` waits without killing, `start
-// /wait` is unbounded, and Inno exposes no timeout of its own.
+
 function ExecBounded(const Exe, Params: string; TimeoutMs: Integer): Integer;
 var
   ResultCode: Integer;

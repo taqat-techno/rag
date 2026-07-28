@@ -372,18 +372,18 @@ def test_verification_cannot_hang_a_completed_installation(script):
 # --- F5: the kill must not reach processes this installation does not own ---
 
 
-def test_the_process_kill_is_scoped_by_path_not_by_image_name(script):
-    """`/IM qdrant.exe` matches every Qdrant on the machine.
+def test_only_our_own_image_names_are_killed_by_name(script):
+    """`rag.exe` and `ragw.exe` are names nothing else ships. `qdrant.exe` is not.
 
-    Ours is one of them; the others are not ours to kill. `storage_backend =
-    "external"` explicitly means "a server you run yourself", a second ragtools
-    install has its own, and an unrelated product may ship a binary with the
-    same common name. Killing those is data loss in someone else's application,
-    caused by installing this one.
+    Matching `qdrant.exe` by image name reaches every Qdrant on the machine —
+    including one a user runs themselves under `storage_backend = "external"`,
+    which the architecture explicitly says this product must not own. Killing it
+    is data loss in someone else's application caused by installing this one.
 
-    The product already draws this distinction everywhere else — `selfcheck`
-    compares process paths against the install directory precisely so it does
-    not accuse a stranger's process.
+    The two halves are deliberately asymmetric: image-name matching for what we
+    own outright (and what is proven to work — v3.0.1 replaced a running
+    `rag.exe` in place with exactly that call), path scoping for the name we
+    share.
     """
     code = _code_section(script)
     body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
@@ -391,19 +391,32 @@ def test_the_process_kill_is_scoped_by_path_not_by_image_name(script):
     assert body, "ForceKillRagProcesses has no definition"
     text = body.group(0)
 
-    assert "/IM" not in text, (
-        "processes are still matched by image name, which reaches every "
-        "process of that name on the machine"
+    by_name = re.findall(r"/IM\s+(\S+)", text)
+    assert by_name, "nothing is stopped at all"
+    assert "qdrant.exe" not in by_name, (
+        "qdrant.exe is killed by image name, which reaches every Qdrant on the "
+        "machine including an external one the user runs themselves"
     )
-    # Either process API is acceptable — `Get-Process` exposes `.Path`,
-    # `Get-CimInstance` exposes `.ExecutablePath`. What must not change is that
-    # the executable's LOCATION decides whether it is ours to kill.
-    assert re.search(r"\$_\.(Path|ExecutablePath)", text), (
-        "the kill does not inspect process paths, so it cannot tell our "
-        "processes from a stranger's with the same image name"
+    assert set(by_name) == {"rag.exe", "ragw.exe"}, (
+        f"unexpected image-name kills: {by_name}"
     )
+    assert re.search(r"\$_\.Path", text), "qdrant is not scoped by executable path"
     assert "StartsWith" in text, "paths are not compared against a root"
-    assert "{app}" in text, "the kill is not scoped to the install directory"
+
+
+def test_the_kill_reports_what_it_did(script):
+    """Inno records nothing about Exec, so a kill that silently does nothing is
+    indistinguishable in the log from one that worked. Two CI cycles went into
+    fixing the wrong layer for exactly that reason."""
+    code = _code_section(script)
+    body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
+                     re.DOTALL | re.MULTILINE)
+    assert body
+    text = body.group(0)
+    assert text.count("Log(") >= 3, "the kill does not log its results"
+    assert "still running afterwards" in text, (
+        "nothing checks — or reports — whether any owned process survived"
+    )
 
 
 def test_the_kill_does_not_depend_on_wmic(script):
@@ -421,42 +434,38 @@ def test_every_owned_image_is_still_covered(script):
     body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
                      re.DOTALL | re.MULTILINE)
     assert body
-    # Base names, because that is what `Get-Process -Name` matches. The
-    # comments still carry the filenames for the reader.
-    for name in ("rag", "ragw", "qdrant"):
-        assert re.search(rf"'{name}'", body.group(0)), f"{name} is no longer stopped"
+    text = body.group(0)
+    # rag/ragw by image name (taskkill), qdrant by path-scoped Get-Process.
+    # Both halves must be present; dropping either restores a real defect.
+    assert "/IM rag.exe" in text, "rag.exe is no longer stopped"
+    assert "/IM ragw.exe" in text, "ragw.exe is no longer stopped — the 3.0.1 defect"
+    # Plain substring, not a regex. A hand-written word-boundary escape here
+    # turned into a literal backspace byte, and the pattern silently stopped
+    # matching the file it was written to check. Where a substring will do,
+    # a regex is just more surface for that to happen on.
+    assert "Get-Process -Name qdrant " in text, (
+        "qdrant.exe is no longer stopped"
+    )
 
 
-def test_processes_are_matched_by_base_name_not_filename(script):
+def test_get_process_is_given_base_names_not_filenames(script):
     """`Get-Process -Name` matches ProcessName, which carries no extension.
 
-    `-Name rag.exe` matches nothing AND reports no error, so passing filenames
-    would silently kill nothing and leave the upgrade to fail later on a locked
-    file — indistinguishable from the defect this procedure exists to prevent.
-    Measured on a live machine: `-Name rag.exe,ragw.exe,qdrant.exe` returned 0
-    processes; `-Name rag,ragw,qdrant` returned 7.
+    `-Name qdrant.exe` matches nothing AND reports no error, so the kill would
+    silently spare the process it was aiming at. Measured on a live machine:
+    `-Name rag.exe,ragw.exe,qdrant.exe` returned 0 processes; `-Name
+    rag,ragw,qdrant` returned 7. (`taskkill /IM` is the opposite — it wants the
+    filename — which is why the two halves look different.)
     """
     code = _code_section(script)
     body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
                      re.DOTALL | re.MULTILINE)
     assert body, "ForceKillRagProcesses has no definition"
-    text = body.group(0)
 
-    invocation = re.search(r"Get-Process -Name[^|]*", text)
-    assert invocation, "the kill no longer uses Get-Process"
-    assert ".exe" not in invocation.group(0), (
-        "process names are passed with their .exe extension, which matches "
-        f"nothing: {invocation.group(0).strip()}"
-    )
-    # The declared list and the list actually passed to Get-Process must be
-    # the same one — that is what stops them drifting apart.
-    declared = re.findall(r"Images\[\d\]\s*:=\s*'([^']+)'", text)
-    assert declared == ["rag", "ragw", "qdrant"], (
-        f"the owned-process list changed shape: {declared}"
-    )
-    assert all("." not in name for name in declared), (
-        f"process names carry a file extension, which matches nothing: {declared}"
-    )
+    for names in re.findall(r"Get-Process -Name ([A-Za-z0-9_,.]+)", body.group(0)):
+        assert ".exe" not in names, (
+            f"Get-Process was given filenames, which match nothing: {names}"
+        )
 
 
 def test_the_kill_needs_no_nested_double_quotes(script):
@@ -485,7 +494,8 @@ INNO_BUILTINS = {
     "AddBackslash", "ChangeFileExt", "DelTree", "DirExists", "Exec",
     "ExecAsOriginalUser", "ExpandConstant", "ExtractFileDir", "ExtractFileExt",
     "ExtractFileName", "ExtractFilePath", "FileCopy", "FileExists",
-    "ForceDirectories", "GetDateTimeString", "IntToStr", "Length", "LowerCase",
+    "ForceDirectories", "GetDateTimeString", "IntToStr", "Length", "Log",
+    "LowerCase",
     "MsgBox", "Pos", "RegQueryStringValue", "RegWriteStringValue",
     "RemoveBackslash", "SetLength", "Sleep", "StringChangeEx", "Trim",
     "UpperCase", "Copy", "IsAdminLoggedOn", "GetEnv", "SuppressibleMsgBox",
@@ -555,16 +565,20 @@ def test_restart_manager_is_disabled(script):
     )
 
 
-def test_the_kill_verifies_its_own_result(script):
-    """With RestartManager off, this is the only thing between a running process
-    and a locked file — so "we sent a stop" is not good enough. Stop-Process
-    returns before the handle is released, and a supervisor can respawn a child
-    in the moment after its own death."""
-    code = _code_section(script)
-    body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
-                     re.DOTALL | re.MULTILINE)
-    assert body, "ForceKillRagProcesses has no definition"
-    text = body.group(0)
+def test_this_suite_contains_no_stray_control_characters():
+    """Escapes that silently become control bytes are this suite's recurring bug.
 
-    assert "for ($i" in text, "the kill does not re-check after stopping"
-    assert "$found.Count -eq 0" in text, "nothing verifies the processes are gone"
+    A hand-written `\b` inside an r-string reaches the regex engine as a word
+    boundary; written one backslash short it becomes byte 0x08, the pattern
+    stops matching, and the test passes against the file it was written to
+    reject. That has now happened four times in this file — twice as a
+    carriage-return from `\r`, once as a backspace — and each time the symptom
+    was a green test rather than a red one.
+    """
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        data = path.read_bytes()
+        strays = {b for b in data if b < 9 or b in (11, 12) or 13 < b < 32}
+        assert not strays, (
+            f"{path.name} contains control bytes {sorted(strays)} — almost "
+            "certainly a backslash escape that lost a backslash"
+        )
