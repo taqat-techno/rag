@@ -495,6 +495,18 @@ begin
   // `service stop` runs first, but the tray and supervisor can survive that.
   if CurUninstallStep = usUninstall then
   begin
+    // END THE TASKS FIRST — the same ordering install needs, for the same
+    // reason. The registration carries RestartOnFailure, and a force-kill is
+    // precisely the failure it reacts to, so killing first lets the scheduler
+    // start a replacement service mid-uninstall. That service then spawns the
+    // managed Qdrant, which holds `bin\qdrant.exe` open, and the uninstaller
+    // silently leaves `bin` and `_internal` behind.
+    //
+    // Observed exactly that: `qdrant.exe pid=1184` still running afterwards,
+    // with `['bin', '_internal']` surviving in the program directory. The
+    // engine only started shipping in this release, so this failure mode is
+    // new with it — an uninstall that leaves a database server running.
+    StopOwnedTasks();
     ForceKillRagProcesses();
   end;
 

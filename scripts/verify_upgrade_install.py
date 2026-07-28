@@ -392,7 +392,13 @@ def main(argv=None) -> int:
         if current:
             break
         time.sleep(5)
+    # Report what was FOUND, not the failure text, when it passes. A PASS whose
+    # detail reads "nothing responded within 300s" is worse than no detail: the
+    # log then contradicts its own verdict and a reader has to guess which half
+    # to believe.
     if not check("the service answers after the upgrade", bool(current),
+                 f"status={current.get('status')} version={current.get('version')}"
+                 if current else
                  "nothing responded within 300s — the state below cannot be read"):
         current = {}
     current = current or {}
@@ -439,14 +445,19 @@ def main(argv=None) -> int:
               progressed, f"stalled at done={stalled_at} for the full 900s")
 
     # Every captured unit, not merely "the plan finished".
-    if was_migrating:
-        final = health() or {}
-        residual = final.get("migration")
-        check("no unit was left pending or failed", residual is None,
-              json.dumps(residual))
+    final = health() or {}
+    residual = final.get("migration")
+    check("no unit was left pending or failed", residual is None,
+          json.dumps(residual) if residual else "the plan completed")
 
+    # UNCONDITIONAL. These were gated on `was_migrating`, i.e. on happening to
+    # poll while the rebuild was still running — and two tiny seeded projects
+    # rebuild in seconds, so the gate usually lost the race and every assertion
+    # below was silently skipped. The seeded config guarantees a migration
+    # occurred; whether the test observed it mid-flight is luck, and luck is not
+    # a precondition for checking the result.
     status = api_status()
-    if was_migrating and status:
+    if status:
         check("the final layout is per-project",
               status.get("collection_strategy") == "per_project",
               str(status.get("collection_strategy")))
