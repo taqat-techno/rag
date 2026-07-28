@@ -416,6 +416,66 @@ Single encoder instance, single lock. The lock protects both the encoder and the
 
 ---
 
+## Decision 18 — Configuration Migration Runs at a Single Bootstrap Seam
+
+**Decision:** The v2→v3 config migration is invoked from exactly one place —
+`ragtools.bootstrap.ensure_config_current()` — called **after `Settings()` is
+constructible but before any `QdrantOwner` exists**, and only from entry points
+that legitimately write (`service/run.py`, `service/app.py`, `cli.py`). Read
+paths (`retrieval/searcher.py`, `selfcheck.py`, the MCP server) never migrate.
+
+**Why the ordering is load-bearing:** `QdrantOwner.__init__` opens the store and
+calls `ensure_collection()` while constructing itself. A migration that ran
+afterwards would already be looking at a store built to the previous layout, so
+"migrate, then construct" is a correctness requirement, not a style preference.
+
+**Why only writers:** a read path that rewrites the user's configuration as a
+side effect is a worse defect than the one being fixed. It is safe to exclude
+them because migration is deliberately behaviour-preserving — see below — so a
+reader looking at an unmigrated file resolves exactly the same backend and
+layout it would resolve afterwards.
+
+**Migration never changes an existing install's collection layout.** Switching
+`shared` → `per_project` invalidates every file hash in the state DB (correctly:
+see `index_identity`), so the next index run re-embeds the entire corpus — tens
+of thousands of files, at first boot, on a machine the user has just upgraded.
+It also does not reliably fix the size ceiling it appears to fix: splitting one
+collection into twenty-five only helps if no *single* project exceeds the limit,
+and a project that vendors a framework can exceed it alone. The layout is
+therefore reachable (`rag storage strategy`), recommended when it would genuinely
+help, and never imposed. A config with **no projects** adopts `per_project`,
+because there is nothing to re-index.
+
+**Version stamping is single-sourced.** `CONFIG_VERSION` is defined once, in
+`config.py`. Config writers preserve whatever version a file declares and never
+invent one; only the migrator changes it. Previously three literals disagreed —
+`_save_projects_to_toml` wrote `2` from sixteen production call sites — so a
+migrated config was demoted by the user's next edit and re-migrated on the
+following boot, forever.
+
+**Failure is loud, not fatal.** A configuration that cannot be rewritten (read-only
+volume, permissions, another process holding the lock) must not stop the service
+starting. It degrades to the values already resolved, reports on `/health`
+(`config_state`, and `config_migration_failed` in `issues`) and in `rag doctor`,
+and retries next boot.
+
+**Concurrency:** an exclusive-create lock file beside the config, with a stale
+timeout. The service, tray, MCP server and a CLI command can all start within the
+same second of a login; atomic writes protect one writer from interruption, not
+two writers from each other.
+
+**Test enforcement:** `tests/test_bootstrap_migration.py` asserts the file is
+really rewritten by the seam, that the ordering holds (by AST, in the real entry
+points), that concurrent starts cannot corrupt it, and that behaviour is
+unchanged for an existing install. `tests/test_config_version_stamp.py` asserts
+no production writer can lower the version.
+
+**Tradeoff:** CLI-only users pay one extra TOML read per command. Accepted: the
+alternative was a migration that never ran, which is what shipped in 3.0.0 and
+3.0.1.
+
+---
+
 ## Summary Table
 
 | # | Decision | Default | Locked |
@@ -437,3 +497,4 @@ Single encoder instance, single lock. The lock protects both the encoder and the
 | 15 | Watcher unavailable paths | Skip, warn, retry 60s | Yes |
 | 16 | API contracts additive-only | `scale.level` enum closed; route fields stable | Yes |
 | 17 | Watcher autostart ownership | Lifecycle-owned (lifespan); desired-state respected | Yes |
+| 18 | Config migration seam | One call, before any owner; writers only; layout never forced | Yes |
