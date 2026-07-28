@@ -128,12 +128,22 @@ def test_a_full_run_covers_every_documented_check():
     names = [c.name for c in run_selfcheck(__version__, port=21599)]
 
     assert names == [
+        # Installation: is this machine running this release at all?
         "installed version",
         "windowed executable",
         "recorded install version",
         "running processes",
         "autostart targets",
         "service health version",
+        # Product: an installation can be byte-perfect and still BE the previous
+        # product. v3.0.0 and v3.0.1 both shipped a migration nothing invoked,
+        # so every upgraded machine kept a v2 configuration and ran on v2
+        # defaults — and nothing reported it, which is how it survived two
+        # releases.
+        "config schema",
+        "migration state",
+        "storage contract",
+        "index identity",
     ]
 
 
@@ -239,3 +249,73 @@ def test_a_source_checkout_is_not_expected_in_the_package_database(monkeypatch):
     monkeypatch.setattr(selfcheck, "_is_packaged", lambda: False)
 
     assert selfcheck.check_recorded_version("3.0.2").skipped
+
+
+# --- the product checks: an installation can be the PREVIOUS product -------
+
+
+def test_a_v2_configuration_is_reported_even_on_a_perfect_installation(tmp_path, monkeypatch):
+    """The defect that survived two releases, stated as a check.
+
+    v3.0.0 and v3.0.1 both shipped a migration nothing invoked, so every
+    upgraded machine had byte-perfect files and a v2 configuration — running on
+    v2 code defaults with the v3 architecture unreachable. Every installation
+    check passed. Nothing looked at the configuration.
+    """
+    import ragtools.config as cfg
+    from ragtools.selfcheck import check_config_schema
+
+    config = tmp_path / "config.toml"
+    config.write_text("version = 2\n", encoding="utf-8")
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: config)
+    monkeypatch.setenv("RAG_CONFIG_PATH", str(config))
+
+    result = check_config_schema()
+
+    assert not result.ok and not result.skipped
+    assert "rag upgrade" in result.detail, "the finding does not name the remedy"
+
+
+def test_no_configuration_file_is_not_a_stale_configuration(tmp_path, monkeypatch):
+    """"Never written one" and "wrote an old one" are different states.
+
+    Collapsing them reports a stale config on every machine that has never
+    written one — a source checkout, a fresh container, a CI runner — which is
+    the same three-state mistake `recorded_version` made, in a new place.
+    """
+    import ragtools.config as cfg
+    from ragtools.selfcheck import check_config_schema
+
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: None)
+
+    assert check_config_schema().skipped
+
+
+def test_a_current_configuration_passes(tmp_path, monkeypatch):
+    import ragtools.config as cfg
+    from ragtools.config import CONFIG_VERSION
+    from ragtools.selfcheck import check_config_schema
+
+    config = tmp_path / "config.toml"
+    config.write_text(f"version = {CONFIG_VERSION}\n", encoding="utf-8")
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: config)
+    monkeypatch.setenv("RAG_CONFIG_PATH", str(config))
+
+    result = check_config_schema()
+
+    assert result.ok and not result.skipped
+
+
+def test_an_unsupported_storage_configuration_is_a_finding(tmp_path, monkeypatch):
+    """`Settings()` refuses it at load, so the check must report that refusal
+    rather than crash on it."""
+    from ragtools.selfcheck import check_storage_contract
+
+    config = tmp_path / "config.toml"
+    config.write_text('version = 3\nstorage_backend = "nonsense"\n', encoding="utf-8")
+    monkeypatch.setenv("RAG_CONFIG_PATH", str(config))
+
+    result = check_storage_contract()
+
+    assert not result.ok and not result.skipped
+    assert "refused" in result.detail

@@ -42,6 +42,15 @@ logger = logging.getLogger("ragtools.config")
 #: name keeps working where it was already imported.
 CONFIG_VERSION = 3
 
+#: The v3 storage contract, stated once and enforced at config load.
+#:
+#: All six combinations are supported: the LAYOUT decides which collections
+#: exist, the ENGINE decides what serves them, and the two compose. Listing them
+#: here rather than in prose means "is this configuration supported?" has an
+#: answer the code can check, and a test can read.
+_SUPPORTED_BACKENDS = frozenset({"embedded", "managed", "external"})
+_SUPPORTED_STRATEGIES = frozenset({"shared", "per_project"})
+
 
 # --- Project Configuration ---
 
@@ -545,6 +554,49 @@ class Settings(BaseSettings):
         # into a secret leak. Ignoring extras fails safe and keeps values silent.
         "extra": "ignore",
     }
+
+    @model_validator(mode="after")
+    def _enforce_storage_contract(self):
+        """Reject an unsupported storage configuration where it enters.
+
+        Both values were already refused further in — `resolve_backend` raises
+        on an unknown engine, `CollectionRouter` on an unknown layout — but only
+        at the moment something needed them. A typo in `config.toml` therefore
+        surfaced deep inside owner construction, as a traceback naming a module
+        the user has never heard of, at the one moment they least want one: the
+        service failing to start after an upgrade.
+
+        Checked here, the message names the file, the key, the bad value and the
+        alternatives, before anything opens a store.
+
+        Every combination of the two IS supported: the layout decides which
+        collections exist, the engine decides what serves them, and they compose.
+        `external` is the one that needs more than a name — a URL it cannot
+        invent. `managed` does not: the service starts the server and fills in
+        `storage_url` afterwards, so requiring it here would refuse a valid
+        configuration.
+        """
+        backend = (self.storage_backend or "").strip().lower()
+        if backend not in _SUPPORTED_BACKENDS:
+            raise ValueError(
+                f"storage_backend={self.storage_backend!r} is not supported; "
+                f"expected one of {', '.join(sorted(_SUPPORTED_BACKENDS))}"
+            )
+
+        strategy = (self.collection_strategy or "").strip().lower()
+        if strategy not in _SUPPORTED_STRATEGIES:
+            raise ValueError(
+                f"collection_strategy={self.collection_strategy!r} is not "
+                f"supported; expected one of {', '.join(sorted(_SUPPORTED_STRATEGIES))}"
+            )
+
+        if backend == "external" and not (self.storage_url or "").strip():
+            raise ValueError(
+                "storage_backend='external' needs storage_url — the address of "
+                "the server you run yourself. ragtools never starts or stops an "
+                "external engine, so it cannot discover one."
+            )
+        return self
 
     @model_validator(mode="after")
     def _anchor_data_dir(self):

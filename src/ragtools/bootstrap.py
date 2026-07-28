@@ -178,6 +178,62 @@ def last_result() -> Optional[BootstrapResult]:
     return _MEMO
 
 
+def _write_document(path: Path, document: dict) -> None:
+    """Serialise fully, then replace atomically, keeping a backup."""
+    import io
+
+    import tomli_w
+
+    from ragtools.atomicio import atomic_write_bytes
+
+    buffer = io.BytesIO()
+    tomli_w.dump(document, buffer)
+    atomic_write_bytes(path, buffer.getvalue(), backup=True)
+
+
+def _create_canonical(result: BootstrapResult, *, allow_write: bool) -> BootstrapResult:
+    """Write the canonical v3 configuration for a clean installation."""
+    from ragtools.config import get_config_write_path
+    from ragtools.upgrade.migrate import canonical_document
+
+    try:
+        target = Path(get_config_write_path())
+    except Exception as exc:  # noqa: BLE001
+        result.error = f"could not choose a configuration path: {exc}"
+        return result
+
+    result.config_path = target
+    result.from_version = 0            # nothing was there
+    document = canonical_document()
+    result.to_version = int(document["version"])
+    result.added_keys = [k for k in document if k not in ("version", "projects")]
+
+    if not allow_write:
+        result.notes.append("read-only caller; no configuration was created")
+        return result
+
+    with _ConfigLock(target) as lock:
+        if not lock.acquired:
+            result.notes.append("another process is creating this configuration")
+            return result
+        if target.is_file():
+            # Someone won the race and wrote it while we waited.
+            result.already_current = True
+            return result
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _write_document(target, document)
+        except Exception as exc:  # noqa: BLE001
+            result.error = f"could not create {target}: {exc}"
+            logger.warning("%s", result.error)
+            return result
+
+    result.migrated = True
+    result.notes.append("clean installation: canonical v3 configuration created")
+    logger.info("Config: created %s at version %s", target, result.to_version)
+    return result
+
+
 def ensure_config_current(*, allow_write: bool = True) -> BootstrapResult:
     """Migrate the configuration file to the current schema if it needs it.
 
@@ -195,10 +251,12 @@ def ensure_config_current(*, allow_write: bool = True) -> BootstrapResult:
         return result
 
     if not path or not Path(path).is_file():
-        # Nothing to migrate. A fresh install has no file until something
-        # writes one, and every writer stamps the current version.
-        result.already_current = True
-        return result
+        # A clean installation. Write the canonical v3 configuration rather
+        # than leaving the file to be created later by whichever writer happens
+        # to run first — those writers stamp a version and nothing else, so a
+        # fresh install ended up with `version = 3` and no storage keys at all,
+        # running on code defaults its own config did not state.
+        return _create_canonical(result, allow_write=allow_write)
 
     path = Path(path)
     result.config_path = path
@@ -240,15 +298,7 @@ def ensure_config_current(*, allow_write: bool = True) -> BootstrapResult:
                 result.already_current = True
                 return result
 
-            import io
-
-            import tomli_w
-
-            from ragtools.atomicio import atomic_write_bytes
-
-            buffer = io.BytesIO()
-            tomli_w.dump(recheck.document, buffer)
-            atomic_write_bytes(path, buffer.getvalue(), backup=True)
+            _write_document(path, recheck.document)
         except Exception as exc:  # noqa: BLE001
             result.error = f"could not write {path}: {exc}"
             logger.warning("%s", result.error)

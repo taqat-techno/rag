@@ -28,6 +28,17 @@ Local-first RAG system over documentation, with **opt-in** source-code and confi
   layout forces a full re-index of every file at first boot; it is offered via
   `rag storage strategy`, never imposed. A config with no projects adopts
   `per_project` because there is nothing to re-index.
+- **A clean install writes the canonical v3 config** (`upgrade.migrate.canonical_document`)
+  — version, engine and layout all stated explicitly, so the file says what the
+  product is doing rather than relying on code defaults.
+- **The storage contract is enforced at config load**, not at first use:
+  engine ∈ {embedded, managed, external}, layout ∈ {shared, per_project}, all six
+  combinations supported, `external` additionally requires `storage_url`.
+  `managed` does NOT — the service starts the server and fills the address in.
+- **A layout change preserves the previous index.** The new layout writes to new
+  collections and nothing drops the old one, so rollback is a config change
+  rather than a restore. `rag storage reclaim` frees the old space afterwards,
+  and refuses while the new layout is still empty.
 
 ### Storage
 - **`storage_backend`** selects the engine: `embedded` (default) | `managed` | `external`.
@@ -136,9 +147,12 @@ rag watch .                       # Auto-index on .md changes (Ctrl+C to stop)
 rag serve                         # Start the MCP server (core + user-enabled optional tools)
 rag version                       # Show version
 rag selfcheck                     # Verify the INSTALLATION (version, autostart targets, stray processes)
+rag upgrade                       # Bring config to the current schema (same code the service runs at startup)
+rag upgrade --dry-run             # Show what would change; write nothing
 rag storage show                  # Which engine and collection layout are actually in force
 rag storage backend managed       # embedded | managed | external — requires a full re-index
 rag storage strategy per_project  # shared | per_project — requires a full re-index
+rag storage reclaim               # Drop collections the current layout no longer uses (after re-index)
 ```
 
 ## Testing

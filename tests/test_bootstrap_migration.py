@@ -187,15 +187,61 @@ def test_an_unreadable_config_degrades_instead_of_raising(tmp_path, monkeypatch)
     assert not result.migrated
 
 
-def test_a_missing_config_is_not_an_error(tmp_path, monkeypatch):
-    """A fresh install has no file until something writes one."""
+def test_a_clean_install_gets_the_canonical_v3_config(tmp_path, monkeypatch):
+    """A missing config is a clean installation, not a no-op.
+
+    This used to return "already current" and write nothing, leaving the file to
+    whichever writer ran first — and those writers stamp a version and nothing
+    else. A fresh install therefore ended up with `version = 3` and no storage
+    keys, running on code defaults its own configuration did not state, so two
+    installs of the same release could behave differently for reasons nothing on
+    disk explained.
+    """
     import ragtools.config as cfg
     from ragtools.bootstrap import ensure_config_current
 
-    monkeypatch.setattr(cfg, "_find_config_path", lambda: tmp_path / "absent.toml")
+    target = tmp_path / "absent.toml"
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: None)
+    monkeypatch.setattr(cfg, "get_config_write_path", lambda: target)
+
     result = ensure_config_current()
 
-    assert result.already_current and not result.degraded
+    assert not result.degraded, result.describe()
+    assert target.is_file(), "no configuration was created for a clean install"
+    document = read(target)
+    assert document["version"] == CONFIG_VERSION
+    assert document["storage_backend"], "the canonical config omits the engine"
+    assert document["collection_strategy"], "the canonical config omits the layout"
+
+
+def test_a_clean_install_adopts_the_v3_layout(tmp_path, monkeypatch):
+    """Nothing is indexed yet, so the v3 layout costs no re-index at all."""
+    import ragtools.config as cfg
+    from ragtools.bootstrap import ensure_config_current
+
+    target = tmp_path / "fresh.toml"
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: None)
+    monkeypatch.setattr(cfg, "get_config_write_path", lambda: target)
+
+    ensure_config_current()
+
+    assert read(target)["collection_strategy"] == "per_project"
+
+
+def test_a_read_only_caller_creates_nothing(tmp_path, monkeypatch):
+    """A read path that materialises the user's configuration as a side effect
+    is the same class of defect as one that rewrites it."""
+    import ragtools.config as cfg
+    from ragtools.bootstrap import ensure_config_current
+
+    target = tmp_path / "absent.toml"
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: None)
+    monkeypatch.setattr(cfg, "get_config_write_path", lambda: target)
+
+    result = ensure_config_current(allow_write=False)
+
+    assert not target.exists()
+    assert not result.migrated and not result.degraded
 
 
 def test_a_read_only_caller_leaves_the_file_alone(v2_config):
@@ -339,3 +385,104 @@ def test_every_entry_point_that_writes_config_runs_the_seam():
     for module, function in (("service/run.py", "main"), ("cli.py", "_get_settings")):
         source = (SRC / module).read_text(encoding="utf-8")
         assert "ensure_config_current_once" in source, f"{module} does not migrate"
+
+
+# --- `rag upgrade` must be the same code, not a second implementation -----
+
+
+def test_rag_upgrade_calls_the_startup_seam(monkeypatch):
+    """One implementation, or they drift until one of them is wrong.
+
+    A separate manual upgrade path is exactly how the automatic and manual
+    routes end up disagreeing — and this project has already shipped two
+    releases in which the migration existed and nothing invoked it. The command
+    must therefore call `ensure_config_current`, not re-derive the work.
+    """
+    import ragtools.bootstrap as bootstrap
+    from typer.testing import CliRunner
+
+    from ragtools.cli import app
+
+    seen = {}
+    real = bootstrap.ensure_config_current
+
+    def watched(*a, **k):
+        seen["called"] = True
+        seen["allow_write"] = k.get("allow_write", True)
+        return real(*a, **k)
+
+    monkeypatch.setattr(bootstrap, "ensure_config_current", watched)
+    CliRunner().invoke(app, ["upgrade"])
+
+    assert seen.get("called"), "rag upgrade does not use the startup seam"
+    assert seen["allow_write"] is True
+
+
+def test_rag_upgrade_dry_run_writes_nothing(tmp_path, monkeypatch):
+    import ragtools.bootstrap as bootstrap
+    import ragtools.config as cfg
+    from typer.testing import CliRunner
+
+    from ragtools.cli import app
+
+    config = tmp_path / "config.toml"
+    config.write_bytes(tomli_w.dumps({
+        "version": 2, "projects": [{"id": "p", "path": str(tmp_path), "mode": "docs"}],
+    }).encode("utf-8"))
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: config)
+    monkeypatch.setattr(cfg, "get_config_write_path", lambda: config)
+    bootstrap._MEMO = None
+
+    before = config.read_bytes()
+    result = CliRunner().invoke(app, ["upgrade", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert config.read_bytes() == before, "a dry run modified the configuration"
+    assert "Dry run" in result.output
+
+
+def test_rag_upgrade_reports_the_architecture_it_left_behind(tmp_path, monkeypatch):
+    """"Migrated" without saying to WHAT is the kind of success message that
+    hides a surprise."""
+    import ragtools.bootstrap as bootstrap
+    import ragtools.config as cfg
+    from typer.testing import CliRunner
+
+    from ragtools.cli import app
+
+    config = tmp_path / "config.toml"
+    config.write_bytes(tomli_w.dumps({
+        "version": 2, "projects": [{"id": "p", "path": str(tmp_path), "mode": "docs"}],
+    }).encode("utf-8"))
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: config)
+    monkeypatch.setattr(cfg, "get_config_write_path", lambda: config)
+    bootstrap._MEMO = None
+
+    result = CliRunner().invoke(app, ["upgrade"])
+
+    assert result.exit_code == 0, result.output
+    assert "engine:" in result.output
+    assert "layout:" in result.output
+
+
+def test_a_failed_upgrade_exits_non_zero(tmp_path, monkeypatch):
+    """A caller scripting this must be able to tell success from failure."""
+    import ragtools.bootstrap as bootstrap
+    import ragtools.config as cfg
+    from typer.testing import CliRunner
+
+    from ragtools.cli import app
+
+    config = tmp_path / "config.toml"
+    config.write_bytes(tomli_w.dumps({"version": 2}).encode("utf-8"))
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: config)
+    monkeypatch.setattr(cfg, "get_config_write_path", lambda: config)
+    bootstrap._MEMO = None
+
+    def refuse(*a, **k):
+        raise PermissionError("read-only volume")
+
+    monkeypatch.setattr("ragtools.atomicio.atomic_write_bytes", refuse)
+    result = CliRunner().invoke(app, ["upgrade"])
+
+    assert result.exit_code == 1, result.output

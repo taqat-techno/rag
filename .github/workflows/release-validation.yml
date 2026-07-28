@@ -180,6 +180,27 @@ jobs:
         # hosted runner provides; keep verifying on one.
         run: python scripts/verify_autostart_lifecycle.py
 
+  storage-backends:
+    name: storage backends (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e .
+      - name: Every engine must fail the same way on every platform
+        # The engine is where "works on my platform" is easiest to believe and
+        # hardest to notice: `embedded` is pure Python, `managed` supervises a
+        # native binary no release bundles, `external` connects to a server the
+        # user runs. Each has a different failure mode, and each must produce
+        # the SAME refusal — or the same explained fallback — on all three.
+        run: python scripts/verify_storage_backends.py
+
   bundle-contract:
     name: built bundle contract (windows)
     runs-on: windows-latest
@@ -303,7 +324,7 @@ jobs:
   gate:
     name: release gate
     needs: [suite, linux-adapter, macos-adapter, clean-install, windows-autostart,
-            bundle-contract, real-upgrade, upgrade-rehearsal]
+            bundle-contract, real-upgrade, upgrade-rehearsal, storage-backends]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

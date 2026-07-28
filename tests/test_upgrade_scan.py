@@ -387,6 +387,36 @@ def test_migration_is_idempotent(tmp_path):
     assert twice.document == once.document
 
 
+def test_migration_is_idempotent_with_a_dependency_catalog(tmp_path):
+    """The input this test used to skip, and the only one that failed.
+
+    `changed` was inferred from `adopted_dependencies`, which is reported on
+    EVERY run because adoption is idempotent — re-adopting an already-adopted
+    catalog still lists it. So a configuration carrying a catalog reported
+    `changed` for ever and was rewritten, with a backup, on every service
+    start. The document was identical each time; only the flag disagreed.
+
+    The version above uses a document with no dependencies, so the one shape
+    that triggers this was the one shape never tried. Found by booting the real
+    application, not by calling the function.
+    """
+    dep = tmp_path / "shared" / "odoo"
+    dep.mkdir(parents=True)
+    doc = _v2_document(tmp_path)
+    doc["projects"][0]["dependency_paths"] = [str(dep)]
+
+    once = migrate_config(doc)
+    twice = migrate_config(once.document)
+
+    assert once.adopted_dependencies, "the fixture no longer exercises adoption"
+    assert twice.adopted_dependencies, "adoption is reported on re-runs, as designed"
+    assert twice.changed is False, (
+        "an already-migrated config still reports a change, so it is rewritten "
+        "on every boot"
+    )
+    assert twice.document == once.document
+
+
 def test_migration_never_writes(tmp_path):
     """It returns the document it WOULD write, so a dry run and a real run
     cannot disagree about what happens."""

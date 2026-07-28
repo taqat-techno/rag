@@ -667,11 +667,30 @@ def selfcheck(
         console.print(format_report(checks))
 
     if broken:
-        console.print(
-            "\n[red]This machine is NOT fully running "
-            f"{expected}.[/red] The most common cause is a process from the "
-            "previous version still running while files were replaced."
-        )
+        console.print(f"\n[red]This machine is NOT fully running {expected}.[/red]")
+        # Name the remedy for what ACTUALLY failed. A fixed sentence blaming a
+        # stale process is wrong — and actively misleading — when the finding is
+        # a configuration still at the previous schema, which is a different
+        # problem with a different one-line fix.
+        names = {check.name for check in broken}
+        if names & {"config schema", "migration state"}:
+            console.print(
+                "  The installation is fine; its CONFIGURATION is not. "
+                "Run `rag upgrade`."
+            )
+        if names & {"storage contract"}:
+            console.print(
+                "  The storage engine or collection layout is not a supported "
+                "combination. Run `rag storage show`."
+            )
+        if names & {"installed version", "windowed executable",
+                    "recorded install version", "running processes",
+                    "autostart targets", "service health version"}:
+            console.print(
+                "  For the installation itself, the most common cause is a "
+                "process from the previous version still running while files "
+                "were replaced. Restart Windows and re-run the installer."
+            )
         raise typer.Exit(1)
 
 
@@ -1324,6 +1343,58 @@ def project_mode(
         console.print(f"[green]Mode set:[/green] {project_id} → {mode}. Run `rag index` to apply.")
 
 
+@app.command()
+def upgrade(
+    dry_run: bool = typer.Option(False, "--dry-run", "-n",
+                                 help="Show what would change; write nothing."),
+):
+    """Bring the configuration to the current schema, and report what changed.
+
+    The SAME implementation the service runs at startup — literally the same
+    call, not a parallel one. A separate upgrade path is how the automatic and
+    manual routes drift until one of them is wrong, and this project already
+    shipped two releases where the migration existed and nothing invoked it.
+
+    Ordinarily there is nothing to do here: every entry point migrates on start.
+    This exists for the cases where that is not enough — a machine whose service
+    will not start, a configuration on a read-only volume that has since been
+    made writable, or simply wanting to see the change before it happens.
+    """
+    from ragtools.bootstrap import ensure_config_current
+    from ragtools.config import Settings
+
+    result = ensure_config_current(allow_write=not dry_run)
+
+    if result.config_path:
+        console.print(f"  config: {result.config_path}")
+    if result.from_version is not None:
+        console.print(f"  schema: v{result.from_version} -> v{result.to_version}")
+    if result.added_keys:
+        console.print(f"  adds:   {', '.join(sorted(result.added_keys))}")
+    for note in result.notes:
+        console.print(f"  note:   {note}")
+
+    if result.degraded:
+        console.print(f"[red]{result.describe()}[/red]")
+        raise typer.Exit(1)
+
+    if dry_run:
+        verb = "would be created" if result.from_version == 0 else (
+            "would be migrated" if not result.already_current else "is already current")
+        console.print(f"[yellow]Dry run:[/yellow] the configuration {verb}.")
+        return
+
+    console.print(f"[green]{result.describe()}[/green]")
+
+    # State what the machine will actually run on. "Migrated" without saying to
+    # what is the kind of success message that hides a surprise.
+    settings = Settings()
+    console.print(f"  engine: {settings.storage_backend}")
+    console.print(f"  layout: {settings.collection_strategy}")
+    if result.migrated:
+        console.print("Restart the service for the new configuration to take effect.")
+
+
 # --- Storage commands ---
 #
 # The storage engine and the collection layout were readable everywhere and
@@ -1394,6 +1465,72 @@ def storage_show():
     console.print(f"  config_version     : {settings.config_version}")
     if settings.storage_url:
         console.print(f"  storage_url        : {settings.storage_url}")
+
+
+@storage_app.command("reclaim")
+def storage_reclaim(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+):
+    """Drop collections the current layout no longer uses.
+
+    The last step of a layout change, and deliberately a SEPARATE one. Changing
+    the layout writes to new collections and leaves the previous index exactly
+    where it was — that is the only rollback the user has, so nothing removes it
+    automatically. Once the new layout is built and trusted, this reclaims the
+    space.
+
+    Refuses while the current layout is empty: an index that has not been built
+    is not one that has been validated, and dropping the old collection then
+    would leave the machine with nothing.
+    """
+    from ragtools.service.owner import QdrantOwner
+
+    settings = _get_settings()
+    if _probe_service(settings):
+        console.print("[yellow]Stop the service first[/yellow] — it owns the store.")
+        raise typer.Exit(1)
+
+    owner = QdrantOwner(settings)
+    try:
+        current = set(owner.router.all_collections())
+        try:
+            existing = {c.name for c in owner._client.get_collections().collections}
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Could not list collections:[/red] {exc}")
+            raise typer.Exit(1)
+
+        live = sum(owner._count_points(name) for name in current)
+        orphaned = sorted(existing - current)
+
+        console.print(f"  layout:  {owner.router.strategy}")
+        console.print(f"  in use:  {len(current)} collection(s), {live:,} points")
+        if not orphaned:
+            console.print("[green]Nothing to reclaim.[/green]")
+            return
+        for name in orphaned:
+            console.print(f"  orphan:  {name} ({owner._count_points(name):,} points)")
+
+        if live == 0:
+            console.print(
+                "[red]Refusing:[/red] the current layout holds no points, so it "
+                "has not been built yet. Run `rag index` first — dropping the "
+                "previous collections now would leave nothing to search."
+            )
+            raise typer.Exit(1)
+
+        if not yes and not typer.confirm(
+                f"Permanently delete {len(orphaned)} collection(s)?", default=False):
+            console.print("Unchanged.")
+            raise typer.Exit(1)
+
+        for name in orphaned:
+            try:
+                owner._client.delete_collection(name)
+                console.print(f"[green]dropped[/green] {name}")
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"[red]could not drop {name}:[/red] {exc}")
+    finally:
+        owner.close()
 
 
 @storage_app.command("backend")

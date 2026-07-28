@@ -83,6 +83,27 @@ class MigrationResult:
     document: dict = field(default_factory=dict)
 
 
+def canonical_document() -> dict:
+    """The configuration a CLEAN installation should have.
+
+    Defined here, next to the migration, so "what a v3 config looks like" has
+    one answer rather than two that drift. A fresh install used to receive
+    ``version = 3`` and nothing else — the storage keys were absent, so the
+    runtime fell back to code defaults and the file did not state what the
+    product was actually doing. Two installs of the same release could then
+    behave differently for reasons nothing on disk explained.
+
+    A new installation has no index, so it takes the v3 layout: adopting it
+    costs nothing when there is nothing to re-index.
+    """
+    return {
+        "version": CONFIG_VERSION,
+        **V3_DEFAULTS,
+        "collection_strategy": LAYOUT_FOR_NEW_INSTALL,
+        "projects": [],
+    }
+
+
 def migrate_config(document: dict) -> MigrationResult:
     """Return the v3 form of a parsed config document. Never writes.
 
@@ -136,11 +157,17 @@ def migrate_config(document: dict) -> MigrationResult:
 
     doc["version"] = CONFIG_VERSION
     result.document = doc
-    result.changed = (
-        result.from_version != CONFIG_VERSION
-        or bool(result.added_keys)
-        or bool(result.adopted_dependencies)
-    )
+    # Whether anything changed is a question about the DOCUMENT, so ask the
+    # document. It used to be inferred from three proxies, and one of them —
+    # `adopted_dependencies` — is reported on every run, because adoption is
+    # idempotent and re-adopting an already-adopted catalog still lists it. So
+    # any configuration carrying a dependency catalog reported `changed` for
+    # ever, and was rewritten (with a backup) on every single service start.
+    #
+    # Caught by the real-boot test rather than by the unit tests: the
+    # idempotence unit test used a document with no dependencies, so the one
+    # input that triggers it was the one input never tried.
+    result.changed = doc != document
     return result
 
 

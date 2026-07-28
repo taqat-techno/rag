@@ -224,8 +224,125 @@ def check_service_health(expect: str, port: int | None = None) -> Check:
                  f"/health reports {running}, expected {expect}")
 
 
+def check_config_schema() -> Check:
+    """The configuration must be at the schema this release reads.
+
+    A machine can be perfectly installed and still be running the previous
+    product: v3.0.0 and v3.0.1 both shipped a migration nothing invoked, so
+    every upgraded installation kept a v2 configuration, fell back to v2 code
+    defaults, and left the v3 architecture unreachable behind a file nobody
+    rewrote. Nothing reported that — which is why it survived two releases.
+    """
+    try:
+        from ragtools.config import CONFIG_VERSION, Settings, _find_config_path
+
+        existing = _find_config_path()
+        found = int(getattr(Settings(), "config_version", 0) or 0)
+    except Exception as exc:  # noqa: BLE001
+        return Check("config schema", True, f"could not read the config: {exc}",
+                     skipped=True)
+
+    # "No configuration file" is not "a configuration at the wrong schema".
+    # Collapsing the two reports a stale config on every machine that has never
+    # written one — a source checkout, a fresh container, a CI runner — which is
+    # the same three-state mistake `recorded_version` made, in a new place.
+    if not existing or not Path(existing).is_file():
+        return Check("config schema", True,
+                     "no configuration file yet", skipped=True)
+
+    if found == CONFIG_VERSION:
+        return Check("config schema", True, f"version {found}")
+    return Check("config schema", False,
+                 f"config is version {found}, this release reads {CONFIG_VERSION} "
+                 f"— run `rag upgrade`")
+
+
+def check_migration_state() -> Check:
+    """Whether this process migrated the configuration, and whether it worked."""
+    try:
+        from ragtools.bootstrap import last_result
+
+        result = last_result()
+    except Exception as exc:  # noqa: BLE001
+        return Check("migration state", True, f"unavailable: {exc}", skipped=True)
+
+    if result is None:
+        return Check("migration state", True,
+                     "no migration ran in this process", skipped=True)
+    return Check("migration state", not result.degraded, result.describe())
+
+
+def check_storage_contract() -> Check:
+    """The engine and layout actually in force, and whether they are supported.
+
+    Reports them even when correct. "Which engine am I really on?" was
+    unanswerable without reading the source, and an operator who cannot see the
+    answer cannot notice it is wrong.
+    """
+    try:
+        from ragtools.config import (
+            _SUPPORTED_BACKENDS,
+            _SUPPORTED_STRATEGIES,
+            Settings,
+        )
+
+        settings = Settings()
+        backend = (settings.storage_backend or "").strip().lower()
+        strategy = (settings.collection_strategy or "").strip().lower()
+    except Exception as exc:  # noqa: BLE001
+        # A Settings() that raises IS the finding — the contract validator
+        # refuses an unsupported configuration at load.
+        return Check("storage contract", False, f"configuration refused: {exc}")
+
+    detail = f"{backend} + {strategy}"
+    ok = backend in _SUPPORTED_BACKENDS and strategy in _SUPPORTED_STRATEGIES
+    return Check("storage contract", ok, detail)
+
+
+def check_index_identity() -> Check:
+    """Does the state DB describe the store this release will write to?
+
+    When it does not, incremental indexing skips files whose hashes match
+    against a store that does not hold them — observed once as
+    "indexed 0, skipped 38286" with ~28k chunks silently missing. Not a failure:
+    a pending re-index is the correct response to a layout change, and saying so
+    is the point.
+    """
+    try:
+        from ragtools.config import Settings
+        from ragtools.index_identity import current_identity, reconcile
+        from ragtools.indexing.state import IndexState
+
+        settings = Settings()
+        if not Path(settings.state_db).exists():
+            return Check("index identity", True, "no index yet", skipped=True)
+
+        state = IndexState(settings.state_db)
+        try:
+            from ragtools.embedding.encoder import Encoder
+
+            identity = current_identity(settings, Encoder(settings.embedding_model).dimension)
+            trustworthy, changed = reconcile(state, identity)
+        finally:
+            state.close()
+    except Exception as exc:  # noqa: BLE001
+        return Check("index identity", True, f"could not be checked: {exc}",
+                     skipped=True)
+
+    if trustworthy:
+        return Check("index identity", True, "state describes the current store")
+    return Check("index identity", True,
+                 f"re-index pending ({', '.join(changed)}) — run `rag index`",
+                 skipped=True)
+
+
 def run_selfcheck(expect_version: str, *, port: int | None = None) -> list[Check]:
-    """Every check, in the order a reader should think about them."""
+    """Every check, in the order a reader should think about them.
+
+    Installation first — is this machine running this release at all — then the
+    configuration and storage that decide what the release actually does. An
+    installation can be byte-perfect and still be the previous product.
+    """
     return [
         check_own_version(expect_version),
         check_windowed_executable(),
@@ -233,6 +350,10 @@ def run_selfcheck(expect_version: str, *, port: int | None = None) -> list[Check
         check_running_processes(),
         check_autostart_targets(),
         check_service_health(expect_version, port),
+        check_config_schema(),
+        check_migration_state(),
+        check_storage_contract(),
+        check_index_identity(),
     ]
 
 
