@@ -27,6 +27,7 @@ def pytest_configure(config):
     os.environ["RAG_CONFIG_PATH"] = str(
         Path(tempfile.gettempdir()) / "ragtools-tests-no-such-config.toml"
     )
+
     # Belt and braces: an ambient value for any of these would point tests at a
     # real engine or a real collection layout.
     for leaky in ("RAG_STORAGE_BACKEND", "RAG_COLLECTION_STRATEGY",
@@ -95,3 +96,31 @@ def _no_real_autostart_registration(request, monkeypatch):
     for cls in (WindowsAdapter, LinuxAdapter, DarwinAdapter):
         monkeypatch.setattr(cls, "install_autostart", _refuse, raising=True)
         monkeypatch.setattr(cls, "remove_autostart", _refuse, raising=True)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_repository_pollution():
+    """No test may leave state in the developer's own data directory.
+
+    A test that constructs a bare ``Settings()`` resolves ``state_db`` — and
+    everything derived from it — relative to the working directory, which during
+    a test run is the repository. One migration test did exactly that and left a
+    real ``data/relayout.db`` behind, after which ``rag selfcheck`` on this
+    machine reported a pending re-index that did not exist.
+
+    Isolating it globally (``RAG_DATA_DIR`` in the environment) looked like the
+    fix and was worse: it marks ``data_dir`` as explicitly set, which defeats the
+    ``_anchor_data_dir`` validator and broke 29 unrelated tests. So the rule is
+    enforced rather than imposed — a test that pollutes fails, and fixes itself
+    by passing an explicit path.
+    """
+    data = Path(__file__).resolve().parents[1] / "data"
+    before = {p.name for p in data.iterdir()} if data.is_dir() else set()
+    yield
+    after = {p.name for p in data.iterdir()} if data.is_dir() else set()
+    created = after - before
+    assert not created, (
+        f"the suite created {sorted(created)} in the repository's data/ "
+        "directory. Pass an explicit state_db/qdrant_path to Settings() in the "
+        "offending test."
+    )

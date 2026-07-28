@@ -15,6 +15,47 @@ _Nothing yet._
 
 ## [3.1.0] — 2026-07-28
 
+### The migration this release performs
+
+An installation upgraded from v2 has no `storage_backend` and no
+`collection_strategy` — because those keys did not exist when its config was
+written, not because anyone chose the values they imply. This release treats
+that absence as a **legacy default to migrate**, not a decision to preserve:
+
+* implicit legacy defaults become **`managed + per_project`**, the recommended
+  v3 architecture (falling back to `embedded` where the packaged engine cannot
+  run, with the reason recorded rather than inferred);
+* an **explicit** value is a decision and is preserved — including an explicit
+  `embedded` or `shared`, and everything describing an external server: url,
+  credentials, ports;
+* `[migration].adopted` records which values the migration chose, because
+  absence is readable exactly once — after the write, nothing can distinguish a
+  value the product picked from one the user did.
+
+**This is a destructive index transition and it takes hours on a real corpus.**
+The old shared index is retired and every project and framework corpus is
+rebuilt under the new layout. While that runs:
+
+* `/health` reports `status: "migrating"` with per-unit counts, named failures
+  and a retry path — it does **not** claim readiness;
+* searches raise rather than returning an empty result. An empty answer from a
+  half-built index is indistinguishable from "your query matched nothing", at
+  the exact moment the content genuinely is not there;
+* a restart resumes: progress is per project and per framework, committed as
+  each finishes, so completed work is never repeated and failed work is never
+  skipped;
+* completion is **validated** before the old storage is deleted — a unit that
+  held points before and holds none after fails validation;
+* `rag upgrade --resume` retries only what is incomplete.
+
+**The managed engine now actually ships.** No previous release packaged a Qdrant
+binary, so `managed` was a mode the product could describe and never enter —
+every attempt fell back to embedded, correctly reporting a reason nobody read.
+The pinned 1.15.5 engine is fetched per platform against checksums committed to
+the repository, and the build fails if it is absent.
+
+
+
 Activates the v3 architecture and makes the Windows upgrade path provable.
 
 The headline defect is that **the v2→v3 configuration migration had never run.**

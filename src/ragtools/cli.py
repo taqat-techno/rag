@@ -1347,6 +1347,8 @@ def project_mode(
 def upgrade(
     dry_run: bool = typer.Option(False, "--dry-run", "-n",
                                  help="Show what would change; write nothing."),
+    resume: bool = typer.Option(False, "--resume",
+                                help="Continue an interrupted or failed re-index."),
 ):
     """Bring the configuration to the current schema, and report what changed.
 
@@ -1362,6 +1364,47 @@ def upgrade(
     """
     from ragtools.bootstrap import ensure_config_current
     from ragtools.config import Settings
+    from ragtools.upgrade import relayout
+
+    if resume:
+        # The supported retry path. Only units that are pending or failed are
+        # attempted, so this is safe to run repeatedly and cheap when there is
+        # nothing left to do.
+        settings = Settings()
+        if _probe_service(settings):
+            console.print("[yellow]The service owns the store[/yellow] — it "
+                          "resumes the rebuild itself on start. Stop it first to "
+                          "run the rebuild here.")
+            raise typer.Exit(1)
+
+        plan = relayout.active_plan(settings)
+        if plan is None:
+            console.print("[green]No migration is pending.[/green]")
+            return
+
+        from ragtools.service.owner import QdrantOwner
+
+        before = relayout.progress(settings, plan)
+        console.print(f"  resuming: {before.describe()}")
+        owner = QdrantOwner(settings)
+        try:
+            report = relayout.run_pending(
+                owner, settings, plan_id=plan,
+                progress_cb=lambda unit, phase: (
+                    console.print(f"  rebuilding {unit.kind} {unit.unit_id}...")
+                    if phase == "start" else None),
+            )
+        finally:
+            owner.close()
+
+        console.print(report.describe())
+        for kind, unit_id, error in report.failures:
+            console.print(f"  [red]{kind} {unit_id}[/red]: {error}")
+        if not report.complete:
+            console.print("[yellow]Re-run `rag upgrade --resume` once the cause "
+                          "is fixed — completed work is not repeated.[/yellow]")
+            raise typer.Exit(1)
+        return
 
     result = ensure_config_current(allow_write=not dry_run)
 

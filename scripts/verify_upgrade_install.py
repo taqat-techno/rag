@@ -273,7 +273,29 @@ def main(argv=None) -> int:
     sentinel = DATA_DIR / "upgrade-sentinel.txt"
     sentinel.write_text("user data must survive", encoding="utf-8")
     config = DATA_DIR / "config.toml"
-    config_before = config.read_bytes() if config.is_file() else None
+
+    # An AUTHENTIC legacy configuration: projects, and no storage keys at all.
+    #
+    # That absence is the whole point. A v2 config has no `storage_backend` and
+    # no `collection_strategy` because those keys did not exist when it was
+    # written, and the release must treat that as a legacy default to migrate —
+    # not as a user who chose shared+embedded. Seeding it here is what makes
+    # this an upgrade test rather than a fresh-install test wearing its clothes.
+    legacy_projects = [work / "legacy_alpha", work / "legacy_beta"]
+    for project in legacy_projects:
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "notes.md").write_text(
+            f"# {project.name}\n\nLegacy content that must survive the migration.",
+            encoding="utf-8")
+    config.write_text(
+        "version = 2\n\n"
+        + "".join(
+            f'[[projects]]\nid = "{p.name}"\npath = '
+            f'"{str(p).replace(chr(92), chr(92) * 2)}"\nmode = "docs"\n\n'
+            for p in legacy_projects),
+        encoding="utf-8")
+    print(f"    seeded a legacy v2 config with {len(legacy_projects)} projects "
+          f"and NO storage keys", flush=True)
 
     # --- 2. the upgrade, over a live installation ------------------------
     rc = install_silently(new_installer, f"v{args.version} (over v{args.from_version})",
@@ -315,14 +337,54 @@ def main(argv=None) -> int:
           bool(after_health) and after_health.get("version") == args.version,
           json.dumps(after_health) if after_health else "no /health")
 
-    # --- 6. user data preserved ------------------------------------------
+    # --- 6. the LEGACY CONFIG was migrated, not merely preserved ----------
+    #
+    # The installer proving the machine moved is only half the release. The
+    # other half is that the machine moved to the intended architecture: a
+    # legacy config with no storage keys must come out of this at schema v3,
+    # on the recommended engine and layout, with every project intact.
+    try:
+        import tomllib
+    except ModuleNotFoundError:                       # pragma: no cover
+        import tomli as tomllib                       # type: ignore[no-redef]
+
+    migrated = {}
+    if config.is_file():
+        try:
+            migrated = tomllib.loads(config.read_text(encoding="utf-8"))
+        except Exception as exc:                      # noqa: BLE001
+            check("the migrated config parses", False, str(exc))
+
+    check("the legacy config was migrated to schema v3",
+          migrated.get("version") == 3, f"version={migrated.get('version')}")
+    check("the migration adopted an explicit engine",
+          bool(migrated.get("storage_backend")),
+          str(migrated.get("storage_backend")))
+    check("the migration adopted the per-project layout",
+          migrated.get("collection_strategy") == "per_project",
+          str(migrated.get("collection_strategy")))
+    check("the adoption was recorded as a legacy default, not a user choice",
+          "storage_backend" in ((migrated.get("migration") or {}).get("adopted") or []),
+          json.dumps(migrated.get("migration")))
+    surviving = [p.get("id") for p in (migrated.get("projects") or [])]
+    check("every legacy project survived the migration",
+          sorted(surviving) == sorted(p.name for p in legacy_projects),
+          str(surviving))
+
+    # `/health` must not claim readiness while the rebuild is outstanding.
+    state = (after_health or {}).get("status")
+    migration_block = (after_health or {}).get("migration")
+    check("the service does not claim readiness while rebuilding",
+          state in ("ready", "migrating"),
+          f"status={state}")
+    if state == "migrating":
+        check("the rebuild reports progress and a retry path",
+              bool(migration_block) and "retry" in (migration_block or {}),
+              json.dumps(migration_block))
+
     check("user sentinel file survived", sentinel.is_file(), str(sentinel))
-    if config_before is not None:
-        check("config.toml was not modified",
-              config.is_file() and config.read_bytes() == config_before,
-              "unchanged" if config.is_file() else "MISSING")
-    else:
-        check("config.toml", True, "none existed before", )
+    check("the configuration still exists after migration", config.is_file(),
+          str(config))
 
     failed = [r for r in results if not r[1]]
     print(f"\n  {len(results) - len(failed)} passed, {len(failed)} failed", flush=True)

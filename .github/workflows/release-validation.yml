@@ -201,6 +201,31 @@ jobs:
         # the SAME refusal — or the same explained fallback — on all three.
         run: python scripts/verify_storage_backends.py
 
+  posix-upgrade:
+    name: packaged upgrade (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[build]"
+      - name: Build the packaged bundle
+        # `--no-model` keeps this to minutes; the embedding model contributes
+        # nothing to a config-migration and lifecycle test. The ENGINE is not
+        # skipped, because whether it ships is one of the things under test.
+        run: python scripts/build.py --no-model
+      - name: Migrate a legacy install and check the lifecycle
+        # Windows had a real packaged-upgrade test long before these did, for
+        # the ordinary reason: that is where the failures were. But "we only
+        # broke it on Windows" is a statement about where we looked, and the
+        # migration this release performs is platform-neutral code.
+        run: python scripts/verify_posix_upgrade.py --bundle dist/rag
+
   bundle-contract:
     name: built bundle contract (windows)
     runs-on: windows-latest
@@ -292,6 +317,13 @@ jobs:
             --version ${{ steps.version.outputs.version }} `
             --from-version ${{ matrix.from }}
 
+      - name: Fire the at-logon tasks the installer just registered
+        # Here, and not in a job of its own, because here the tasks are the ones
+        # the real installer created — pointing at the real `ragw.exe`. A
+        # standalone job would have to register a stand-in, which makes the
+        # "targets the windowless executable" assertion assert nothing.
+        run: python scripts/verify_logon_lifecycle.py
+
       - name: Run the REAL uninstaller and sweep for residue
         # Not `continue-on-error`. The release rule is that uninstall and
         # residue validations must PASS; a step that cannot fail does not pass,
@@ -324,7 +356,8 @@ jobs:
   gate:
     name: release gate
     needs: [suite, linux-adapter, macos-adapter, clean-install, windows-autostart,
-            bundle-contract, real-upgrade, upgrade-rehearsal, storage-backends]
+            bundle-contract, real-upgrade, upgrade-rehearsal, storage-backends,
+            posix-upgrade]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

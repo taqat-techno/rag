@@ -66,6 +66,9 @@ class BootstrapResult:
     #: still starts; this is what it reports.
     error: Optional[str] = None
     config_path: Optional[Path] = None
+    #: Plan id when this migration changed the architecture and therefore owes a
+    #: full re-index. None when nothing needs rebuilding.
+    relayout_plan: Optional[int] = None
 
     @property
     def degraded(self) -> bool:
@@ -191,6 +194,40 @@ def _write_document(path: Path, document: dict) -> None:
     atomic_write_bytes(path, buffer.getvalue(), backup=True)
 
 
+def _open_relayout(result: BootstrapResult, migration) -> None:
+    """Record what must be rebuilt, using the configuration as it is NOW.
+
+    Best-effort by design: a machine that cannot open the plan store must still
+    start. The consequence of failing here is a migration that runs without
+    progress tracking, which is worse than one that runs with it and far better
+    than a service that refuses to boot.
+    """
+    try:
+        from ragtools.config import Settings
+        from ragtools.upgrade import relayout
+
+        before = Settings()          # the pre-migration architecture
+        inventory = relayout.capture_inventory(before)
+        if not inventory:
+            result.notes.append("nothing was indexed, so no rebuild is required")
+            return
+
+        plan = relayout.begin(
+            before, inventory,
+            from_backend=before.storage_backend,
+            to_backend=str(migration.document.get("storage_backend")),
+            from_strategy=before.collection_strategy,
+            to_strategy=str(migration.document.get("collection_strategy")),
+        )
+        result.relayout_plan = plan
+        result.notes.append(
+            f"a full re-index is required and has been planned as {inventory.describe()}"
+            f"; the product reports itself unready until it completes")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not open a relayout plan: %s", exc)
+        result.notes.append(f"re-index tracking unavailable: {exc}")
+
+
 def _create_canonical(result: BootstrapResult, *, allow_write: bool) -> BootstrapResult:
     """Write the canonical v3 configuration for a clean installation."""
     from ragtools.config import get_config_write_path
@@ -223,6 +260,7 @@ def _create_canonical(result: BootstrapResult, *, allow_write: bool) -> Bootstra
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             _write_document(target, document)
+
         except Exception as exc:  # noqa: BLE001
             result.error = f"could not create {target}: {exc}"
             logger.warning("%s", result.error)
@@ -297,6 +335,23 @@ def ensure_config_current(*, allow_write: bool = True) -> BootstrapResult:
             if not recheck.changed:
                 result.already_current = True
                 return result
+
+            # OPEN THE RELAYOUT PLAN BEFORE THE CONFIG CHANGES.
+            #
+            # Adopting the recommended architecture makes the old index
+            # unreachable — the router will answer with different collections
+            # the moment this file is written. What has to be rebuilt is a fact
+            # about the OLD installation, so it is recorded while the old
+            # installation is still the current one. Captured afterwards, the
+            # inventory would describe the new, empty layout and the migration
+            # would declare itself complete having rebuilt nothing.
+            #
+            # If the process dies between here and the write, the next start
+            # finds a plan whose units are all pending against a config that
+            # never changed — which re-runs the same migration and replaces the
+            # plan. Harmless, and the safe direction to fail in.
+            if recheck.adopted_defaults:
+                _open_relayout(result, recheck)
 
             _write_document(path, recheck.document)
         except Exception as exc:  # noqa: BLE001

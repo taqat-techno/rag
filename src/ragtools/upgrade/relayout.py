@@ -175,28 +175,37 @@ def _connect(settings) -> sqlite3.Connection:
 # --- capture, which must happen before anything is destroyed --------------
 
 
-def capture_inventory(owner) -> Inventory:
+def capture_inventory(settings, owner=None) -> Inventory:
     """What the CURRENT index holds, as the list of things to rebuild.
+
+    Takes SETTINGS, not an owner, deliberately. The inventory has to be captured
+    before the configuration changes, and an owner cannot exist that early —
+    constructing one is what opens the store and creates collections for the new
+    layout. Making this need an owner would force the capture to happen after the
+    thing it is capturing has already been replaced.
 
     Read from the state DB rather than from Qdrant: the state DB knows which
     project each file belonged to, which is the unit of work, whereas a
-    collection only knows points. A project configured but never indexed is
-    deliberately included — it is part of the inventory to validate, and
-    re-indexing it is cheap.
+    collection only knows points. It is also independent of the collection
+    layout, so it answers the same before and after the switch.
+
+    A project configured but never indexed is deliberately included — it is part
+    of the inventory to validate, and re-indexing it is cheap.
     """
     from ragtools.indexing.state import IndexState
 
     units: list[Unit] = []
     total = 0
 
-    try:
-        total, _per = owner._collection_points()
-    except Exception:  # noqa: BLE001 — a count we cannot take is not a blocker
-        total = 0
+    if owner is not None:
+        try:
+            total, _per = owner._collection_points()
+        except Exception:  # noqa: BLE001 — a count we cannot take is not a blocker
+            total = 0
 
     seen: set[str] = set()
     try:
-        state = IndexState(owner.settings.state_db)
+        state = IndexState(settings.state_db)
         try:
             summary = state.get_summary()
             for project_id in summary.get("projects") or []:
@@ -212,7 +221,7 @@ def capture_inventory(owner) -> Inventory:
     # Configured but never indexed still belongs in the inventory: the
     # transition must leave every configured project queryable, and "it had no
     # rows before" is not a reason to skip validating it afterwards.
-    for project in getattr(owner.settings, "enabled_projects", []) or []:
+    for project in getattr(settings, "enabled_projects", []) or []:
         if project.id not in seen:
             units.append(Unit(KIND_PROJECT, project.id, 0))
             seen.add(project.id)
@@ -220,7 +229,7 @@ def capture_inventory(owner) -> Inventory:
     # Framework corpora are indexed once and shared; they are units in their own
     # right because a project linking one is not responsible for rebuilding it.
     try:
-        frameworks = owner._frameworks
+        frameworks = getattr(owner, "_frameworks", None) if owner else None
         if frameworks is not None:
             for record in frameworks.all_frameworks():
                 units.append(Unit(KIND_FRAMEWORK, str(record.get("id") or record),
@@ -261,7 +270,16 @@ def begin(settings, inventory: Inventory, *, from_backend: str, to_backend: str,
 
 
 def active_plan(settings) -> Optional[int]:
-    """The running plan, or None. This is what "am I ready?" consults."""
+    """The running plan, or None. This is what "am I ready?" consults.
+
+    Asks WITHOUT creating anything. `_connect` runs the schema script, so
+    connecting to find out whether a plan exists brings the database into being
+    as a side effect of the question — and on a machine that has never migrated,
+    every readiness check and every `selfcheck` would leave a file behind. It
+    did exactly that in this repository's own data directory during a test run.
+    """
+    if not _db_path(settings).exists():
+        return None
     try:
         conn = _connect(settings)
     except Exception:  # noqa: BLE001 — no store means no migration in flight
@@ -277,6 +295,8 @@ def active_plan(settings) -> Optional[int]:
 
 def progress(settings, plan_id: Optional[int] = None) -> Optional[Progress]:
     """Per-unit state, for reporting and for deciding what is left to do."""
+    if not _db_path(settings).exists():
+        return None
     conn = _connect(settings)
     try:
         if plan_id is None:
@@ -397,3 +417,81 @@ def obsolete_collections(owner) -> list[str]:
     except Exception:  # noqa: BLE001
         return []
     return sorted(existing - current)
+
+
+def run_pending(owner, settings, *, plan_id: Optional[int] = None,
+                progress_cb=None) -> Progress:
+    """Rebuild every unit that is not already done, then validate and finish.
+
+    Idempotent and resumable: it asks the plan what is left rather than assuming
+    it starts from the beginning, so a restart halfway through an eight-hour
+    migration continues instead of repeating.
+
+    One unit failing does not stop the others. A migration that aborts on the
+    first bad project leaves every later project unindexed AND unreported, which
+    is strictly worse than finishing the ones that can finish and naming the one
+    that could not.
+    """
+    plan_id = plan_id if plan_id is not None else active_plan(settings)
+    if plan_id is None:
+        return Progress(plan_id=-1, status=PLAN_COMPLETE)
+
+    todo = units_to_do(settings, plan_id)
+    logger.info("relayout plan %s: %d unit(s) to rebuild", plan_id, len(todo))
+
+    for unit in todo:
+        if progress_cb:
+            try:
+                progress_cb(unit, "start")
+            except Exception:  # noqa: BLE001 — reporting must not break the work
+                pass
+        try:
+            if unit.kind == KIND_PROJECT:
+                owner.run_full_index(project_id=unit.unit_id)
+                after = _points_for_project(owner, unit.unit_id)
+            else:
+                owner.sync_frameworks(refresh=True)
+                after = 0
+            mark(settings, plan_id, unit, STATUS_DONE, points_after=after)
+            logger.info("relayout: %s %s rebuilt (%s points)",
+                        unit.kind, unit.unit_id, after)
+        except Exception as exc:  # noqa: BLE001 — record and carry on
+            mark(settings, plan_id, unit, STATUS_FAILED, error=f"{type(exc).__name__}: {exc}")
+            logger.warning("relayout: %s %s FAILED: %s", unit.kind, unit.unit_id, exc)
+        if progress_cb:
+            try:
+                progress_cb(unit, "done")
+            except Exception:  # noqa: BLE001
+                pass
+
+    ok, problems = validate(owner, settings, plan_id)
+    if ok:
+        _retire_old_storage(owner)
+        finalize(settings, plan_id)
+    else:
+        for problem in problems:
+            logger.warning("relayout not complete: %s", problem)
+
+    return progress(settings, plan_id) or Progress(plan_id=plan_id, status=PLAN_RUNNING)
+
+
+def _points_for_project(owner, project_id: str) -> int:
+    try:
+        return int(owner._count_points(owner.router.collection_for(project_id)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _retire_old_storage(owner) -> None:
+    """Delete what the new layout does not use — only after validation passed.
+
+    This is the destructive step, and it is deliberately the LAST one. Deleting
+    the old collection before the new one is proven leaves a machine with
+    neither.
+    """
+    for name in obsolete_collections(owner):
+        try:
+            owner._client.delete_collection(name)
+            logger.info("relayout: retired obsolete collection %s", name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("relayout: could not retire %s: %s", name, exc)

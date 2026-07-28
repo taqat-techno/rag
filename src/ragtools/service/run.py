@@ -92,8 +92,37 @@ def _post_startup(settings: Settings, from_scheduler: bool) -> None:
             from ragtools.service.app import get_owner, get_settings
             from ragtools.service.activity import log_activity
 
-            # Guard: do not run sync if no projects loaded (may be config load failure)
             s = get_settings()
+
+            # A pending layout migration takes priority over an incremental
+            # sync, and completes it before anything else runs.
+            #
+            # Resumed rather than restarted: `run_pending` asks the plan what is
+            # left, so a reboot four hours into an eight-hour rebuild continues
+            # from where it stopped. Until it finishes, /health reports
+            # `migrating` and searches refuse rather than answering from a
+            # half-built index.
+            from ragtools.upgrade import relayout
+
+            plan = relayout.active_plan(s)
+            if plan is not None:
+                log_activity("warning", "indexer",
+                             "Layout migration in progress — rebuilding every "
+                             "project and framework under the new collection layout")
+                logger.warning("Relayout plan %s is active; rebuilding", plan)
+                report = relayout.run_pending(get_owner(), s, plan_id=plan)
+                if report.complete:
+                    log_activity("success", "indexer", report.describe())
+                    logger.info("%s", report.describe())
+                else:
+                    log_activity("error", "indexer",
+                                 f"{report.describe()} — retry with `rag upgrade --resume`")
+                    for kind, unit_id, error in report.failures:
+                        logger.error("relayout failed for %s %s: %s",
+                                     kind, unit_id, error)
+                return
+
+            # Guard: do not run sync if no projects loaded (may be config load failure)
             if not s.projects:
                 log_activity("warning", "indexer", "Startup sync skipped: no projects configured (check config path)")
                 logger.warning("Startup sync skipped — no projects in config. Config may not have loaded correctly.")

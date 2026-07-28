@@ -41,6 +41,24 @@ def _clear_memo():
     bootstrap._MEMO = None
 
 
+@pytest.fixture(autouse=True)
+def _isolated_state(tmp_path, monkeypatch):
+    """Point the INDEX state at a sandbox, per test.
+
+    Migration reads the index state to work out what a re-index would have to
+    rebuild. With a default `state_db` that read reaches the developer's real
+    `data/index_state.db`, finds their actual projects, and opens a relayout
+    plan in their repository — which then makes `rag selfcheck` on that machine
+    report a pending re-index that does not exist.
+
+    Scoped to this file rather than set globally: exporting `RAG_DATA_DIR` for
+    the whole session marks `data_dir` as explicitly set, which defeats the
+    `_anchor_data_dir` validator and broke 29 unrelated tests.
+    """
+    monkeypatch.setenv("RAG_STATE_DB", str(tmp_path / "isolated_state.db"))
+    monkeypatch.setenv("RAG_QDRANT_PATH", str(tmp_path / "isolated_qdrant"))
+
+
 @pytest.fixture
 def v2_config(tmp_path, monkeypatch):
     """A realistic v2 file, with the seam pointed at it."""
@@ -282,7 +300,12 @@ def test_the_product_refuses_to_look_ready_while_the_index_is_rebuilding(v2_conf
     from ragtools.upgrade.relayout import Inventory, MigrationInProgress, Unit
 
     ensure_config_current()
-    settings = Settings()
+    # An explicit state_db: a bare Settings() resolves it relative to the
+    # working directory, so this test wrote a real `data/relayout.db` into the
+    # repository — after which `rag selfcheck` on the developer's machine
+    # reported a pending re-index that did not exist.
+    settings = Settings(state_db=str(v2_config.parent / "state.db"),
+                        qdrant_path=str(v2_config.parent / "qdrant"))
 
     relayout.begin(settings,
                    Inventory(units=[Unit(relayout.KIND_PROJECT, "p1", 500)]),

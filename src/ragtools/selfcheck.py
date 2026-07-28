@@ -336,6 +336,39 @@ def check_index_identity() -> Check:
                  skipped=True)
 
 
+def check_reindex_state() -> Check:
+    """A migration that stopped half-way is a FAILURE, not a status line.
+
+    The machine is then running a v3 configuration over an index that was never
+    rebuilt for it: some projects present, some absent, and every query against
+    the missing ones answering "no matches" in the ordinary, reassuring shape.
+    Left as an informational note it would be read as progress and ignored — so
+    it fails, names the units, and names the retry.
+    """
+    try:
+        from ragtools.config import Settings
+        from ragtools.upgrade import relayout
+
+        settings = Settings()
+        plan = relayout.active_plan(settings)
+        if plan is None:
+            return Check("reindex state", True, "no migration pending")
+        report = relayout.progress(settings, plan)
+    except Exception as exc:  # noqa: BLE001
+        return Check("reindex state", True, f"could not be checked: {exc}",
+                     skipped=True)
+
+    if report is None or report.complete:
+        return Check("reindex state", True, "no migration pending")
+
+    detail = report.describe()
+    if report.failures:
+        named = "; ".join(f"{k} {i}: {e}" for k, i, e in report.failures[:3])
+        detail += f" — {named}"
+    return Check("reindex state", False,
+                 f"{detail}. Retry with `rag upgrade --resume`")
+
+
 def run_selfcheck(expect_version: str, *, port: int | None = None) -> list[Check]:
     """Every check, in the order a reader should think about them.
 
@@ -354,6 +387,7 @@ def run_selfcheck(expect_version: str, *, port: int | None = None) -> list[Check
         check_migration_state(),
         check_storage_contract(),
         check_index_identity(),
+        check_reindex_state(),
     ]
 
 

@@ -144,6 +144,7 @@ def test_a_full_run_covers_every_documented_check():
         "migration state",
         "storage contract",
         "index identity",
+        "reindex state",
     ]
 
 
@@ -319,3 +320,79 @@ def test_an_unsupported_storage_configuration_is_a_finding(tmp_path, monkeypatch
 
     assert not result.ok and not result.skipped
     assert "refused" in result.detail
+
+
+def test_a_stalled_migration_is_a_failure_not_a_status_line(tmp_path, monkeypatch):
+    """Gate 5. An unmigrated legacy config reaching steady state must FAIL.
+
+    The machine is then running a v3 configuration over an index that was never
+    rebuilt for it: some projects present, some absent, and every query against
+    a missing one answering "no matches" in the ordinary, reassuring shape. Left
+    as an informational note this reads as progress and gets ignored.
+    """
+    from ragtools.config import Settings
+    from ragtools.selfcheck import check_reindex_state
+    from ragtools.upgrade import relayout
+    from ragtools.upgrade.relayout import Inventory, Unit
+
+    monkeypatch.setenv("RAG_STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("RAG_QDRANT_PATH", str(tmp_path / "qdrant"))
+    settings = Settings()
+
+    relayout.begin(settings,
+                   Inventory(units=[Unit(relayout.KIND_PROJECT, "alpha", 500),
+                                    Unit(relayout.KIND_PROJECT, "beta", 300)]),
+                   from_backend="embedded", to_backend="managed",
+                   from_strategy="shared", to_strategy="per_project")
+
+    result = check_reindex_state()
+
+    assert not result.ok and not result.skipped, result
+    assert "rag upgrade --resume" in result.detail, (
+        "the failure does not name the supported retry path"
+    )
+
+
+def test_a_failed_unit_is_named_in_the_finding(tmp_path, monkeypatch):
+    """"Something failed" is not actionable; the project and the error are."""
+    from ragtools.config import Settings
+    from ragtools.selfcheck import check_reindex_state
+    from ragtools.upgrade import relayout
+    from ragtools.upgrade.relayout import STATUS_FAILED, Inventory, Unit
+
+    monkeypatch.setenv("RAG_STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("RAG_QDRANT_PATH", str(tmp_path / "qdrant"))
+    settings = Settings()
+
+    plan = relayout.begin(
+        settings, Inventory(units=[Unit(relayout.KIND_PROJECT, "beta", 300)]),
+        from_backend="embedded", to_backend="managed",
+        from_strategy="shared", to_strategy="per_project")
+    relayout.mark(settings, plan, Unit(relayout.KIND_PROJECT, "beta"),
+                  STATUS_FAILED, error="permission denied")
+
+    result = check_reindex_state()
+
+    assert not result.ok
+    assert "beta" in result.detail and "permission denied" in result.detail
+
+
+def test_a_completed_migration_passes(tmp_path, monkeypatch):
+    from ragtools.config import Settings
+    from ragtools.selfcheck import check_reindex_state
+    from ragtools.upgrade import relayout
+    from ragtools.upgrade.relayout import STATUS_DONE, Inventory, Unit
+
+    monkeypatch.setenv("RAG_STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("RAG_QDRANT_PATH", str(tmp_path / "qdrant"))
+    settings = Settings()
+
+    plan = relayout.begin(
+        settings, Inventory(units=[Unit(relayout.KIND_PROJECT, "alpha", 1)]),
+        from_backend="embedded", to_backend="managed",
+        from_strategy="shared", to_strategy="per_project")
+    relayout.mark(settings, plan, Unit(relayout.KIND_PROJECT, "alpha"),
+                  STATUS_DONE, points_after=1)
+    relayout.finalize(settings, plan)
+
+    assert check_reindex_state().ok
