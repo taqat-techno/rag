@@ -325,6 +325,33 @@ def main(argv=None) -> int:
           not wrong and bool(targets), json.dumps(wrong) if wrong else f"{targets}")
 
     # --- 4. the product's own verdict ------------------------------------
+    #
+    # WAIT for the rebuild first. A legacy config migrates to a new collection
+    # layout, and the index for it does not exist until the service has rebuilt
+    # every project — so `selfcheck` correctly FAILS in the meantime, reporting
+    # `reindex state: 0/2 rebuilt`. Asserting readiness before that finishes
+    # tests the wrong instant: it turns the machinery working as designed into a
+    # failure, and would push someone to weaken the check that is telling the
+    # truth.
+    #
+    # Waiting also makes this the stronger assertion. It proves the whole
+    # lifecycle — migrate, rebuild, become ready — instead of only the first step.
+    deadline = time.monotonic() + 900
+    last = None
+    while time.monotonic() < deadline:
+        last = health()
+        if not last or last.get("status") != "migrating":
+            break
+        done = (last.get("migration") or {}).get("done")
+        total = (last.get("migration") or {}).get("total")
+        print(f"    rebuilding after migration: {done}/{total}", flush=True)
+        time.sleep(10)
+
+    migration = (last or {}).get("migration") or {}
+    check("the post-migration rebuild completed",
+          (last or {}).get("status") != "migrating",
+          json.dumps(migration) if migration else "no migration was pending")
+
     selfcheck = run([str(install / "rag.exe"), "selfcheck",
                      "--expect-version", args.version], timeout=600)
     check("rag selfcheck passes", selfcheck.returncode == 0,

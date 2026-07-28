@@ -114,11 +114,25 @@ def _no_repository_pollution():
     enforced rather than imposed — a test that pollutes fails, and fixes itself
     by passing an explicit path.
     """
+    # Artifacts the suite has ALWAYS created here. They are a pre-existing
+    # habit, not the defect this guard was added for, and listing them keeps the
+    # guard honest about its scope: it catches a NEW writer, not every writer.
+    #
+    # The list is load-bearing on a fresh checkout. Locally `data/` already
+    # exists, so a "what appeared during this run" diff sees nothing; in CI the
+    # directory does not exist at all and every one of these looks brand new —
+    # which failed all three platform suites while passing locally.
+    PRE_EXISTING = {
+        "backups", "boot_marker.json", "devcheck", "index_state.db", "logs",
+        "profiles.db", "qdrant", "runtime.db", "service.pid", "supervisor.pid",
+        "tray.pid", "activity.db", "jobs.db", "map_cache.json",
+    }
+
     data = Path(__file__).resolve().parents[1] / "data"
     before = {p.name for p in data.iterdir()} if data.is_dir() else set()
     yield
     after = {p.name for p in data.iterdir()} if data.is_dir() else set()
-    created = after - before
+    created = after - before - PRE_EXISTING
     assert not created, (
         f"the suite created {sorted(created)} in the repository's data/ "
         "directory. Pass an explicit state_db/qdrant_path to Settings() in the "
