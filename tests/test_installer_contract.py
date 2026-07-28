@@ -421,8 +421,10 @@ def test_every_owned_image_is_still_covered(script):
     body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
                      re.DOTALL | re.MULTILINE)
     assert body
-    for image in ("rag.exe", "ragw.exe", "qdrant.exe"):
-        assert image in body.group(0), f"{image} is no longer stopped"
+    # Base names, because that is what `Get-Process -Name` matches. The
+    # comments still carry the filenames for the reader.
+    for name in ("rag", "ragw", "qdrant"):
+        assert re.search(rf"'{name}'", body.group(0)), f"{name} is no longer stopped"
 
 
 def test_processes_are_matched_by_base_name_not_filename(script):
@@ -446,9 +448,14 @@ def test_processes_are_matched_by_base_name_not_filename(script):
         "process names are passed with their .exe extension, which matches "
         f"nothing: {invocation.group(0).strip()}"
     )
-    assert "RemoveFileExt" in text, (
-        "base names are hard-coded rather than derived, so the list of owned "
-        "images and the list actually killed can drift apart"
+    # The declared list and the list actually passed to Get-Process must be
+    # the same one — that is what stops them drifting apart.
+    declared = re.findall(r"Images\[\d\]\s*:=\s*'([^']+)'", text)
+    assert declared == ["rag", "ragw", "qdrant"], (
+        f"the owned-process list changed shape: {declared}"
+    )
+    assert all("." not in name for name in declared), (
+        f"process names carry a file extension, which matches nothing: {declared}"
     )
 
 
@@ -463,4 +470,63 @@ def test_the_kill_needs_no_nested_double_quotes(script):
     assert '""' not in body.group(0), (
         "the kill embeds escaped double quotes, whose survival depends on every "
         "layer agreeing about escaping"
+    )
+
+
+# --- F6: the [Code] section must only call functions that exist -----------
+
+
+#: Inno Setup Pascal Script support functions this installer relies on.
+#:
+#: Curated deliberately rather than generated: the point is that adding a NEW
+#: name is a decision someone has to make consciously, having checked it against
+#: Inno's "Support Functions Reference". Every entry here has compiled.
+INNO_BUILTINS = {
+    "AddBackslash", "ChangeFileExt", "DelTree", "DirExists", "Exec",
+    "ExecAsOriginalUser", "ExpandConstant", "ExtractFileDir", "ExtractFileExt",
+    "ExtractFileName", "ExtractFilePath", "FileCopy", "FileExists",
+    "ForceDirectories", "GetDateTimeString", "IntToStr", "Length", "LowerCase",
+    "MsgBox", "Pos", "RegQueryStringValue", "RegWriteStringValue",
+    "RemoveBackslash", "SetLength", "Sleep", "StringChangeEx", "Trim",
+    "UpperCase", "Copy", "IsAdminLoggedOn", "GetEnv", "SuppressibleMsgBox",
+}
+
+#: Pascal keywords that can be followed by a parenthesis.
+_PASCAL_KEYWORDS = {
+    "if", "then", "else", "begin", "end", "for", "while", "do", "and", "or",
+    "not", "var", "to", "case", "of", "array", "function", "procedure", "div",
+    "mod", "in", "repeat", "until", "with", "const", "type", "record",
+}
+
+
+def _pascal_code_only(script: str) -> str:
+    """`[Code]`, with comments AND string literals removed.
+
+    String literals matter: this installer builds PowerShell commands as Pascal
+    strings, so `$p.Kill()` and `.StartsWith(...)` appear as text. Extracting
+    identifiers without stripping them reports PowerShell methods as missing
+    Pascal functions.
+    """
+    body = _code_section(script)
+    return re.sub(r"'(?:[^']|'')*'", "''", body)
+
+
+def test_the_code_section_calls_only_functions_that_exist(script):
+    """Catch an unknown identifier here, not twenty-five minutes into CI.
+
+    `RemoveFileExt` looked like the obvious way to turn `rag.exe` into `rag`.
+    It does not exist in Pascal Script, and nothing said so until ISCC failed
+    on a hosted runner after a full PyInstaller build — one wasted cycle for a
+    fault that is visible in the source.
+    """
+    code = _pascal_code_only(script)
+    defined = set(re.findall(r"(?:function|procedure)\s+(\w+)", code))
+    called = {name for name in re.findall(r"\b([A-Za-z_]\w*)\s*\(", code)
+              if name.lower() not in _PASCAL_KEYWORDS}
+
+    unknown = called - defined - INNO_BUILTINS
+    assert not unknown, (
+        f"[Code] calls {sorted(unknown)}, which is neither defined in this "
+        "script nor a known Inno Setup support function. If it IS one, add it "
+        "to INNO_BUILTINS after checking Inno's Support Functions Reference."
     )

@@ -205,9 +205,20 @@ begin
   //
   // `qdrant.exe` is owned too: managed storage supervises one, and it holds
   // handles under the data dir that a reconciling upgrade may need.
-  Images[0] := 'rag.exe';
-  Images[1] := 'ragw.exe';
-  Images[2] := 'qdrant.exe';
+  // PROCESS names, which is what `Get-Process -Name` matches: `ProcessName`
+  // carries no extension. `-Name rag.exe` matches NOTHING and reports no error,
+  // so the filenames would silently kill nothing and leave the upgrade to fail
+  // later on a locked file — indistinguishable from the defect this procedure
+  // exists to prevent. Measured on a live machine: `-Name rag.exe,ragw.exe,
+  // qdrant.exe` -> 0 processes; `-Name rag,ragw,qdrant` -> 7.
+  //
+  // Written out rather than derived. `RemoveFileExt` looked like the obvious
+  // helper and does not exist in Pascal Script — the compile failed on it — and
+  // a literal list needs no API at all. `tests/test_installer_contract.py`
+  // keeps this list and the owned-image list from drifting apart.
+  Images[0] := 'rag';      // rag.exe
+  Images[1] := 'ragw';     // ragw.exe
+  Images[2] := 'qdrant';   // qdrant.exe
 
   // SCOPED BY PATH, not by image name.
   //
@@ -242,14 +253,7 @@ begin
     '$ErrorActionPreference = ''SilentlyContinue''; ' +
     '$app = ''' + ExpandConstant('{app}') + '''; ' +
     '$data = ''' + ExpandConstant('{localappdata}\RAGTools') + '''; ' +
-    // BASE names, not filenames. `Get-Process -Name` matches ProcessName, which
-    // carries no extension: `-Name rag.exe` matches NOTHING and reports no
-    // error, so passing the filenames would silently kill nothing and leave the
-    // upgrade to fail later on a locked file. Measured on a live machine:
-    // `-Name rag.exe,ragw.exe,qdrant.exe` -> 0 processes; `-Name rag,ragw,qdrant`
-    // -> 7. Derived with RemoveFileExt so the list above stays the single source.
-    'Get-Process -Name ' + RemoveFileExt(Images[0]) + ',' +
-    RemoveFileExt(Images[1]) + ',' + RemoveFileExt(Images[2]) +
+    'Get-Process -Name ' + Images[0] + ',' + Images[1] + ',' + Images[2] +
     ' -ErrorAction SilentlyContinue | ' +
     'Where-Object { $_.Path -and ' +
     '( $_.Path.StartsWith($app, ''OrdinalIgnoreCase'') -or ' +
