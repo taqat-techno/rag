@@ -88,15 +88,34 @@ def build_sandbox(root: Path, real_config: Path) -> Path:
 def main() -> int:
     from ragtools.platform import KIND_SERVICE, KIND_TRAY, Registration
 
-    real_config = Path(os.environ.get("LOCALAPPDATA", "")) / "RAGTools" / "config.toml"
-    if not real_config.exists():
-        print(f"no installed config at {real_config}; nothing to rehearse against")
-        return 2
-
     root = Path(tempfile.mkdtemp(prefix="ragtools-rehearsal-"))
+
+    # Prefer the developer's real config; SYNTHESISE one when there is none.
+    #
+    # This used to `return 2` whenever no installation was present, which is the
+    # state of every CI runner — so the job ran, printed one line, exited
+    # non-zero, and was marked `continue-on-error: true`, which turned the
+    # failure into a green tick. It has therefore never rehearsed anything on
+    # CI while appearing in the release gate as a passing check.
+    #
+    # A synthesised v2 config exercises the same code on every machine; the real
+    # one, when present, additionally covers whatever shape a genuine install
+    # has grown into.
+    real_config = Path(os.environ.get("LOCALAPPDATA", "")) / "RAGTools" / "config.toml"
+    if real_config.exists():
+        source, origin = real_config, f"the REAL installed config: {real_config}"
+    else:
+        source = root / "synthesised-config.toml"
+        source.write_text(
+            'version = 2\n\n'
+            '[[projects]]\nid = "alpha"\npath = "C:\\\\projects\\\\alpha"\nmode = "docs"\n\n'
+            '[[projects]]\nid = "beta"\npath = "C:\\\\projects\\\\beta"\nmode = "general"\n',
+            encoding="utf-8")
+        origin = "a SYNTHESISED v2 config (no installation on this machine)"
+
     print(f"Rehearsing v2.7.0 -> v3 in {root}")
-    print(f"Using the REAL installed config: {real_config}\n")
-    app = build_sandbox(root, real_config)
+    print(f"Using {origin}\n")
+    app = build_sandbox(root, source)
 
     # The registrations measured on this machine.
     registrations = [
@@ -163,8 +182,8 @@ def main() -> int:
                                                              "collection_strategy"},
           ", ".join(migration.added_keys))
     check("migration is idempotent", migrate_config(migration.document).changed is False)
-    check("the real config file is not modified by a dry run",
-          (app / "config.toml").read_bytes() == real_config.read_bytes())
+    check("the source config file is not modified by a dry run",
+          (app / "config.toml").read_bytes() == source.read_bytes())
 
     # --- pre-flight against real numbers ----------------------------------
     class _Settings:

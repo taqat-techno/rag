@@ -103,12 +103,28 @@ def main() -> int:
               f"{len(leftovers)} entries: {leftovers[:8]}")
 
     # The sweep, run by the same detection code the upgrade uses.
+    #
+    # Filter on the REAL layout constants, imported rather than typed. The first
+    # version of this check asked for `by_layout("install")` — a layout that
+    # does not exist, so it returned an empty list and passed on every machine
+    # including one where nothing had been uninstalled at all.
+    from ragtools.upgrade.scan import (
+        L_INSTALL_MACHINE,
+        L_INSTALL_PIP,
+        L_INSTALL_USER,
+        L_LEGACY_ARTIFACT,
+        L_DATA,
+    )
     from ragtools.upgrade import scan
 
     result = scan()
-    installs = result.by_layout("install") if hasattr(result, "by_layout") else []
-    check("a fresh scan finds no installation", not installs,
-          f"{len(installs)} finding(s)")
+    # `install-pip` is the CI checkout's own editable install and `data` is
+    # preserved by policy; neither is residue of the packaged product.
+    assert L_INSTALL_PIP and L_DATA  # named so the exclusions are explicit
+    residue = [f for f in result.findings
+               if f.layout in (L_INSTALL_USER, L_INSTALL_MACHINE, L_LEGACY_ARTIFACT)]
+    check("a fresh scan finds no packaged installation", not residue,
+          "; ".join(f"{f.layout}: {f.path}" for f in residue) or "clean")
     check("a fresh scan finds no registrations", not result.registrations,
           f"{len(result.registrations)} registration(s)")
     check("no product PATH entries survive", not result.path_entries,

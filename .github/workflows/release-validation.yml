@@ -257,7 +257,7 @@ jobs:
             throw "installer was not produced"
           }
 
-      - name: Install a genuine v2.7.0, start it, then upgrade over it
+      - name: Install a genuine v${{ matrix.from }}, start it, then upgrade over it
         # The check every previous upgrade test could not make. The others
         # synthesise a v2 layout and call migrate_config() directly; this runs
         # one PACKAGED installer over another with the previous version's
