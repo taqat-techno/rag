@@ -94,13 +94,19 @@ def main() -> int:
     check("the uninstall entry is gone", registry_value("DisplayVersion") is None,
           str(registry_value("DisplayVersion")))
 
+    # `unins000.exe` is the uninstaller itself, and a running program cannot
+    # delete its own image. Inno schedules it for removal at the next reboot;
+    # until then it legitimately remains, alone, in an otherwise empty
+    # directory. Treating that as residue fails every correct uninstall — which
+    # it did on the first run of this script.
+    SELF = {"unins000.exe", "unins000.dat"}
     if install_dir:
         leftovers = []
         root = Path(install_dir)
         if root.is_dir():
-            leftovers = [p.name for p in root.iterdir()]
-        check("no program files survive", not leftovers,
-              f"{len(leftovers)} entries: {leftovers[:8]}")
+            leftovers = [p.name for p in root.iterdir() if p.name.lower() not in SELF]
+        check("no program files survive except the uninstaller itself",
+              not leftovers, f"{len(leftovers)} entries: {leftovers[:8]}")
 
     # The sweep, run by the same detection code the upgrade uses.
     #
@@ -121,8 +127,16 @@ def main() -> int:
     # `install-pip` is the CI checkout's own editable install and `data` is
     # preserved by policy; neither is residue of the packaged product.
     assert L_INSTALL_PIP and L_DATA  # named so the exclusions are explicit
+    def _only_the_uninstaller(path: Path) -> bool:
+        """A directory holding nothing but Inno's own stub is not residue."""
+        try:
+            return all(p.name.lower() in SELF for p in Path(path).iterdir())
+        except OSError:
+            return False
+
     residue = [f for f in result.findings
-               if f.layout in (L_INSTALL_USER, L_INSTALL_MACHINE, L_LEGACY_ARTIFACT)]
+               if f.layout in (L_INSTALL_USER, L_INSTALL_MACHINE, L_LEGACY_ARTIFACT)
+               and not _only_the_uninstaller(f.path)]
     check("a fresh scan finds no packaged installation", not residue,
           "; ".join(f"{f.layout}: {f.path}" for f in residue) or "clean")
     check("a fresh scan finds no registrations", not result.registrations,

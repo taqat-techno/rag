@@ -797,3 +797,67 @@ def test_background_executable_helper_survives_an_unsupported_platform(monkeypat
     monkeypatch.setattr(platform_pkg, "adapter", _no_adapter)
 
     assert platform_pkg.background_executable("/opt/rag/rag") == "/opt/rag/rag"
+
+
+# --- superseded registrations must actually be removed --------------------
+
+
+def test_installing_autostart_removes_the_superseded_registrations(tmp_path, allow_platform_writes):
+    """Enumerating them was never enough — something had to act on the report.
+
+    `find_autostart` has reported legacy registrations since v3.0.0 and nothing
+    consumed the report: `installer.iss` says the upgrade engine removes them,
+    but that engine is `rag upgrade`, which does not exist. So every upgrade
+    from v2 left "RAGTools Watchdog" registered, pointing at a watchdog v3
+    deleted — a task that fires at each logon and fails, indefinitely.
+
+    Found by `rag selfcheck` during a real packaged 2.7.0 -> 3.1.0 upgrade in
+    CI ("legacy registration survives: RAGTools Watchdog"), which is exactly
+    the job that check exists to do.
+    """
+    runner = FakeRunner({
+        r"/tn \RAGTools\Service": OK,
+        "/tn RAGTools Watchdog": OK,
+    })
+    adapter, startup = _win(tmp_path, runner)
+    legacy_file = startup / "RAGTools.vbs"
+    legacy_file.write_text("legacy", encoding="utf-8")
+
+    adapter.install_autostart(
+        AutostartSpec("svc", KIND_SERVICE, [r"C:\app\ragw.exe", "service", "run"]))
+
+    assert runner.saw("/delete"), f"no legacy task was deleted; calls: {runner.calls}"
+    assert runner.saw("RAGTools Watchdog"), "the legacy watchdog task was not touched"
+    assert not legacy_file.exists(), "the legacy startup-folder script survives"
+
+
+def test_a_legacy_sweep_failure_does_not_fail_the_registration(tmp_path, allow_platform_writes):
+    """The new task registered successfully. A legacy one that refuses to go is
+    worth reporting — `selfcheck` does — but not worth undoing that."""
+    runner = FakeRunner({
+        r"/tn \RAGTools\Service": OK,
+        "/tn RAGTools Watchdog": OK,
+        "/delete": CommandResult(1, "", "access denied"),
+    })
+    adapter, _ = _win(tmp_path, runner)
+
+    registration = adapter.install_autostart(
+        AutostartSpec("svc", KIND_SERVICE, [r"C:\app\ragw.exe", "service", "run"]))
+
+    assert registration.name.endswith("Service")
+
+
+def test_the_current_registration_is_never_swept(tmp_path, allow_platform_writes):
+    """A sweep that removed what it had just installed would be worse than the
+    defect it fixes."""
+    runner = FakeRunner({r"/tn \RAGTools\Service": OK})
+    adapter, _ = _win(tmp_path, runner)
+
+    adapter.install_autostart(
+        AutostartSpec("svc", KIND_SERVICE, [r"C:\app\ragw.exe", "service", "run"]))
+
+    deleted_current = [c for c in runner.calls
+                       if "/delete" in c and any("RAGTools\\Service" in a for a in c)]
+    assert not deleted_current, (
+        f"the sweep deleted the current registration: {deleted_current}"
+    )

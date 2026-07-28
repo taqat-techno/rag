@@ -314,10 +314,43 @@ class WindowsAdapter:
             raise RuntimeError(
                 f"failed to register {task}: {result.stderr.strip() or result.stdout.strip()}"
             )
+
+        # Registering the current mechanism is also when the superseded ones go.
+        #
+        # `find_autostart` has always REPORTED legacy registrations, and nothing
+        # ever acted on the report: the installer's comment says the upgrade
+        # engine removes them, but that engine is `rag upgrade`, which does not
+        # exist. So every upgrade from v2 left "RAGTools Watchdog" registered,
+        # pointing at a watchdog v3 deleted — a task that fires at every logon
+        # and fails, forever. Caught by `rag selfcheck` on a real 2.7.0 -> 3.1.0
+        # upgrade, which is precisely the job it was added to do.
+        #
+        # Best-effort: a legacy task that cannot be removed must not fail the
+        # registration that just succeeded. `selfcheck` still reports it.
+        self._sweep_legacy(spec.kind)
+
         return Registration(
             name=task, kind=spec.kind, mechanism="task-scheduler",
             target=_command_line(spec.argv), enabled=True,
         )
+
+    def _sweep_legacy(self, kind: str) -> list[str]:
+        """Delete superseded registrations of `kind`. Returns what went."""
+        removed: list[str] = []
+        for registration in self.find_autostart(kind):
+            if not registration.legacy:
+                continue
+            try:
+                if registration.mechanism == "task-scheduler":
+                    if self._run(["schtasks", "/delete", "/tn",
+                                  registration.name, "/f"]).ok:
+                        removed.append(registration.name)
+                elif registration.path is not None:
+                    registration.path.unlink(missing_ok=True)
+                    removed.append(registration.name)
+            except OSError:
+                continue
+        return removed
 
     def current_user(self) -> str:
         """The account autostart is registered for. Injectable for tests."""
