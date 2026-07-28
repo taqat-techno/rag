@@ -27,7 +27,11 @@ from pathlib import Path
 from typing import Optional
 
 #: The config version this release reads and writes.
-CONFIG_VERSION = 3
+#:
+#: Re-exported, not redefined. It is a fact about the schema, so it belongs to
+#: the module that owns the schema; a second literal here is precisely how the
+#: writers came to disagree with the migrator in the first place.
+from ragtools.config import CONFIG_VERSION  # noqa: E402  (re-export)
 
 #: Keys a v3 config carries that a v2 config does not. Absent means "the v2
 #: default", which is why each has an explicit value here rather than being
@@ -35,10 +39,33 @@ CONFIG_VERSION = 3
 V3_DEFAULTS = {
     # Embedded is the honest default: it needs nothing, and the scale warning
     # tells the truth when the index outgrows it. Choosing `managed` for the
-    # user would download a binary they did not ask for.
+    # user would download a binary they did not ask for — and no release ships
+    # one, so `managed` cannot be a default in any case.
     "storage_backend": "embedded",
-    "collection_strategy": "per_project",
 }
+
+#: The collection layout a migrated config adopts.
+#:
+#: `shared`, deliberately, even though `per_project` is the v3 model. Changing
+#: the layout changes *where the vectors live*, so `index_identity` correctly
+#: refuses to trust the state DB afterwards and forces a full re-index — tens of
+#: thousands of files, at first boot, on a machine the user has just upgraded
+#: and is waiting on. An upgrade that silently starts hours of work is not an
+#: upgrade the user consented to.
+#:
+#: It also would not reliably fix the thing it appears to fix. Splitting one
+#: collection into twenty-five only helps if no SINGLE project exceeds the
+#: engine's limit, and a project that vendors a framework can exceed it alone —
+#: so the forced re-index can cost hours and leave the warning exactly where it
+#: was.
+#:
+#: The layout is therefore reachable, recommended when it would genuinely help,
+#: and never imposed. See `rag storage strategy`.
+LAYOUT_FOR_EXISTING_INSTALL = "shared"
+
+#: A configuration with no projects has nothing indexed, so adopting the v3
+#: layout costs nothing and re-indexes nothing.
+LAYOUT_FOR_NEW_INSTALL = "per_project"
 
 
 @dataclass
@@ -73,6 +100,21 @@ def migrate_config(document: dict) -> MigrationResult:
         if key not in doc:
             doc[key] = value
             result.added_keys.append(key)
+
+    # The layout depends on whether there is an index to disturb. An explicit
+    # value either way, so the file states what it does rather than relying on
+    # a code default that a later release could change underneath it.
+    if "collection_strategy" not in doc:
+        existing_install = bool(doc.get("projects"))
+        doc["collection_strategy"] = (LAYOUT_FOR_EXISTING_INSTALL if existing_install
+                                      else LAYOUT_FOR_NEW_INSTALL)
+        result.added_keys.append("collection_strategy")
+        if existing_install:
+            result.notes.append(
+                "collection layout left as 'shared' — switching to per-project "
+                "collections requires a full re-index, so it is offered rather "
+                "than imposed (see `rag storage strategy`)"
+            )
 
     # Fold legacy `dependency_paths` into the catalog using the SAME validator
     # the runtime uses, so a migrated file and a loaded file agree by

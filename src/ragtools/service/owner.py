@@ -61,7 +61,32 @@ _EMPTY_STATUS = {
 }
 
 
-def compute_scale_warning(points_count: int, capabilities=None) -> dict:
+def governing_collection(per_collection) -> tuple[int, str, int]:
+    """The count the engine's ceiling actually applies to.
+
+    Returns ``(points, collection_name, collection_count)``.
+
+    **The limit is per collection, not per index.** In embedded mode every
+    collection is its own brute-force scan, so twenty-five collections of two
+    thousand points each are twenty-five fast scans — not one slow one. Summing
+    them and comparing the total against the ceiling is simply the wrong
+    arithmetic, and it fails in the direction that matters: it would report
+    "over" permanently on exactly the per-project layout that fixes the problem,
+    training the operator to ignore the warning that was right.
+
+    The converse is equally wrong. A single project that vendors a framework can
+    exceed the ceiling alone while the average across collections looks
+    comfortable, so the maximum is the honest summary — not the mean, and not
+    the total.
+    """
+    if not per_collection:
+        return 0, "", 0
+    worst = max(per_collection, key=lambda entry: entry.get("points", 0) or 0)
+    return int(worst.get("points", 0) or 0), str(worst.get("name", "")), len(per_collection)
+
+
+def compute_scale_warning(points_count: int, capabilities=None, *,
+                          collection: str = "", collection_count: int = 1) -> dict:
     """Return a structured scale-warning record for a given collection size.
 
     Levels:
@@ -92,18 +117,29 @@ def compute_scale_warning(points_count: int, capabilities=None) -> dict:
             "engine": "server",
         }
 
+    # Name the collection when there is more than one, so "which one?" is
+    # answerable from the message itself. With a single collection it is noise.
+    subject = (f"Collection '{collection}'" if collection and collection_count > 1
+               else "Collection")
+
     if points_count >= _QDRANT_LOCAL_HARD_WARN:
         level = "over"
         message = (
-            f"Collection has {points_count:,} points, which is above Qdrant's "
+            f"{subject} has {points_count:,} points, which is above Qdrant's "
             f"recommended local-mode limit of {_QDRANT_LOCAL_HARD_WARN:,}. "
-            "Search latency and memory use may degrade. Consider pruning the "
-            "index or migrating Qdrant to server mode."
+            "Search latency and memory use may degrade. "
+            # Every action named here must be one the user can actually take.
+            # This previously advised "migrating Qdrant to server mode" — which
+            # no CLI command, API field or admin-panel control could do, because
+            # `storage_backend` had no setter anywhere. Advice that cannot be
+            # followed reads as a broken product rather than a warning.
+            "Reduce it with ignore rules (`rag ignore add`), or move this "
+            "install to a real engine with `rag storage backend managed`."
         )
     elif points_count >= _QDRANT_LOCAL_SOFT_WARN:
         level = "approaching"
         message = (
-            f"Collection has {points_count:,} points, approaching the local-mode "
+            f"{subject} has {points_count:,} points, approaching the local-mode "
             f"limit of {_QDRANT_LOCAL_HARD_WARN:,}. Review ignore_patterns "
             "for large generated files and consider archiving completed projects."
         )
@@ -161,21 +197,6 @@ def compute_index_freshness(last_indexed, stale_after_hours: float = 24, now=Non
     return {**base, "age_seconds": age, "level": "fresh", "message": ""}
 
 
-def _log_scale_warning_once(points_count: int) -> None:
-    """Log the scale warning at service/index-complete time.
-
-    Kept separate from compute_scale_warning (pure) so the pure function
-    remains test-friendly and this logging side-effect stays isolated.
-    """
-    record = compute_scale_warning(points_count)
-    if record["level"] == "over":
-        logger.warning(
-            "[scale=over] %s", record["message"],
-        )
-    elif record["level"] == "approaching":
-        logger.info(
-            "[scale=approaching] %s", record["message"],
-        )
 
 
 class QdrantOwner:
@@ -1536,6 +1557,7 @@ class QdrantOwner:
     def _compute_status(self) -> dict:
         """Build the status dict. Caller must hold ``self._lock``."""
         points_count, collections = self._collection_points()
+        _worst_points, _worst_name, _collection_count = governing_collection(collections)
 
         state_path = Path(self._settings.state_db)
         if state_path.exists():
@@ -1553,7 +1575,12 @@ class QdrantOwner:
             "storage": self.storage_info(),
             # The scale ceiling is a property of the ENGINE, not of the data:
             # on a real server there is no brute-force limit to warn about.
-            "scale": compute_scale_warning(points_count, capabilities=self.capabilities()),
+            # Per-collection, not the sum: the engine scans each collection
+            # separately, so totalling them compares the wrong number against
+            # the ceiling and would report "over" forever under per_project.
+            "scale": compute_scale_warning(
+                _worst_points, capabilities=self.capabilities(),
+                collection=_worst_name, collection_count=_collection_count),
             "freshness": compute_index_freshness(
                 summary.get("last_indexed"),
                 getattr(self._settings, "stale_index_hours", 24),
@@ -1624,11 +1651,13 @@ class QdrantOwner:
         Safe to call without the RLock held as callers already hold it.
         """
         try:
-            points_count, _per_collection = self._collection_points()
+            _total, per_collection = self._collection_points()
         except Exception:
             return
 
-        record = compute_scale_warning(points_count, capabilities=self.capabilities())
+        worst, name, count = governing_collection(per_collection)
+        record = compute_scale_warning(worst, capabilities=self.capabilities(),
+                                       collection=name, collection_count=count)
         if record["level"] == "over":
             logger.warning("[scale=over] %s", record["message"])
             log_activity("warning", "indexer", record["message"])
@@ -1700,8 +1729,13 @@ class QdrantOwner:
     def update_projects(self, projects: list) -> None:
         """Hot-reload project configuration. Thread-safe."""
         with self._lock:
+            from ragtools.config import CONFIG_VERSION
+
             object.__setattr__(self._settings, "projects", projects)
-            object.__setattr__(self._settings, "config_version", 2)
+            # Hot-reloading projects does not change the schema version, and
+            # asserting `2` here made the in-memory Settings disagree with a
+            # freshly migrated file on disk.
+            object.__setattr__(self._settings, "config_version", CONFIG_VERSION)
             logger.info("Projects updated: %d configured", len(projects))
             from ragtools.service.activity import log_activity
             log_activity("info", "config", f"Projects reloaded: {len(projects)} configured")

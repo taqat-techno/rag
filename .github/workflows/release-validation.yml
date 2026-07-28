@@ -203,9 +203,25 @@ jobs:
         run: python scripts/verify_bundle.py --bundle dist/rag --require-windowed
 
   real-upgrade:
-    name: packaged v2.7.0 -> this build, on a real machine
+    name: packaged v${{ matrix.from }} -> this build, on a real machine
     runs-on: windows-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # BOTH legs, and the second one is the one that matters.
+        #
+        # 2.7.0 registers its scheduled tasks against `rag.exe`, so the running
+        # set during that upgrade is `rag.exe` — which even the OLD single-image
+        # kill handled. That leg therefore passes with or without the fix, and
+        # cannot distinguish them.
+        #
+        # 3.0.1 points BOTH tasks at `ragw.exe`. The running set is `ragw.exe`,
+        # which is precisely what the old kill missed and what the forensic
+        # report from the field describes as the state that machine is now in:
+        # "ragw.exe (PID 3076) and the task-registered images are now the
+        # running set". Only this leg proves the defect is fixed.
+        from: ["2.7.0", "3.0.1"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -253,12 +269,21 @@ jobs:
           python scripts/verify_upgrade_install.py `
             --installer dist/RAGTools-Setup-${{ steps.version.outputs.version }}.exe `
             --version ${{ steps.version.outputs.version }} `
-            --from-version 2.7.0
+            --from-version ${{ matrix.from }}
 
-      - name: Uninstall and sweep for residue
+      - name: Run the REAL uninstaller and sweep for residue
+        # Not `continue-on-error`. The release rule is that uninstall and
+        # residue validations must PASS; a step that cannot fail does not pass,
+        # it reports — and this one had been unable to fail while also testing
+        # the wrong program (a pip uninstall from a sandbox venv, and elsewhere
+        # a fake `unins000.exe` containing the bytes "MZ").
+        run: python scripts/verify_real_uninstall.py
+
+      - name: Sandbox residue sweep (wheel install/uninstall)
+        # Kept as well: it covers the source/wheel install path, which the
+        # packaged uninstaller does not touch.
         if: always()
         run: python scripts/verify_uninstall_residue.py
-        continue-on-error: true
 
   upgrade-rehearsal:
     name: upgrade rehearsal (synthesised layout)
@@ -274,11 +299,11 @@ jobs:
         # the synthesised layout. Against a real previous install it also
         # copies the actual config — see the script.
         run: python scripts/rehearse_upgrade.py
-        continue-on-error: true
 
   gate:
     name: release gate
-    needs: [suite, linux-adapter, macos-adapter, clean-install, windows-autostart, bundle-contract, real-upgrade]
+    needs: [suite, linux-adapter, macos-adapter, clean-install, windows-autostart,
+            bundle-contract, real-upgrade, upgrade-rehearsal]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -31,6 +31,8 @@ project_app = typer.Typer(help="Manage configured projects.")
 app.add_typer(project_app, name="project")
 backup_app = typer.Typer(help="Manage state-DB backups (taken before destructive operations).")
 app.add_typer(backup_app, name="backup")
+storage_app = typer.Typer(help="Choose the storage engine and collection layout.")
+app.add_typer(storage_app, name="storage")
 tray_app = typer.Typer(
     help="Manage the RAG Tools system-tray icon.",
     invoke_without_command=True,
@@ -51,8 +53,16 @@ def _profile_store(settings=None):
 
 
 def _get_settings():
-    """Load settings."""
+    """Load settings, with the configuration brought to the current schema.
+
+    Every CLI command is a deliberate user action, and migration is
+    idempotent, atomic, backed up and behaviour-preserving — so doing it here
+    costs one TOML read and removes the case where a CLI-only user never
+    migrates at all.
+    """
+    from ragtools.bootstrap import ensure_config_current_once
     from ragtools.config import Settings
+    ensure_config_current_once()
     return Settings()
 
 
@@ -344,8 +354,19 @@ def doctor(
             info = client.get_collection(settings.collection_name)
             points_count = info.points_count
             # Surface Qdrant local-mode scale warnings (field-report incident).
+            #
+            # `capabilities` is not optional here. Without it this always
+            # assumed the embedded brute-force engine, so `rag doctor` warned
+            # about a 20,000-point ceiling on a managed or external server where
+            # no such ceiling exists — advising the user to fix something they
+            # had already fixed.
             from ragtools.service.owner import compute_scale_warning
-            scale = compute_scale_warning(points_count)
+            try:
+                from ragtools.storage import resolve_backend
+                caps = resolve_backend(settings).capabilities()
+            except Exception:  # noqa: BLE001 — unknown engine: assume the weakest
+                caps = None
+            scale = compute_scale_warning(points_count, capabilities=caps)
             if scale["level"] == "over":
                 status_label = "WARNING"
                 detail = (
@@ -1301,6 +1322,146 @@ def project_mode(
         from ragtools.service.pages import _save_projects_to_toml
         _save_projects_to_toml(list(settings.projects))
         console.print(f"[green]Mode set:[/green] {project_id} → {mode}. Run `rag index` to apply.")
+
+
+# --- Storage commands ---
+#
+# The storage engine and the collection layout were readable everywhere and
+# settable nowhere: no CLI command, no field on the config API, no control in
+# the admin panel. `collection_strategy` appeared in one diagnostics template as
+# text. So the v3 architecture could be described but not chosen, and the scale
+# warning recommended moving to server mode — a thing the installed product had
+# no way to do.
+#
+# Both settings change WHERE VECTORS LIVE, which is why they share a command
+# group and a confirmation: `index_identity` correctly stops trusting the state
+# DB after either one changes, and the next index run rebuilds from scratch.
+
+
+def _write_storage_setting(key: str, value: str) -> None:
+    from ragtools.service.pages import _update_toml_config
+
+    _update_toml_config(None, {key: value})
+
+
+def _confirm_relayout(settings, what: str, yes: bool) -> None:
+    """Refuse to silently start hours of work.
+
+    Changing the engine or the layout invalidates every file hash in the state
+    DB, so the next index run re-embeds the entire corpus. On a large install
+    that is hours. It is a perfectly reasonable thing to ask for and a hostile
+    thing to do without asking.
+    """
+    from ragtools.upgrade.preflight import estimate_required_bytes, run_preflight
+
+    points = 0
+    try:
+        client = settings.get_qdrant_client()
+        points = int(client.count(collection_name=settings.collection_name,
+                                  exact=True).count)
+    except Exception:  # noqa: BLE001 — a fresh install has nothing to count
+        points = 0
+
+    console.print(f"[yellow]Changing {what} requires a full re-index.[/yellow]")
+    if points:
+        console.print(f"  Current index: {points:,} points")
+        console.print("  Estimated peak disk needed: "
+                      f"~{estimate_required_bytes(points) / 1024**3:.1f} GB")
+
+    # Report the whole list rather than one blocker per attempt. The point
+    # count is passed through so the disk check sizes the real corpus instead
+    # of assuming an empty one.
+    report = run_preflight(settings, point_count=points)
+    for blocker in report.blockers:
+        console.print(f"  [red]blocked:[/red] {blocker.name} — {blocker.detail}")
+        if blocker.remedy:
+            console.print(f"            {blocker.remedy}")
+    if not report.ok:
+        console.print("[red]Refusing: preflight found blockers.[/red]")
+        raise typer.Exit(1)
+
+    if not yes and not typer.confirm("Continue?", default=False):
+        console.print("Unchanged.")
+        raise typer.Exit(1)
+
+
+@storage_app.command("show")
+def storage_show():
+    """Show the storage engine and collection layout actually in force."""
+    settings = _get_settings()
+    console.print(f"  storage_backend    : {settings.storage_backend}")
+    console.print(f"  collection_strategy: {settings.collection_strategy}")
+    console.print(f"  config_version     : {settings.config_version}")
+    if settings.storage_url:
+        console.print(f"  storage_url        : {settings.storage_url}")
+
+
+@storage_app.command("backend")
+def storage_backend(
+    backend: str = typer.Argument(..., help="embedded | managed | external"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+):
+    """Set the storage engine. Requires a full re-index."""
+    backend = backend.lower()
+    if backend not in ("embedded", "managed", "external"):
+        console.print("[red]backend must be: embedded, managed, or external.[/red]")
+        raise typer.Exit(2)
+
+    settings = _get_settings()
+    if backend == settings.storage_backend:
+        console.print(f"Already {backend}.")
+        return
+
+    if backend == "managed":
+        # Fail here, with the reason, rather than at the next service start —
+        # no release packages a Qdrant binary, so this is a likely outcome.
+        from ragtools.service.managed_qdrant import find_qdrant_binary
+        try:
+            found = find_qdrant_binary(settings)
+        except Exception as exc:  # noqa: BLE001 — an explicit bad path raises
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        if not found:
+            console.print(
+                "[red]No Qdrant executable found.[/red] Managed mode supervises a "
+                "native qdrant binary, which this release does not bundle.\n"
+                "  Place it in the data directory's `bin/`, put it on PATH, or set "
+                "`qdrant_binary` in the config, then re-run this command.")
+            raise typer.Exit(1)
+        console.print(f"  Using: {found}")
+
+    _confirm_relayout(settings, "the storage engine", yes)
+    _write_storage_setting("storage_backend", backend)
+    console.print(f"[green]storage_backend = {backend}.[/green] "
+                  "Restart the service, then run `rag index` to rebuild.")
+
+
+@storage_app.command("strategy")
+def storage_strategy(
+    strategy: str = typer.Argument(..., help="shared | per_project"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+):
+    """Set the collection layout. Requires a full re-index.
+
+    `per_project` gives each project its own collection, so one project's query
+    never reads another's vectors and each collection is scanned on its own. It
+    only relieves the size ceiling if no SINGLE project exceeds it — a project
+    that vendors a framework can exceed it alone.
+    """
+    strategy = strategy.lower()
+    if strategy not in ("shared", "per_project"):
+        console.print("[red]strategy must be: shared or per_project.[/red]")
+        raise typer.Exit(2)
+
+    settings = _get_settings()
+    if strategy == settings.collection_strategy:
+        console.print(f"Already {strategy}.")
+        return
+
+    _confirm_relayout(settings, "the collection layout", yes)
+    _write_storage_setting("collection_strategy", strategy)
+    console.print(f"[green]collection_strategy = {strategy}.[/green] "
+                  "Restart the service, then run `rag index` to rebuild.")
 
 
 # --- Backup commands ---

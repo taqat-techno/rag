@@ -13,61 +13,106 @@ _Nothing yet._
 
 ---
 
-## [3.0.2] — 2026-07-27
+## [3.1.0] — 2026-07-28
 
-Hardens the Windows upgrade path and makes the installer prove its own result.
-The trigger was an investigation into a reported failed upgrade; that specific
-report turned out to be an installer that never ran (see below), but the
-investigation found a real defect that 3.0.1 had introduced into its own future
-upgrade path, plus a class of failure the installer could not detect at all.
+Activates the v3 architecture and makes the Windows upgrade path provable.
 
-### Fixed
-- **The installer now stops every process an installation owns, not just the
-  one it used to ship.** `ForceKillRagProcesses()` killed only `rag.exe`. 3.0.1
-  moved both scheduled tasks to `ragw.exe`, so from that release forward the
-  service and tray running at login were images the pre-install step did not
-  touch — and a running image holds its own file open. The processes an upgrade
-  most needs to stop were the ones it left alone, so a copy would skip locked
-  files and setup would report success over a half-replaced tree. `ragw.exe` and
-  `qdrant.exe` are now stopped as well.
-- **Scheduled tasks are ended before the processes are killed.** The
-  registration carries `RestartOnFailure`, and a force-kill is exactly the
-  failure it reacts to — so killing first let the scheduler start a replacement
-  between the kill and the copy.
+The headline defect is that **the v2→v3 configuration migration had never run.**
+`migrate_config()` shipped in 3.0.0, was correct, and was fully unit-tested —
+and every reference to it outside its own tests was a re-export. So an
+installation upgraded to v3 kept a v2 configuration, the runtime fell back to v2
+code defaults, and per-project collections, managed storage and framework
+corpora stayed unreachable behind a file nothing rewrote. A clean v3 install
+landed in the same place, so this was never only an upgrade defect.
+
+Fixing that alone would not have held: the configuration writers actively undid
+it. `_save_projects_to_toml` wrote `version = 2` unconditionally from sixteen
+production call sites — every project add, edit, mode change, ignore rule and
+dependency change, from CLI, admin panel and MCP alike — so a migrated config
+was demoted by the user's next edit and re-migrated on the following boot,
+forever.
+
+**3.0.2 was never released; its changes are included here.**
 
 ### Added
+- **`rag storage`** — `show`, `backend` and `strategy`. The storage engine and
+  collection layout were readable everywhere and settable nowhere: no CLI
+  command, no field on the config API, no control in the admin panel. The v3
+  architecture could be described but not chosen, and the scale warning
+  recommended moving to server mode — something the installed product had no
+  way to do. Both setters run preflight, state the re-index cost and require
+  confirmation.
 - **`rag selfcheck`** — verifies the *installation*, not the executable: its
   version, the `ragw.exe` sibling, the uninstall registry entry, that no owned
   process runs from outside the install directory, that every autostart
   registration targets it, and that a responding service reports this version.
-  Exits non-zero so a caller can refuse to claim success.
-- **The installer runs it after installing** (`ssDone`, after the tasks are
-  re-registered) and reports a clear error if the machine is in a mixed state,
-  instead of reporting success. An installer that copied files has proven it
-  copied files; every way an upgrade half-fails looks identical from inside it.
-- **A real upgrade regression test** — `scripts/verify_upgrade_install.py`
-  downloads the published **v2.7.0 installer**, installs it, starts it so its
-  binaries are genuinely locked, runs the newly built installer over it, then
-  asserts the binary, uninstall registry, running process paths, scheduled-task
-  targets, `/health` and `rag selfcheck` all belong to the new release — and
-  that user config survived. Runs as the `real-upgrade` job and gates the
-  release. Every previous upgrade check used a synthesised layout and called
-  `migrate_config()` directly, which is why none of them could see the
-  `ragw.exe` defect above.
-- **CI asserts the built binary reports the tag being released** before it is
-  packaged, closing the remaining version-injection direction (a correctly named
-  installer wrapping a bundle built from stale sources).
+  Exits non-zero so a caller can refuse to claim success. The installer runs it
+  at `ssDone` and reports a mixed state rather than success.
+- **`/health` reports the configuration state** (`config_version`,
+  `config_state`) and flags `config_migration_failed`, so "am I actually running
+  a v3 configuration?" is answerable without reading the file.
+- **A real upgrade regression test from BOTH 2.7.0 and 3.0.1.** The 2.7.0 leg
+  cannot fail: its tasks target `rag.exe`, which even the old single-image kill
+  handled. 3.0.1 points both tasks at `ragw.exe` — the state a field machine is
+  now in — and only that leg proves the fix.
+- **The real uninstaller is finally exercised.** Every previous uninstall check
+  tested something else: a `pip uninstall` from a sandbox venv, and elsewhere a
+  fake `unins000.exe` containing the two bytes `MZ`. `verify_real_uninstall.py`
+  runs the actual Inno uninstaller and sweeps with the upgrade's own detection.
 
-### Note on the reported incident
-The upgrade failure that prompted this work could not be reproduced, and the
-evidence says it did not occur: on the affected machine `unins000.dat` and the
-uninstall registry entry were both unchanged since 2026-06-30, no `3.0.x` string
-appeared anywhere in a 4.2 MB service log spanning three months, no `ragw.exe`
-existed, and the only RAGTools installer present was `RAGTools-Setup-3.0.0-rc.4.exe`
-— `RAGTools-Setup-3.0.1.exe` had never been downloaded. **Artifacts remain
-unsigned**, so Windows SmartScreen blocks execution unless the user explicitly
-clicks through, which is the most likely reason an installer run leaves no trace.
-Signing (V16) is still open and is now the highest-value remaining work.
+### Fixed
+- **Configuration migration runs, once, before anything resolves storage.**
+  `QdrantOwner.__init__` opens the store and creates collections while
+  constructing itself, so the seam is before `Settings()` is read, not after.
+  Idempotent, atomic, backed up, lock-protected against concurrent starts, and
+  degrades loudly instead of refusing to boot.
+- **No production writer can lower the schema version.** One definition of
+  `CONFIG_VERSION`; writers preserve what the file declares and never invent
+  one.
+- **The scale warning describes the risk that exists.** It was computed from the
+  *total* across collections — the wrong arithmetic the moment there is more
+  than one, and a guaranteed false alarm under the per-project layout that fixes
+  the problem. It now reports the largest single collection, names it, respects
+  the engine's real capabilities in `rag doctor` and `/api/system-health`, and
+  only recommends actions the product can perform.
+- **One unreadable path no longer stops indexing for every project.** A junction
+  the OS refused to describe (`WinError 448`) raised out of the scan, past a
+  per-project loop with no handler, into the single blanket `except` around the
+  whole startup sync — where it was logged as "non-fatal" while indexing stopped
+  for all projects on every boot. Refusals are now skipped, counted and
+  reported, and a project that cannot be scanned costs only itself.
+- **Junction loops no longer multiply the index.** `rglob` follows reparse
+  points; a self-referential junction produced 23 copies of one file, bounded
+  only by the path-length limit. Files are de-duplicated by filesystem identity.
+- **The installer stops every image it owns — and only the ones it owns.**
+  `ForceKillRagProcesses()` killed `rag.exe` alone, while 3.0.1 had moved both
+  tasks to `ragw.exe`, so the processes an upgrade most needs to stop were the
+  ones it left alone. It now covers `rag.exe`, `ragw.exe` and `qdrant.exe`, and
+  matches by **executable path** rather than image name: `/IM qdrant.exe` would
+  kill an `external` backend the user runs themselves, or another product's
+  binary of the same common name.
+- **Scheduled tasks are ended before processes are killed**, so `RestartOnFailure`
+  cannot start a replacement between the kill and the copy.
+- **Nothing in the upgrade path waits forever.** The pre-install graceful stop
+  runs the *previous* release's binary, whose behaviour this installer cannot
+  control; unbounded, one that never returns stopped the upgrade before a single
+  file was touched, silently. All such calls are now time-limited, and the
+  installer writes an Inno log that CI dumps on timeout.
+
+### Note on the reported incident — corrected
+The 3.0.2 notes stated that the reported v3.0.1 upgrade failure "did not occur".
+**That was wrong, and it was wrong because it described the wrong machine.** The
+evidence cited (an unchanged `unins000.dat`, no `3.0.x` in the service log, no
+`ragw.exe`) was accurate for the development machine, where 3.0.1 was indeed
+never installed. The report came from a different machine sharing the same
+workspace over Syncthing. On that machine 3.0.1 installed **successfully** — a
+matching installer hash, a fully replaced `_internal`, correct registry and
+`/health`, in three minutes. The storage alert it showed was not an install
+failure at all; it was the correct behaviour of a v2 configuration that nothing
+had migrated, which is the defect this release fixes.
+
+**Artifacts remain unsigned.** Signing is still open and is the highest-value
+remaining work.
 
 ---
 

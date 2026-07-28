@@ -141,24 +141,101 @@ def test_a_matching_installation_reports_no_failures_from_source():
     """Running from a checkout, everything machine-specific is skipped and the
     version matches — so the verifier must be quiet. A verifier that cries wolf
     in development is a verifier people learn to pass `|| true`."""
+    # No exemptions. This list used to excuse "recorded install version",
+    # because from a checkout that check reported whatever packaged build
+    # happened to be on the developer's machine. The exemption was hiding a
+    # real defect — the check never asked whether this was a packaged install
+    # at all — so removing it is part of the fix, not a tightening of the test.
     checks = run_selfcheck(__version__, port=21599)
-    broken = [c for c in failures(checks)
-              # The uninstall registry legitimately describes whatever packaged
-              # build is installed on the developer's machine, which is not this
-              # source tree. Only that check may disagree here.
-              if c.name != "recorded install version"]
 
-    assert broken == [], format_report(checks)
+    assert failures(checks) == [], format_report(checks)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="registry is Windows-only")
-def test_the_registry_check_actually_reads_the_registry():
-    """Not a stub. On Windows it must reach the real uninstall key and either
-    report a version or say plainly that no entry exists."""
-    from ragtools.selfcheck import check_recorded_version
+def test_windows_declares_that_it_records_installed_versions():
+    """The platform fact, asserted as a platform fact.
 
-    result = check_recorded_version("0.0.0-not-a-real-version")
+    The previous version of this test ran the check and demanded it not skip —
+    which is only true on a machine where the packaged product happens to be
+    installed. It passed for the author and failed on every CI runner, testing
+    the developer's machine rather than the code. What is actually invariant on
+    Windows is that a package database EXISTS.
+    """
+    from ragtools.platform import adapter
 
-    assert not result.skipped, "the registry check silently skipped on Windows"
-    assert not result.ok
-    assert "the system records" in result.detail
+    assert adapter().records_installed_version is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="registry is Windows-only")
+def test_the_registry_is_really_read_and_never_raises():
+    """Not a stub: it reaches the real key and answers with a version or None,
+    on a machine with the product installed and on one without."""
+    from ragtools.platform import adapter
+
+    recorded = adapter().recorded_version()
+
+    assert recorded is None or isinstance(recorded, str)
+
+
+def test_a_packaged_install_the_system_does_not_record_is_a_failure(monkeypatch):
+    """The case the old three-way collapse could not express.
+
+    A packaged installation absent from the OS's package database means the
+    installer did not register it — Add/Remove Programs, winget and upgrade
+    detection all disagree with the files on disk. That is a finding, and it
+    must not read the same as "this OS has no registry".
+    """
+    from ragtools import selfcheck
+
+    class _Adapter:
+        records_installed_version = True
+
+        @staticmethod
+        def recorded_version():
+            return None
+
+    monkeypatch.setattr(selfcheck, "_adapter", lambda: _Adapter())
+    monkeypatch.setattr(selfcheck, "_is_packaged", lambda: True)
+    result = selfcheck.check_recorded_version("3.0.2")
+
+    assert not result.ok and not result.skipped
+    assert "no installation" in result.detail
+
+
+def test_a_platform_with_no_package_database_is_skipped(monkeypatch):
+    from ragtools import selfcheck
+
+    class _Adapter:
+        records_installed_version = False
+
+        @staticmethod
+        def recorded_version():  # pragma: no cover — must not be consulted
+            raise AssertionError("asked a platform that keeps no record")
+
+    monkeypatch.setattr(selfcheck, "_adapter", lambda: _Adapter())
+    monkeypatch.setattr(selfcheck, "_is_packaged", lambda: True)
+    result = selfcheck.check_recorded_version("3.0.2")
+
+    assert result.skipped and result.ok
+
+
+def test_a_source_checkout_is_not_expected_in_the_package_database(monkeypatch):
+    """A checkout has no reason to appear there, so its absence is not a finding.
+
+    Every sibling check already asks this; this one did not, which is exactly
+    why it reported a failure on any Windows machine that had never installed
+    the packaged product.
+    """
+    from ragtools import selfcheck
+
+    class _Adapter:
+        records_installed_version = True
+
+        @staticmethod
+        def recorded_version():
+            return None
+
+    monkeypatch.setattr(selfcheck, "_adapter", lambda: _Adapter())
+    monkeypatch.setattr(selfcheck, "_is_packaged", lambda: False)
+
+    assert selfcheck.check_recorded_version("3.0.2").skipped

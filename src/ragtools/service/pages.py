@@ -1418,7 +1418,7 @@ def ui_config_save(
 def _update_toml_config(section: str | None, data: dict) -> None:
     """Update the TOML config file. If section is None, update root level."""
     import tomli_w
-    from ragtools.config import get_config_write_path
+    from ragtools.config import CONFIG_VERSION, get_config_write_path
 
     config_path = get_config_write_path()
 
@@ -1431,7 +1431,11 @@ def _update_toml_config(section: str | None, data: dict) -> None:
         with open(config_path, "rb") as f:
             existing = tomllib.load(f)
 
-    existing.setdefault("version", 1)
+    # Preserve whatever schema version the file already declares; stamp the
+    # current one only when creating a file that has none. A settings writer
+    # must never *decide* the schema version — that is the migrator's job, and
+    # this line previously wrote `1`, silently declaring a v1 config.
+    existing.setdefault("version", CONFIG_VERSION)
 
     if section is None:
         existing.update(data)
@@ -1464,7 +1468,7 @@ def _save_projects_to_toml(projects: list, dependencies: list | None = None) -> 
     project quietly losing its shared dependencies at once.
     """
     import tomli_w
-    from ragtools.config import get_config_write_path
+    from ragtools.config import CONFIG_VERSION, get_config_write_path
 
     config_path = get_config_write_path()
 
@@ -1477,7 +1481,19 @@ def _save_projects_to_toml(projects: list, dependencies: list | None = None) -> 
         with open(config_path, "rb") as f:
             existing = tomllib.load(f)
 
-    existing["version"] = 2
+    # PRESERVE the declared version; never assert one.
+    #
+    # This line read `existing["version"] = 2` unconditionally. Reached from
+    # sixteen production call sites — every project add, remove, edit, mode
+    # change, ignore rule and dependency change, from CLI, admin panel and MCP
+    # alike — it meant a v3 config was demoted to v2 by the user's next edit,
+    # and re-migrated on the following boot, forever. Measured: version
+    # oscillating 3 -> 2 -> 3 while the v3 keys themselves survived, which made
+    # "has this been migrated?" unanswerable from the version field.
+    #
+    # Saving projects says nothing about the schema version, so it now says
+    # nothing about the schema version.
+    existing.setdefault("version", CONFIG_VERSION)
     # Serialize via model_dump so every ProjectConfig field round-trips (no
     # hand-maintained key list to forget). exclude_none drops any None values —
     # required because tomli_w cannot serialize None (TOML has no null). The

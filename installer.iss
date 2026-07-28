@@ -17,7 +17,7 @@
 ; nothing, and the release published WITHOUT its installer while every step
 ; reported success.
 #ifndef MyAppVersion
-  #define MyAppVersion "3.0.2"
+  #define MyAppVersion "3.1.0"
 #endif
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
@@ -188,11 +188,12 @@ procedure ForceKillRagProcesses();
 var
   ResultCode: Integer;
   Images: array[0..2] of string;
+  Filter: string;
   I: Integer;
 begin
   // EVERY image an installation owns, not just the one it used to ship.
   //
-  // This killed `rag.exe` alone until v3.0.2 — written when that was the only
+  // This killed `rag.exe` alone until v3.1.0 — written when that was the only
   // executable. v3.0.1 then added `ragw.exe` and pointed BOTH scheduled tasks
   // at it, so from that release on the service and tray at login are `ragw.exe`
   // and the kill missed them entirely. A running image holds its own file, so
@@ -208,18 +209,74 @@ begin
   Images[1] := 'ragw.exe';
   Images[2] := 'qdrant.exe';
 
+  // SCOPED BY PATH, not by image name.
+  //
+  // `/IM qdrant.exe` matches every Qdrant on the machine. Ours is one of them;
+  // the others are not ours to kill. `storage_backend = "external"` explicitly
+  // means "a server you run yourself", a second ragtools install has its own,
+  // and an unrelated product may simply ship a binary with the same common
+  // name. Killing those is data loss in someone else's application, caused by
+  // installing this one — and the product already draws this distinction
+  // correctly everywhere else: `selfcheck` compares process paths against the
+  // install directory precisely so it does not accuse a stranger's process.
+  //
+  // WMIC-free: `wmic` is deprecated and absent from recent Windows builds.
+  // PowerShell's CIM query is present everywhere this installer runs, and the
+  // whole filter-and-kill happens in one call so no PID can be reused between
+  // deciding and acting.
   for I := 0 to 2 do
   begin
-    // /F force, /T whole tree, /IM by image name. Errors ignored: taskkill
-    // returns 128 when nothing matches, which is the fresh-install path.
-    Exec(ExpandConstant('{sys}\taskkill.exe'),
-         '/F /IM ' + Images[I] + ' /T',
-         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Filter :=
+      '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
+      '$ErrorActionPreference = ''SilentlyContinue''; ' +
+      '$app = ''' + ExpandConstant('{app}') + '''; ' +
+      '$data = ''' + ExpandConstant('{localappdata}\RAGTools') + '''; ' +
+      'Get-CimInstance Win32_Process -Filter ""Name=''' + Images[I] + '''"" | ' +
+      'Where-Object { $_.ExecutablePath -and ' +
+      '( $_.ExecutablePath.StartsWith($app, ''OrdinalIgnoreCase'') -or ' +
+      '  $_.ExecutablePath.StartsWith($data, ''OrdinalIgnoreCase'') ) } | ' +
+      'ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"';
+    Exec('powershell.exe', Filter, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 
   // Short delay for NTFS file handles to fully release so the copy step
   // doesn't hit a "file is in use" error immediately after kill.
   Sleep(1500);
+end;
+
+// Run a program with a hard time limit, and carry on when it overruns.
+//
+// `Exec(..., ewWaitUntilTerminated, ...)` waits forever. That is tolerable when
+// the callee is this release's own binary; it is not when the callee is the
+// PREVIOUS release's binary, whose behaviour this installer cannot control and
+// cannot fix. A `service stop` that never returns hangs the upgrade before a
+// single file has been replaced — and in a silent install there is no output to
+// say so. It simply stops, which is indistinguishable from a wedged machine.
+//
+// Overrunning is not an error here. Every bounded call below is a courtesy step
+// whose job is done more forcefully a moment later by StopOwnedTasks and
+// ForceKillRagProcesses; the point is to give the graceful path a chance, not to
+// depend on it.
+//
+// PowerShell is the mechanism because it is the only always-present way to wait
+// with a timeout and then kill: `timeout.exe` waits without killing, `start
+// /wait` is unbounded, and Inno exposes no timeout of its own.
+function ExecBounded(const Exe, Params: string; TimeoutMs: Integer): Integer;
+var
+  ResultCode: Integer;
+  Cmd: string;
+begin
+  Cmd := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
+         '$ErrorActionPreference = ''SilentlyContinue''; ' +
+         'try { $p = Start-Process -FilePath ''' + Exe + ''' -ArgumentList ''' + Params +
+         ''' -WindowStyle Hidden -PassThru } catch { exit 0 }; ' +
+         'if (-not $p) { exit 0 }; ' +
+         'if (-not $p.WaitForExit(' + IntToStr(TimeoutMs) + ')) ' +
+         '{ try { $p.Kill() } catch { }; exit 258 }; ' +
+         'exit $p.ExitCode"';
+  if not Exec('powershell.exe', Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    ResultCode := -1;
+  Result := ResultCode;
 end;
 
 // End every scheduled task this product owns before touching its files.
@@ -264,10 +321,19 @@ begin
   if CurStep = ssInstall then
   begin
     // Phase 1: ask the service to stop gracefully (if upgrading).
+    //
+    // BOUNDED, because this runs the PREVIOUS release's `rag.exe`. Which
+    // release that is, and how it behaves when its own service is wedged, is
+    // not knowable from here — every version ever shipped is a possible callee.
+    // Unbounded, a single old binary that never returns stops the upgrade dead
+    // before any file is touched, with no output explaining why.
+    //
+    // Overrunning the limit is fine. Phases 2 and 3 do the same job without
+    // asking, so this is the polite attempt, not the mechanism.
     if FileExists(ExpandConstant('{app}\rag.exe')) then
     begin
-      Exec(ExpandConstant('{app}\rag.exe'), 'service stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-      Exec(ExpandConstant('{app}\rag.exe'), 'service uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      ResultCode := ExecBounded(ExpandConstant('{app}\rag.exe'), 'service stop', 60000);
+      ResultCode := ExecBounded(ExpandConstant('{app}\rag.exe'), 'service uninstall', 60000);
     end;
     // Phase 2: end the scheduled tasks BEFORE killing, so the scheduler cannot
     // restart what we are about to kill. The registration carries
@@ -305,9 +371,17 @@ begin
     Exit;
   end;
 
-  if not Exec(Verifier, 'selfcheck --quiet --expect-version {#MyAppVersion}',
-              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    Exit;   // could not run the check at all; do not invent a verdict
+  // Bounded: this runs at ssDone, after every file is already in place. A
+  // verifier that hangs would leave the installer running forever having
+  // ALREADY completed the installation successfully — the worst possible
+  // trade, since the check exists to add confidence, not to be load-bearing.
+  // 258 is the overrun code from ExecBounded; -1 means it could not be
+  // launched. Neither is evidence of a bad install, so neither invents a
+  // verdict.
+  ResultCode := ExecBounded(Verifier,
+                            'selfcheck --quiet --expect-version {#MyAppVersion}', 120000);
+  if (ResultCode = -1) or (ResultCode = 258) then
+    Exit;   // could not run the check, or it overran; do not invent a verdict
 
   if ResultCode <> 0 then
     MsgBox('RAG Tools {#MyAppVersion} was installed, but verification found that this '

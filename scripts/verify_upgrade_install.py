@@ -134,13 +134,63 @@ def health(port: int = 21420, tries: int = 45) -> dict | None:
     return None
 
 
-def install_silently(installer: Path, label: str) -> int:
+#: How long one silent install may take before we call it hung.
+#:
+#: The previous release installs in ~90 s on a hosted runner. 2400 s was chosen
+#: as "surely enough" and had the opposite effect: a hang burned forty minutes
+#: and then reported only `TimeoutExpired`, which says the installer did not
+#: finish and nothing about where it stopped. A tighter bound fails fast, and
+#: the log below says where.
+INSTALL_TIMEOUT_SECONDS = 900
+
+
+def _dump_inno_log(log_path: Path, label: str, *, tail: int = 120) -> None:
+    """Print the tail of Inno's own log.
+
+    This is the difference between "the installer hung" and "the installer hung
+    at line N". Inno logs every step with a timestamp — the graceful-stop Exec,
+    each [InstallDelete] entry, every file it copies, each [Run] entry — so the
+    last line before the silence names the operation that never returned.
+    """
+    if not log_path.is_file():
+        print(f"    (no Inno log at {log_path})", flush=True)
+        return
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        print(f"    (could not read the Inno log: {exc})", flush=True)
+        return
+    print(f"\n--- Inno log for {label} (last {tail} of {len(lines)} lines) ---",
+          flush=True)
+    for line in lines[-tail:]:
+        print(f"    {line}", flush=True)
+    print("--- end Inno log ---\n", flush=True)
+
+
+def install_silently(installer: Path, label: str, *, log_dir: Path | None = None) -> int:
     """Inno silent install. `startnow` is omitted so nothing opens a browser;
-    the service is started explicitly instead, which is the state that matters."""
+    the service is started explicitly instead, which is the state that matters.
+
+    `/LOG=` is not optional instrumentation. A silent installer that stalls
+    produces no console output at all, so without the log a failure is
+    indistinguishable from a hung runner — and the log is written incrementally,
+    which means it survives the timeout that kills the process.
+    """
+    log_path = (log_dir or installer.parent) / f"inno-{label.split()[0]}.log"
+    log_path.unlink(missing_ok=True)
     print(f"\n>>> installing {label}: {installer.name}", flush=True)
-    proc = run([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-                "/TASKS=addtopath,startup"], timeout=2400)
+    print(f"    log: {log_path}", flush=True)
+    argv = [str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+            "/TASKS=addtopath,startup", f"/LOG={log_path}"]
+    try:
+        proc = run(argv, timeout=INSTALL_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        print(f"    TIMED OUT after {INSTALL_TIMEOUT_SECONDS}s", flush=True)
+        _dump_inno_log(log_path, label)
+        raise
     print(f"    exit={proc.returncode}", flush=True)
+    if proc.returncode != 0:
+        _dump_inno_log(log_path, label)
     return proc.returncode
 
 
@@ -178,7 +228,7 @@ def main(argv=None) -> int:
 
     # --- 1. a genuine previous installation ------------------------------
     previous = download_previous(args.from_version, work)
-    install_silently(previous, f"v{args.from_version}")
+    install_silently(previous, f"v{args.from_version}", log_dir=work)
 
     print("\n--- the machine before the upgrade ---", flush=True)
     install = installed_dir()
@@ -207,7 +257,8 @@ def main(argv=None) -> int:
     config_before = config.read_bytes() if config.is_file() else None
 
     # --- 2. the upgrade, over a live installation ------------------------
-    rc = install_silently(new_installer, f"v{args.version} (over v{args.from_version})")
+    rc = install_silently(new_installer, f"v{args.version} (over v{args.from_version})",
+                          log_dir=work)
     check("the upgrade installer exited 0", rc == 0, f"exit {rc}")
 
     # --- 3. the machine must now belong to the new release ---------------

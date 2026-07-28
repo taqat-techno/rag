@@ -150,6 +150,13 @@ class PlatformAdapter(Protocol):
     #: not have to branch on the OS to find out.
     windowed_executable_name: Optional[str]
 
+    #: Whether this platform keeps a package database recording installed
+    #: versions at all. Declarative for the same reason as
+    #: :attr:`windowed_executable_name`: it is a fact about the OS, and a caller
+    #: deciding whether "no version found" is a finding or a non-question must
+    #: not have to branch on ``sys.platform`` to answer it.
+    records_installed_version: bool
+
     def recorded_version(self) -> Optional[str]:
         """The version the OS's own package database says is installed.
 
@@ -158,8 +165,16 @@ class PlatformAdapter(Protocol):
         record the rest of the system reads — Add/Remove Programs, winget and
         the installer's own upgrade detection all consult it.
 
-        ``None`` means this platform keeps no such record, which is not a
-        failure and must not be reported as agreement.
+        ``None`` means **no installation is recorded**. It does NOT mean "this
+        platform has no registry": that question is answered by
+        :attr:`records_installed_version`, and conflating the two is a real
+        defect rather than a hypothetical one. A single ``Optional[str]`` made
+        a clean Windows runner (registry present, nothing installed)
+        indistinguishable from Linux (no registry at all), so a check written to
+        prove the registry is genuinely read passed on the author's machine —
+        where the product happened to be installed — and failed in CI. The
+        three-state split is the same one :meth:`owned_processes` already draws
+        between "looked, found none" and "could not look".
         """
         ...
 

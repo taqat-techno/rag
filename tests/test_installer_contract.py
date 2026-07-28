@@ -285,3 +285,134 @@ def test_a_failed_verification_is_reported_as_an_error(script):
     assert re.search(r"ResultCode\s*<>\s*0", text), (
         "the verifier's exit code is never checked"
     )
+
+
+# --- F4: nothing in the upgrade path may wait forever ---------------------
+
+
+def _code_section(script: str) -> str:
+    """The `[Code]` body with Pascal comments stripped.
+
+    `section()` strips `;` comments, which is the comment syntax of the *ini*
+    sections. `[Code]` is Pascal and uses `//`, so nothing was ever stripped
+    there — and every structural assertion over this section was really being
+    made against the prose explaining the defect as much as the code fixing it.
+    Two tests here duly passed on a comment that quoted the very line they were
+    written to forbid.
+
+    Only whole-line comments are removed. `//` also appears inside string
+    literals (`http://...`), and cutting at the first occurrence anywhere would
+    silently truncate real code.
+    """
+    body = section(script, "Code")
+    return "\n".join(line for line in body.splitlines()
+                     if not line.strip().startswith("//"))
+
+
+def test_the_previous_releases_binary_is_never_run_unbounded(script):
+    """The upgrade path must not wait forever on a binary it did not ship.
+
+    `Exec(..., ewWaitUntilTerminated, ...)` has no timeout. That is acceptable
+    for this release's own executables and unacceptable for `{app}\rag.exe`
+    during ssInstall, because at that moment `{app}` still holds the PREVIOUS
+    release — any version ever published — and how it behaves when its own
+    service is wedged is not knowable from here.
+
+    Observed: a silent upgrade over a running v2.7.0 produced no output and did
+    not finish in forty minutes, while the same installer completed a clean
+    install in ninety seconds.
+    """
+    code = _code_section(script)
+    # Built with re.escape rather than hand-escaped. Written by hand, the
+    # literal `{app}\rag.exe` needs FOUR backslashes in a raw string: `\\rag`
+    # reaches the regex engine as `\r` — a carriage return — so the pattern
+    # matched nothing and the test passed against the very file it was written
+    # to reject. A negative control caught it; re.escape removes the trap.
+    target = re.escape(r"ExpandConstant('{app}\rag.exe')")
+    unbounded = re.findall(rf"Exec\(\s*{target}.*?ewWaitUntilTerminated",
+                           code, re.DOTALL)
+    assert not unbounded, (
+        "the previous release's rag.exe is still run with an unbounded Exec: "
+        f"{unbounded}"
+    )
+
+
+def test_a_bounded_exec_helper_exists_and_enforces_a_timeout(script):
+    code = _code_section(script)
+    assert "function ExecBounded(" in code, "no bounded-exec helper"
+    body = re.search(r"function ExecBounded\(.*?^end;", code,
+                     re.DOTALL | re.MULTILINE)
+    assert body, "ExecBounded has no body"
+    text = body.group(0)
+    assert "WaitForExit(" in text, "ExecBounded does not actually wait with a timeout"
+    assert ".Kill()" in text, "ExecBounded never kills a process that overruns"
+
+
+def test_the_graceful_stop_is_bounded(script):
+    """Phase 1 of ssInstall is a courtesy, not a mechanism — it must not block."""
+    code = _code_section(script)
+    step = re.search(r"if CurStep = ssInstall then.*?^  end;", code,
+                     re.DOTALL | re.MULTILINE)
+    assert step, "ssInstall handling not found"
+    text = step.group(0)
+    assert "ExecBounded" in text, "the pre-install stop sequence is not bounded"
+
+
+def test_verification_cannot_hang_a_completed_installation(script):
+    """ssDone runs after every file is in place; a stalled verifier there would
+    hang an installation that had already succeeded."""
+    bodies = [m.group(0) for m in
+              re.finditer(r"procedure VerifyInstallation\(\);.*?^end;", script,
+                          re.DOTALL | re.MULTILINE)
+              if "forward;" not in m.group(0).splitlines()[0]]
+    assert bodies, "VerifyInstallation has no definition"
+    assert "ExecBounded" in bodies[0], "the verifier is invoked unbounded"
+
+
+# --- F5: the kill must not reach processes this installation does not own ---
+
+
+def test_the_process_kill_is_scoped_by_path_not_by_image_name(script):
+    """`/IM qdrant.exe` matches every Qdrant on the machine.
+
+    Ours is one of them; the others are not ours to kill. `storage_backend =
+    "external"` explicitly means "a server you run yourself", a second ragtools
+    install has its own, and an unrelated product may ship a binary with the
+    same common name. Killing those is data loss in someone else's application,
+    caused by installing this one.
+
+    The product already draws this distinction everywhere else — `selfcheck`
+    compares process paths against the install directory precisely so it does
+    not accuse a stranger's process.
+    """
+    code = _code_section(script)
+    body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
+                     re.DOTALL | re.MULTILINE)
+    assert body, "ForceKillRagProcesses has no definition"
+    text = body.group(0)
+
+    assert "/IM" not in text, (
+        "processes are still matched by image name, which reaches every "
+        "process of that name on the machine"
+    )
+    assert "ExecutablePath" in text, "the kill does not inspect process paths"
+    assert "{app}" in text, "the kill is not scoped to the install directory"
+
+
+def test_the_kill_does_not_depend_on_wmic(script):
+    """`wmic` is deprecated and absent from recent Windows builds, where a
+    kill built on it silently matches nothing."""
+    code = _code_section(script)
+    assert "wmic" not in code.lower(), "the installer depends on deprecated wmic"
+
+
+def test_every_owned_image_is_still_covered(script):
+    """Scoping must not quietly narrow WHICH images are stopped — that was the
+    3.0.1 defect, and re-introducing it would restore the locked-file failure.
+    """
+    code = _code_section(script)
+    body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
+                     re.DOTALL | re.MULTILINE)
+    assert body
+    for image in ("rag.exe", "ragw.exe", "qdrant.exe"):
+        assert image in body.group(0), f"{image} is no longer stopped"

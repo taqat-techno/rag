@@ -130,8 +130,16 @@ async def lifespan(app: FastAPI):
             stop_runtime()
         return
 
+    # Bring the configuration to the current schema BEFORE anything reads it.
+    # Ordering is the whole point: QdrantOwner opens the store and creates
+    # collections while constructing itself, so a migration that ran later
+    # would already be looking at a store built to the previous layout.
+    from ragtools.bootstrap import ensure_config_current_once
+    _bootstrap = ensure_config_current_once()
+
     _settings = Settings()
     logger.info("Starting RAGTools service on %s:%d", _settings.service_host, _settings.service_port)
+    logger.info("Config: %s", _bootstrap.describe())
 
     # Managed Qdrant must be up BEFORE the owner connects, because the owner
     # resolves its client through the storage backend. If it cannot start

@@ -159,6 +159,10 @@ class WindowsAdapter:
     #: Windows ships one; see WINDOWED_EXE_NAME.
     windowed_executable_name = WINDOWED_EXE_NAME
 
+    #: Windows keeps one (the uninstall registry), so "nothing recorded"
+    #: on Windows is a finding rather than a non-question.
+    records_installed_version = True
+
     def recorded_version(self) -> Optional[str]:
         """`DisplayVersion` from Inno's uninstall key, or None if absent.
 

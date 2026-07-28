@@ -127,6 +127,9 @@ class DarwinAdapter:
     #: No windowless variant exists; Mach-O has no console-vs-GUI subsystem split.
     windowed_executable_name = None
 
+    #: No OS-wide package database this product installs itself into.
+    records_installed_version = False
+
     def recorded_version(self):
         """launchd keeps no per-application version record this product
         writes, so there is nothing to disagree with. None means "no record",

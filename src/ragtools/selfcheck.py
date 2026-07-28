@@ -106,10 +106,22 @@ def check_recorded_version(expect: str) -> Check:
     the next run is an upgrade.
     """
     impl = _adapter()
-    recorded = impl.recorded_version() if impl else None
-    if recorded is None:
+    if impl is None or not getattr(impl, "records_installed_version", False):
         return Check("recorded install version", True,
                      "this platform records no installed version", skipped=True)
+
+    # A source checkout has no business appearing in the OS package database,
+    # so its absence there is not a finding. Every sibling check already asks
+    # this; this one did not, which is why it reported a FAIL on any Windows
+    # machine that had never installed the packaged product — including every
+    # CI runner.
+    if not _is_packaged():
+        return Check("recorded install version", True, "source install", skipped=True)
+
+    recorded = impl.recorded_version()
+    if recorded is None:
+        return Check("recorded install version", False,
+                     "the system records no installation of this product")
     return Check("recorded install version", recorded == expect,
                  f"the system records {recorded}, expected {expect}")
 

@@ -143,6 +143,11 @@ def main():
         if os.path.exists(model_cache):
             os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", model_cache)
 
+    # Before Settings() is read: see ragtools.bootstrap for why the seam is
+    # here rather than after the owner exists.
+    from ragtools.bootstrap import ensure_config_current_once
+    ensure_config_current_once()
+
     settings = Settings()
     host = args.host or settings.service_host
     port = args.port or settings.service_port

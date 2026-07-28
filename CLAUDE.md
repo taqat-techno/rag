@@ -12,6 +12,23 @@ Local-first RAG system over documentation, with **opt-in** source-code and confi
 
 ## Architecture Decisions (Non-Negotiable)
 
+### Configuration schema and migration
+- **`CONFIG_VERSION` lives in `config.py` and is defined exactly once.** Config
+  writers PRESERVE the version a file declares and never invent one; only the
+  migrator changes it. (Three literals used to disagree: `_save_projects_to_toml`
+  wrote `2` from 16 call sites and `_update_toml_config` stamped `1`, so a
+  migrated config was demoted by the user's next project edit.)
+- **`bootstrap.ensure_config_current()` is the only migration seam**, called
+  before `Settings()` is read by any owner — `QdrantOwner.__init__` opens the
+  store and creates collections, so a later migration would be looking at a
+  store built to the previous layout. Writers migrate (service, CLI,
+  supervisor); read paths do not, which is safe only because migration is
+  behaviour-preserving.
+- **Migration never changes an existing install's collection layout.** Switching
+  layout forces a full re-index of every file at first boot; it is offered via
+  `rag storage strategy`, never imposed. A config with no projects adopts
+  `per_project` because there is nothing to re-index.
+
 ### Storage
 - **`storage_backend`** selects the engine: `embedded` (default) | `managed` | `external`.
   - `embedded` — `QdrantClient(path=...)`. An in-process **pure-Python** engine:
@@ -118,6 +135,10 @@ rag projects                      # List indexed projects with counts
 rag watch .                       # Auto-index on .md changes (Ctrl+C to stop)
 rag serve                         # Start the MCP server (core + user-enabled optional tools)
 rag version                       # Show version
+rag selfcheck                     # Verify the INSTALLATION (version, autostart targets, stray processes)
+rag storage show                  # Which engine and collection layout are actually in force
+rag storage backend managed       # embedded | managed | external — requires a full re-index
+rag storage strategy per_project  # shared | per_project — requires a full re-index
 ```
 
 ## Testing
@@ -271,7 +292,27 @@ All settings in `config.py` via Pydantic Settings. Override with env vars prefix
 | `RAG_SCORE_THRESHOLD` | `0.3` | Minimum similarity score |
 | `RAG_CONTENT_ROOT` | `.` | Root for project discovery |
 | `RAG_STATE_DB` | `data/index_state.db` | SQLite state path |
-| `RAG_INDEX_SOURCE_CODE` | `false` | Global default: also index source code + config/data, not just docs. Overridable **per-project** ("dev mode") via the admin panel, `rag project dev-mode <id> on/off/inherit`, or the `set_project_dev_mode` MCP tool — stored as `ProjectConfig.index_source_code` (None=inherit / True=code / False=docs). |
+| `RAG_INDEX_SOURCE_CODE` | `false` | Global default when a project has no explicit mode: `false` = docs only, `true` = also index source + config/data. **Per-project this is superseded by `ProjectConfig.mode`** — see below. |
+
+### Per-project indexing mode (authoritative)
+
+Each project carries an explicit **`mode`**, not a boolean. Default is `docs`.
+
+| Mode | Indexes |
+|---|---|
+| `docs` | documentation / Markdown / text only (**default**) |
+| `code` | source + config/data files only |
+| `general` | both |
+
+Set it via the admin panel, the CLI `rag project mode <id> docs|code|general`, or the MCP tool
+**`set_project_mode(project, mode, confirm_token)`** (`src/ragtools/integration/mcp_server.py:253`, `:776`).
+
+> **Do not use `set_project_dev_mode`, `rag project dev-mode`, or `ProjectConfig.index_source_code`
+> as a per-project tri-state.** Those names come from the superseded P1–P7 design (commits `0e2fd1f`..`ceb0d88`)
+> and were replaced one commit later by `5fb10e8`. They do not exist in the shipped v2.7.0 interface.
+
+A project in `docs` mode returns **no code chunks**; an empty `find_definition` / `search_project_context`
+result is therefore *not* evidence that a symbol is absent. Check `project_status(project=...)` → `mode` first.
 | `RAG_SECRET_ALLOWLIST` | `[]` | Globs to re-include specific secret-bearing files (default: none) |
 
 ### Shared dependencies (catalog + per-project links)

@@ -138,6 +138,22 @@ def health():
     if not storage_ok:
         issues.append("storage_unreachable")
 
+    # A configuration that could not be brought to the current schema is a real
+    # degradation: the product is running on fallback defaults rather than on
+    # what the file says, and nothing else would ever mention it. Silence here
+    # is exactly how migrate_config came to be unreachable for two releases.
+    config_state = "unknown"
+    try:
+        from ragtools.bootstrap import last_result
+
+        bootstrap = last_result()
+        if bootstrap is not None:
+            config_state = bootstrap.describe()
+            if bootstrap.degraded:
+                issues.append("config_migration_failed")
+    except Exception:  # noqa: BLE001 — never let diagnostics break liveness
+        config_state = "unknown"
+
     return {
         # "ready" stays truthful about the process for liveness back-compat;
         # `degraded` + `issues` carry the real state.
@@ -155,6 +171,10 @@ def health():
         # the source.
         "storage_backend": getattr(owner.settings, "storage_backend", "embedded"),
         "collection_strategy": owner.router.strategy,
+        # What the schema migration did on this boot, so "am I actually running
+        # a v3 configuration?" is answerable without reading the file.
+        "config_version": getattr(owner.settings, "config_version", None),
+        "config_state": config_state,
     }
 
 
@@ -2321,9 +2341,12 @@ def system_health_endpoint():
     try:
         owner = get_owner()
         status = owner.get_status()
-        from ragtools.service.owner import compute_scale_warning
+        # Reuse the status record rather than recomputing it. Recomputing here
+        # dropped `capabilities`, so a managed or external engine — which has no
+        # brute-force ceiling at all — was reported as "over" by this endpoint
+        # while /api/status said "ok" about the same index.
         pc = status.get("points_count", 0)
-        scale = compute_scale_warning(pc)
+        scale = status.get("scale") or {"level": "unknown", "message": ""}
         checks.append({
             "component": "collection",
             "status": "warning" if scale["level"] == "over" else "ok",

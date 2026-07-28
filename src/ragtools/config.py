@@ -28,6 +28,21 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 logger = logging.getLogger("ragtools.config")
 
 
+#: The config schema version this release reads and writes.
+#:
+#: ONE definition, because there used to be three literals and they disagreed.
+#: `_save_projects_to_toml` wrote ``2`` unconditionally from sixteen call sites —
+#: every project add, edit, mode change, ignore rule and dependency change from
+#: the CLI, the admin panel and MCP alike — while `_update_toml_config` stamped
+#: ``1`` onto a file that had no version key. A migration to v3 was therefore
+#: undone by the user's next edit and re-run on the following boot, forever.
+#:
+#: Lives here rather than in `ragtools.upgrade` because the version of the
+#: schema is a fact about the schema. `upgrade.migrate` re-exports it so the
+#: name keeps working where it was already imported.
+CONFIG_VERSION = 3
+
+
 # --- Project Configuration ---
 
 # Canonical project indexing modes (Project Mode, distinct from Project Status).
