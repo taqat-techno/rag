@@ -530,3 +530,41 @@ def test_the_code_section_calls_only_functions_that_exist(script):
         "script nor a known Inno Setup support function. If it IS one, add it "
         "to INNO_BUILTINS after checking Inno's Support Functions Reference."
     )
+
+
+def test_restart_manager_is_disabled(script):
+    """Two mechanisms closing the same processes, and the loser aborts the install.
+
+    Inno's RestartManager enumerates BEFORE `CurStepChanged(ssInstall)` and
+    shuts down AFTER it, so it acts on a list that is as stale as our pre-install
+    phase is long — 86 seconds, measured. Anything it then fails to close raises
+    an Abort/Retry/Ignore box, and `/SUPPRESSMSGBOXES` answers with the DEFAULT,
+    which is Abort. Observed exactly that: "Some applications could not be shut
+    down" -> "User canceled the installation process" -> exit 5, on an upgrade
+    where nothing was actually wrong.
+
+    This installer closes its own processes, scoped by path, and verifies the
+    result. RM adds a second opinion and a way to lose.
+    """
+    setup = section(script, "Setup")
+    match = re.search(r"^CloseApplications=(\w+)", setup, re.MULTILINE)
+    assert match, "CloseApplications is not stated explicitly"
+    assert match.group(1).lower() == "no", (
+        "RestartManager is enabled; its suppressed Abort/Retry/Ignore defaults "
+        "to Abort and cancels silent upgrades"
+    )
+
+
+def test_the_kill_verifies_its_own_result(script):
+    """With RestartManager off, this is the only thing between a running process
+    and a locked file — so "we sent a stop" is not good enough. Stop-Process
+    returns before the handle is released, and a supervisor can respawn a child
+    in the moment after its own death."""
+    code = _code_section(script)
+    body = re.search(r"procedure ForceKillRagProcesses\(\);.*?^end;", code,
+                     re.DOTALL | re.MULTILINE)
+    assert body, "ForceKillRagProcesses has no definition"
+    text = body.group(0)
+
+    assert "for ($i" in text, "the kill does not re-check after stopping"
+    assert "$found.Count -eq 0" in text, "nothing verifies the processes are gone"

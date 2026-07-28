@@ -44,12 +44,37 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ; Prevent two installers running simultaneously (corrupts {app} during copy).
 SetupMutex=RAGToolsInstallerMutex_7E4B2A3C
-; Windows Restart Manager: detect running rag.exe (service, tray, supervisor,
-; MCP clients holding a handle) and offer to close them before copying files.
-; Pre-v2.5.1 users had to Task-Manager-kill everything by hand — this fixes it.
-CloseApplications=yes
-; Don't relaunch them after install — the post-install [Run] section handles
-; starting the service cleanly with the new binary.
+; Windows Restart Manager: OFF, because this installer closes its own processes
+; deterministically and RM actively breaks that.
+;
+; Measured, from Inno's own log during a silent upgrade over a running 3.0.1:
+;
+;   05:24:09.772  RestartManager found an application using one of our files: rag
+;                 (86-second gap: CurStepChanged(ssInstall) stopping and killing)
+;   05:25:35.812  Starting the installation process.
+;   05:25:35.814  Shutting down applications using our files.
+;   05:25:35.919  Some applications could not be shut down.
+;   05:25:35.919  Defaulting to Abort for suppressed message box (Abort/Retry/Ignore)
+;   05:25:35.919  User canceled the installation process.
+;
+; RM enumerates BEFORE our pre-install phase and shuts down AFTER it, so it acts
+; on a list that is 86 seconds stale. Whatever it then fails to close — a
+; process we already stopped, or one that legitimately exited — produces an
+; Abort/Retry/Ignore box, and `/SUPPRESSMSGBOXES` answers it with the DEFAULT,
+; which is **Abort**. A cancelled install, rolled back, exit code 5: the upgrade
+; is refused not because anything is wrong but because a second mechanism
+; disagreed with the first.
+;
+; RM was added pre-v2.5.1 when nothing else closed running processes. Something
+; else does now: `ForceKillRagProcesses` stops every owned image, scoped by
+; executable path, at ssInstall — before [InstallDelete] and before [Files] —
+; and verifies the result. If it ever misses one, the copy fails loudly with a
+; file-in-use error and `rag selfcheck` reports a mixed installation at ssDone.
+; Both are better than a silent, self-inflicted cancellation.
+CloseApplications=no
+; Moot with CloseApplications=no, kept explicit so re-enabling RM cannot also
+; silently start relaunching applications: the post-install [Run] section is
+; what starts the service, with the new binary.
 RestartApplications=no
 
 [Languages]
@@ -253,12 +278,23 @@ begin
     '$ErrorActionPreference = ''SilentlyContinue''; ' +
     '$app = ''' + ExpandConstant('{app}') + '''; ' +
     '$data = ''' + ExpandConstant('{localappdata}\RAGTools') + '''; ' +
-    'Get-Process -Name ' + Images[0] + ',' + Images[1] + ',' + Images[2] +
-    ' -ErrorAction SilentlyContinue | ' +
+    // Kill, wait, LOOK AGAIN — up to three rounds.
+    //
+    // With RestartManager disabled this is the only thing standing between a
+    // running process and a locked file, so "we sent a stop" is not good enough:
+    // a supervisor can respawn a child in the moment after its own death, and
+    // Stop-Process returns before the handle is actually released. The loop
+    // exits as soon as a scan finds nothing, so the common case costs one pass.
+    'for ($i = 0; $i -lt 3; $i++) { ' +
+    '  $found = @(Get-Process -Name ' + Images[0] + ',' + Images[1] + ',' +
+    Images[2] + ' -ErrorAction SilentlyContinue | ' +
     'Where-Object { $_.Path -and ' +
     '( $_.Path.StartsWith($app, ''OrdinalIgnoreCase'') -or ' +
-    '  $_.Path.StartsWith($data, ''OrdinalIgnoreCase'') ) } | ' +
-    'Stop-Process -Force"';
+    '  $_.Path.StartsWith($data, ''OrdinalIgnoreCase'') ) }); ' +
+    '  if ($found.Count -eq 0) { break }; ' +
+    '  $found | Stop-Process -Force; ' +
+    '  Start-Sleep -Milliseconds 700; ' +
+    '}"';
   Exec('powershell.exe', Filter, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
   // Short delay for NTFS file handles to fully release so the copy step
