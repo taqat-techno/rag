@@ -72,6 +72,25 @@ def copy_model_to_dist():
     print(f"Model copied to: {dest}")
 
 
+def fetch_engine():
+    """Place the pinned managed Qdrant engine inside the bundle.
+
+    `find_qdrant_binary` has always looked for one "alongside the packaged
+    application (the installer ships it here)" and no release ever shipped it —
+    so `managed` was a mode the product could describe and never enter. Every
+    attempt fell back to embedded with a reason nobody was reading.
+
+    Packaged here rather than downloaded at runtime: a first start that reaches
+    the internet is a first start that fails behind a proxy, on an air-gapped
+    machine, or whenever GitHub is having a day. The engine is part of the
+    product, so it ships with the product.
+    """
+    import fetch_qdrant
+
+    print("Fetching the managed Qdrant engine...")
+    return fetch_qdrant.fetch(DIST_DIR / "bin")
+
+
 def verify_build():
     """Quick verification that the bundle works."""
     if sys.platform == "win32":
@@ -128,6 +147,8 @@ def run_inno_setup():
 def main():
     parser = argparse.ArgumentParser(description="Build RAG Tools")
     parser.add_argument("--no-model", action="store_true", help="Skip model download")
+    parser.add_argument("--no-engine", action="store_true",
+                        help="Skip the managed Qdrant engine (test builds only)")
     parser.add_argument("--installer", action="store_true", help="Also build Inno Setup installer")
     args = parser.parse_args()
 
@@ -148,10 +169,17 @@ def main():
     if not args.no_model:
         copy_model_to_dist()
 
-    # Step 4: Verify
+    # Step 4: the managed engine, INSIDE the bundle
+    if not args.no_engine:
+        fetch_engine()
+    else:
+        print("Skipping the managed engine (--no-engine) — managed mode will "
+              "fall back to embedded in this build")
+
+    # Step 5: Verify
     verify_build()
 
-    # Step 5: Inno Setup (optional)
+    # Step 6: Inno Setup (optional)
     if args.installer:
         run_inno_setup()
 

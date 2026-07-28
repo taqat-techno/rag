@@ -221,7 +221,7 @@ jobs:
         #     refactor passes every unit test and restores the login window.
         #   * one .dist-info per distribution — the invariant the crash loop
         #     violated, and a property of a directory that only exists here.
-        run: python scripts/verify_bundle.py --bundle dist/rag --require-windowed
+        run: python scripts/verify_bundle.py --bundle dist/rag --require-windowed --require-engine
 
   real-upgrade:
     name: packaged v${{ matrix.from }} -> this build, on a real machine

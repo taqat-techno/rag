@@ -142,12 +142,42 @@ def check_no_layered_manifests(bundle: Path) -> None:
               f"{safetensors} — this is the 3.0.0 crash-loop signature")
 
 
+def check_managed_engine(bundle: Path) -> None:
+    """The managed engine must be IN the bundle, not merely supported by it.
+
+    `find_qdrant_binary` looks for one "alongside the packaged application (the
+    installer ships it here)" — a comment that was true of the intent and false
+    of every release. Nothing shipped it, so `managed` fell back to embedded on
+    every machine, correctly reporting a reason nobody read.
+
+    That failure is invisible from inside the product: falling back IS the
+    designed behaviour. The only place it can be caught is here, against a real
+    bundle, before it becomes an installer.
+    """
+    engine = bundle / "bin" / ("qdrant.exe" if (bundle / "rag.exe").is_file()
+                               else "qdrant")
+    if not engine.is_file():
+        check("the managed engine is packaged", False,
+              f"{engine} is missing — `managed` would silently fall back to "
+              "embedded on every installation")
+        return
+
+    size_mb = engine.stat().st_size / 1048576
+    check("the managed engine is packaged", True, f"{engine.name} ({size_mb:.1f} MB)")
+    # A truncated or placeholder file passes an existence check and fails at the
+    # one moment it matters, so assert it is plausibly an executable.
+    check("the packaged engine is a real binary", size_mb > 5,
+          f"{size_mb:.1f} MB")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", default="dist/rag",
                         help="the PyInstaller one-dir output")
     parser.add_argument("--require-windowed", action="store_true",
                         help="fail if ragw.exe is absent (Windows builds)")
+    parser.add_argument("--require-engine", action="store_true",
+                        help="fail if the managed Qdrant engine is not bundled")
     args = parser.parse_args(argv)
 
     bundle = Path(args.bundle)
@@ -165,6 +195,11 @@ def main(argv=None) -> int:
         check_windowed_executable(bundle)
     else:
         print("  [skip] windowed-executable checks — not a Windows bundle")
+
+    if args.require_engine:
+        check_managed_engine(bundle)
+    else:
+        print("  [skip] managed-engine check — not requested (--require-engine)")
 
     failed = [r for r in results if r[1] == FAIL]
     print(f"\n  {len(results) - len(failed)} passed, {len(failed)} failed")

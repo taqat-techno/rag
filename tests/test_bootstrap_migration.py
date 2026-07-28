@@ -113,14 +113,117 @@ def test_projects_survive_the_migration(v2_config):
 # --- the product decision, pinned ------------------------------------------
 
 
-def test_an_existing_install_keeps_the_layout_it_already_had(v2_config):
-    """Switching layout forces a full re-index of every file, at first boot,
-    on a machine the user just upgraded. It is offered, never imposed."""
+def test_a_legacy_config_with_no_storage_keys_adopts_the_v3_architecture(v2_config):
+    """A missing key is not a decision.
+
+    A v2 config has no `collection_strategy` because the key did not exist when
+    it was written — not because anyone chose the value it now implies. Treating
+    that absence as "the user wants shared" preserves a legacy architecture
+    nobody asked for and leaves the scale problem that prompted the upgrade
+    exactly where it was, discoverable only by finding and running
+    `rag storage strategy` by hand.
+    """
     from ragtools.bootstrap import ensure_config_current
 
     ensure_config_current()
 
-    assert read(v2_config)["collection_strategy"] == "shared"
+    after = read(v2_config)
+    assert after["collection_strategy"] == "per_project"
+    assert after["storage_backend"], "the engine was left unstated"
+
+
+def test_the_migration_records_which_values_it_chose(v2_config):
+    """Absence is readable exactly ONCE.
+
+    After migration the keys exist, and a later run cannot tell a value it wrote
+    from one the user chose. Provenance has to be recorded at the moment the
+    distinction is still visible, or it is lost with the write that erases it.
+    """
+    from ragtools.bootstrap import ensure_config_current
+
+    ensure_config_current()
+
+    record = read(v2_config).get("migration") or {}
+    assert set(record.get("adopted") or []) == {"storage_backend", "collection_strategy"}
+    assert record.get("from_version") == 2
+
+
+def test_an_explicit_choice_is_preserved_even_when_it_is_the_legacy_one(tmp_path, monkeypatch):
+    """`embedded` and `shared` chosen deliberately are decisions, not defaults.
+
+    The rule cuts both ways: if absence means "migrate me", then presence must
+    mean "leave me alone" — otherwise the product overrides users who read the
+    documentation and configured what they wanted.
+    """
+    import ragtools.config as cfg
+    from ragtools.bootstrap import ensure_config_current
+
+    path = tmp_path / "config.toml"
+    path.write_bytes(tomli_w.dumps({
+        "version": 2,
+        "storage_backend": "embedded",
+        "collection_strategy": "shared",
+        "projects": [{"id": "p1", "path": str(tmp_path), "mode": "docs"}],
+    }).encode("utf-8"))
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: path)
+
+    ensure_config_current()
+
+    after = read(path)
+    assert after["storage_backend"] == "embedded"
+    assert after["collection_strategy"] == "shared"
+    assert "migration" not in after, "an explicit config was recorded as adopted"
+
+
+def test_an_external_backend_keeps_its_address_and_credentials(tmp_path, monkeypatch):
+    """Never overwrite what points at a server the user runs.
+
+    A migration that rewrote `storage_url` would disconnect an installation from
+    its own database, and one that dropped `storage_api_key` would do it while
+    looking like a permissions problem.
+    """
+    import ragtools.config as cfg
+    from ragtools.bootstrap import ensure_config_current
+
+    path = tmp_path / "config.toml"
+    path.write_bytes(tomli_w.dumps({
+        "version": 2,
+        "storage_backend": "external",
+        "storage_url": "http://qdrant.internal:6333",
+        "storage_api_key": "a-real-secret",
+        "collection_strategy": "shared",
+        "projects": [],
+    }).encode("utf-8"))
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: path)
+
+    ensure_config_current()
+
+    after = read(path)
+    assert after["storage_backend"] == "external"
+    assert after["storage_url"] == "http://qdrant.internal:6333"
+    assert after["storage_api_key"] == "a-real-secret"
+    assert after["collection_strategy"] == "shared"
+
+
+def test_a_partially_explicit_config_only_adopts_what_is_missing(tmp_path, monkeypatch):
+    """Each key is judged on its own. Setting one does not consent for the other."""
+    import ragtools.config as cfg
+    from ragtools.bootstrap import ensure_config_current
+
+    path = tmp_path / "config.toml"
+    path.write_bytes(tomli_w.dumps({
+        "version": 2,
+        "collection_strategy": "shared",     # explicit
+        "projects": [{"id": "p1", "path": str(tmp_path), "mode": "docs"}],
+    }).encode("utf-8"))                       # storage_backend absent
+    monkeypatch.setattr(cfg, "_find_config_path", lambda: path)
+
+    ensure_config_current()
+
+    after = read(path)
+    assert after["collection_strategy"] == "shared", "an explicit layout was overridden"
+    assert after["storage_backend"], "the absent engine was not adopted"
+    assert (after.get("migration") or {}).get("adopted") == ["storage_backend"]
 
 
 def test_a_config_with_no_projects_adopts_the_v3_layout(tmp_path, monkeypatch):
@@ -137,23 +240,53 @@ def test_a_config_with_no_projects_adopts_the_v3_layout(tmp_path, monkeypatch):
     assert read(path)["collection_strategy"] == "per_project"
 
 
-def test_migration_never_changes_the_resolved_behaviour_of_an_existing_install(v2_config):
-    """The reason read paths may safely skip migration.
+def test_migration_now_changes_the_declared_architecture(v2_config):
+    """Migration is deliberately NO LONGER behaviour-preserving.
 
-    A reader looking at the unmigrated file must resolve the same backend and
-    layout it would resolve afterwards; otherwise "only writers migrate" would
-    be a correctness bug rather than a simplification.
+    That was the justification for "only writers migrate": a reader looking at
+    an unmigrated file resolved exactly what it would resolve afterwards, so
+    skipping migration on read paths cost nothing. Adopting the recommended
+    architecture for legacy defaults removes that guarantee by design — the
+    whole point is that the machine ends up somewhere different.
+
+    Two consequences follow, and they are tracked below rather than left
+    implicit.
     """
+    from ragtools.bootstrap import ensure_config_current
     from ragtools.config import Settings
 
     before = Settings()
-    resolved_before = (before.storage_backend, before.collection_strategy)
+    assert before.collection_strategy == "shared", "fixture is not a legacy config"
 
-    from ragtools.bootstrap import ensure_config_current
     ensure_config_current()
 
     after = Settings()
-    assert (after.storage_backend, after.collection_strategy) == resolved_before
+    assert after.collection_strategy == "per_project", (
+        "the legacy default was not migrated to the recommended architecture"
+    )
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "KNOWN GAP — the config records the TARGET architecture the moment migration "
+    "runs, but the index for it does not exist until the cutover completes. A "
+    "reader resolving the target early would query empty collections and return "
+    "nothing, while the previous index sits intact and unqueried. The effective "
+    "architecture must therefore stay the old one until the re-index has been "
+    "built and validated, which is the cutover state machine (amendment item 9) "
+    "and is NOT yet implemented. Tracked here so the gap is visible in the suite "
+    "rather than only in prose."))
+def test_the_effective_architecture_waits_for_the_index_to_exist(v2_config):
+    from ragtools.bootstrap import ensure_config_current
+    from ragtools.config import Settings
+
+    ensure_config_current()
+
+    effective = Settings()
+    # Until the re-index has run, the layout that can actually answer a query is
+    # still the previous one.
+    assert effective.collection_strategy == "shared", (
+        "the effective layout switched before its index existed"
+    )
 
 
 # --- failure is loud, not fatal --------------------------------------------
