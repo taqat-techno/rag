@@ -1010,7 +1010,16 @@ class QdrantOwner:
         Fail-closed boundary (S1/A2): an unscoped or requested-but-empty scope
         is REFUSED here with ``ScopeUnresolvedError`` unless ``allow_unscoped``
         is explicitly set. This single choke point covers HTTP and MCP-direct.
+
+        It is also where a rebuild in flight is refused. While a layout
+        migration is running the new collections exist and are being filled, so
+        a query would return the ordinary "no matches" shape from an index that
+        has not been built yet — telling the user their content is gone, in the
+        one form they have no reason to doubt.
         """
+        from ragtools.upgrade.relayout import guard_ready
+
+        guard_ready(self._settings)
         resolve_scope(project_id, project_ids, allow_unscoped=allow_unscoped)
         with self._lock:
             searcher = Searcher(

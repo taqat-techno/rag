@@ -154,10 +154,45 @@ def health():
     except Exception:  # noqa: BLE001 — never let diagnostics break liveness
         config_state = "unknown"
 
+    # A half-rebuilt index is not a ready one.
+    #
+    # During a layout migration the new collections exist and are being filled.
+    # Answering "ready" then means every search returns the ordinary "no
+    # matches" shape from an index that simply has not been built yet — which
+    # tells the user their content is gone. That answer is both wrong and
+    # completely convincing, so `status` itself changes here rather than only
+    # `degraded`: callers that check nothing else still get the truth.
+    migration_state = None
+    try:
+        from ragtools.upgrade import relayout
+
+        plan = relayout.active_plan(owner.settings)
+        if plan is not None:
+            report = relayout.progress(owner.settings, plan)
+            if report is not None and not report.complete:
+                migration_state = report
+                issues.append("reindex_in_progress")
+                if report.failed:
+                    issues.append("reindex_incomplete")
+    except Exception:  # noqa: BLE001 — never let this break liveness
+        migration_state = None
+
     return {
-        # "ready" stays truthful about the process for liveness back-compat;
-        # `degraded` + `issues` carry the real state.
-        "status": "ready",
+        # "ready" stays truthful about the process for liveness back-compat,
+        # EXCEPT while the index is being rebuilt, when it is not true at all.
+        "status": "migrating" if migration_state is not None else "ready",
+        "migration": (None if migration_state is None else {
+            "state": migration_state.describe(),
+            "total": migration_state.total,
+            "done": migration_state.done,
+            "failed": migration_state.failed,
+            "pending": migration_state.pending,
+            "failures": [
+                {"kind": k, "id": i, "error": e}
+                for k, i, e in migration_state.failures
+            ],
+            "retry": "rag upgrade --resume",
+        }),
         "collection": owner.settings.collection_name,
         "version": __version__,
         "watcher_running": watcher_running,

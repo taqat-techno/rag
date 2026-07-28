@@ -266,27 +266,31 @@ def test_migration_now_changes_the_declared_architecture(v2_config):
     )
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "KNOWN GAP — the config records the TARGET architecture the moment migration "
-    "runs, but the index for it does not exist until the cutover completes. A "
-    "reader resolving the target early would query empty collections and return "
-    "nothing, while the previous index sits intact and unqueried. The effective "
-    "architecture must therefore stay the old one until the re-index has been "
-    "built and validated, which is the cutover state machine (amendment item 9) "
-    "and is NOT yet implemented. Tracked here so the gap is visible in the suite "
-    "rather than only in prose."))
-def test_the_effective_architecture_waits_for_the_index_to_exist(v2_config):
+def test_the_product_refuses_to_look_ready_while_the_index_is_rebuilding(v2_config):
+    """How the target/effective split is resolved, now that it is settled.
+
+    Migration switches the architecture immediately and the index for it does
+    not exist yet. The answer is NOT to keep serving the old layout — dual-read
+    is explicitly not a requirement — but to stop claiming readiness until the
+    rebuild finishes. An empty result from a half-built index is
+    indistinguishable from "your query matched nothing", which tells the user
+    their content is gone in the one form they have no reason to doubt.
+    """
     from ragtools.bootstrap import ensure_config_current
     from ragtools.config import Settings
+    from ragtools.upgrade import relayout
+    from ragtools.upgrade.relayout import Inventory, MigrationInProgress, Unit
 
     ensure_config_current()
+    settings = Settings()
 
-    effective = Settings()
-    # Until the re-index has run, the layout that can actually answer a query is
-    # still the previous one.
-    assert effective.collection_strategy == "shared", (
-        "the effective layout switched before its index existed"
-    )
+    relayout.begin(settings,
+                   Inventory(units=[Unit(relayout.KIND_PROJECT, "p1", 500)]),
+                   from_backend="embedded", to_backend="managed",
+                   from_strategy="shared", to_strategy="per_project")
+
+    with pytest.raises(MigrationInProgress):
+        relayout.guard_ready(settings)
 
 
 # --- failure is loud, not fatal --------------------------------------------
