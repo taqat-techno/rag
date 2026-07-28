@@ -135,6 +135,21 @@ def health(port: int = 21420, tries: int = 45) -> dict | None:
 
 
 
+
+def browser_processes() -> list[str]:
+    """Browsers started since setup began.
+
+    The mandatory service start must not drag a browser window onto the screen:
+    that was the `startnow` checkbox's job and it stays optional. A silent
+    install that opens a browser is a silent install in name only.
+    """
+    script = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -in "
+              "'msedge.exe','chrome.exe','firefox.exe','iexplore.exe' } | "
+              "ForEach-Object { \"$($_.Name):$($_.ProcessId)\" }")
+    out = run(["powershell", "-NoProfile", "-Command", script], timeout=120).stdout
+    return [line.strip() for line in (out or "").splitlines() if line.strip()]
+
+
 def api_status(port: int = 21420) -> dict | None:
     """`/api/status`, for the collection layout the machine actually ended on."""
     try:
@@ -348,22 +363,20 @@ def main(argv=None) -> int:
     # lifecycle — migrate, rebuild, become ready — instead of only the first step.
     # "Only after completion" is half the claim, so prove the other half: while
     # the rebuild is outstanding, the product's own verdict must be NEGATIVE.
-    # START THE SERVICE. Nothing else will, on a runner.
+    # NOTHING HERE STARTS THE SERVICE. That is the assertion.
     #
-    # The installer only starts it under `Tasks: startnow`, which this test
-    # deliberately omits so no browser opens; the scheduled task that would
-    # start it fires at LOGON, and a hosted runner never logs anyone in. So
-    # after the upgrade the machine has a registered service and no running
-    # one — and the rebuild, which is the service's job, never begins.
+    # This test installs WITHOUT `startnow` and fires no logon. If a service is
+    # answering below, the installer started it — which is the property under
+    # test: a finished installation must leave a running service, not one
+    # waiting for the user's next Windows session.
     #
-    # A previous run DID find a service answering here, which made this look
-    # unnecessary. That was incidental: the task carries RestartOnFailure, and
-    # force-killing the old service during the upgrade sometimes provoked a
-    # restart. Depending on that is depending on a race.
-    #
-    # Starting it explicitly is also what the real lifecycle does — the logon
-    # task starts the service, and the service resumes the migration.
-    run([str(install / "rag.exe"), "service", "start"], timeout=600)
+    # An earlier version of this script started the service itself and called
+    # the resulting green a pass. It was measuring its own workaround: the
+    # product left the service stopped unless the user ticked a checkbox whose
+    # real subject was "open my browser".
+    check("no browser was opened by the mandatory service start",
+          not browser_processes(),
+          "; ".join(browser_processes()) or "none")
 
     # WAIT FOR THE SERVICE TO ANSWER AT ALL before asking what it is doing.
     #

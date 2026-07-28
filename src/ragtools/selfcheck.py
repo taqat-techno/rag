@@ -216,8 +216,23 @@ def check_service_health(expect: str, port: int | None = None) -> Check:
 
         resolved = port or Settings().service_port
         payload = httpx.get(f"http://127.0.0.1:{resolved}/health", timeout=5.0).json()
-    except Exception:  # noqa: BLE001 — not listening is the normal case here
-        return Check("service health version", True, "no service responding", skipped=True)
+    except Exception:  # noqa: BLE001
+        # On a PACKAGED installation, silence is a finding.
+        #
+        # Installation now starts the service and waits for it, so a finished
+        # install that answers nothing has not finished. This used to skip
+        # unconditionally, on the reasonable-at-the-time basis that setup ran
+        # before anything was started — which stopped being true when service
+        # startup became mandatory rather than gated on the browser checkbox.
+        #
+        # From a source checkout there is still nothing to expect, so that stays
+        # a skip.
+        if _is_packaged():
+            return Check("service health version", False,
+                         "nothing is listening — a completed installation must "
+                         "leave the service running")
+        return Check("service health version", True, "no service responding",
+                     skipped=True)
 
     running = payload.get("version")
     return Check("service health version", running == expect,

@@ -622,3 +622,74 @@ def test_a_suppressed_uninstall_prompt_keeps_user_data(script):
     assert call.group(1).rstrip().endswith("IDNO"), (
         "a silent uninstall would answer YES to deleting user data"
     )
+
+
+# --- F8: a finished installation leaves a RUNNING service ------------------
+
+
+def test_the_service_start_is_not_gated_on_the_browser_checkbox(script):
+    """A finished installation must leave a running service.
+
+    Service startup was gated on `startnow`, a task whose real subject is "open
+    the admin panel in your browser". So a user who declined the browser got a
+    registered service and no running one, and nothing would start it until
+    their next Windows logon. On an upgrade that also means the post-upgrade
+    re-index never begins — the rebuild is the service's job and the service was
+    not there to do it.
+
+    Found because a CI run reported `0/2 rebuilt` and `nothing responded within
+    300s`. The first fix was to have the TEST start the service, which would
+    have measured the workaround rather than the product.
+    """
+    run = section(script, "Run")
+    starts = [line for line in run.splitlines()
+              if re.search(r'Parameters:\s*"service start', line)]
+    assert starts, "nothing starts the service after installation"
+
+    for line in starts:
+        assert not re.search(r"Tasks:\s*startnow", line), (
+            "service startup is gated on the browser checkbox: "
+            f"{line.strip()}"
+        )
+
+
+def test_the_mandatory_start_waits_for_the_service_to_answer(script):
+    """"The command was issued" and "the service is serving" are different
+    claims, and only the second is worth reporting. Spawning returns
+    immediately while the encoder takes seconds to load."""
+    run = section(script, "Run")
+    starts = [line for line in run.splitlines()
+              if re.search(r'Parameters:\s*"service start', line)]
+    assert starts
+
+    for line in starts:
+        assert "--wait" in line, f"the start is not verified: {line.strip()}"
+        assert "nowait" not in line, (
+            f"the installer does not wait for its own start: {line.strip()}"
+        )
+
+
+def test_the_browser_remains_optional(script):
+    """Decoupled, not merged. Making the service mandatory must not make the
+    browser mandatory too — a silent install that opens a window is a silent
+    install in name only."""
+    run = section(script, "Run")
+    browsers = [line for line in run.splitlines()
+                if "http://localhost" in line or "start http" in line]
+    assert browsers, "the admin panel is never offered"
+
+    for line in browsers:
+        assert re.search(r"Tasks:\s*startnow", line), (
+            f"opening a browser is no longer optional: {line.strip()}"
+        )
+
+
+def test_the_tray_remains_optional(script):
+    run = section(script, "Run")
+    tray = [line for line in run.splitlines()
+            if re.search(r'Parameters:\s*"tray"', line)]
+    assert tray, "the tray is never launched"
+    for line in tray:
+        assert re.search(r"Tasks:\s*startup", line), (
+            f"the tray launch is not gated on the autostart choice: {line.strip()}"
+        )

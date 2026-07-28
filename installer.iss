@@ -144,10 +144,32 @@ Filename: "{app}\rag.exe"; Parameters: "tray install"; StatusMsg: "Registering t
 ; unknown-command exit, and because the step was `runhidden` WITHOUT `nowait` the
 ; installer waited for it and surfaced the failure. Two subsystems with opposite
 ; intentions: one removing the task, the other reinstalling it.
-; Start service now (ON by default)
-Filename: "{app}\rag.exe"; Parameters: "service start"; StatusMsg: "Starting service..."; Tasks: startnow; Flags: runhidden nowait
-; Open admin panel in browser after a delay (let service start)
-Filename: "cmd.exe"; Parameters: "/c timeout /t 15 /nobreak >nul & start http://localhost:21420"; StatusMsg: "Opening admin panel..."; Tasks: startnow; Flags: runhidden nowait
+; START THE SERVICE. MANDATORY — no `Tasks:` gate, and it WAITS.
+;
+; A finished installation must leave a running service. This was gated on
+; `startnow`, a checkbox whose real subject is "open the admin panel in your
+; browser" — so a user who declined the browser got a registered service and
+; no running one, and nothing would start it until their next Windows logon.
+; On an upgrade that also means the post-upgrade re-index never begins: the
+; rebuild is the service's job, and the service was not there to do it.
+;
+; The three concerns are now independent:
+;   * starting the service      — MANDATORY, here, now;
+;   * opening the browser       — optional (`startnow`);
+;   * launching the tray icon   — optional (`startup`).
+;
+; `--wait` rather than `nowait`, because "the command was issued" and "the
+; service is serving" are different claims and only the second is worth
+; reporting. It returns as soon as /health answers — including while a
+; migration is rebuilding, which is answering truthfully — so this does not
+; block setup for the length of a re-index.
+;
+; The at-logon tasks registered above remain responsible for FUTURE sessions
+; and for restart persistence. They are not responsible for finishing this
+; installation.
+Filename: "{app}\ragw.exe"; Parameters: "service start --wait --timeout 180"; StatusMsg: "Starting the background service..."; Flags: runhidden
+; Open admin panel in browser — OPTIONAL, and now only the browser.
+Filename: "cmd.exe"; Parameters: "/c start http://localhost:21420"; StatusMsg: "Opening admin panel..."; Tasks: startnow; Flags: runhidden nowait
 ; Launch the tray once after install/upgrade so the icon appears WITHOUT requiring
 ; logout or restart. Gated on `Tasks: startup` so nothing starts for users who
 ; declined autostart registration.

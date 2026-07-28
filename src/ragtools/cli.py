@@ -720,8 +720,22 @@ def service_start(
         help="Launch the service directly without the auto-restart supervisor "
              "(legacy pre-v2.4.3 behavior).",
     ),
+    wait: bool = typer.Option(
+        False, "--wait",
+        help="Block until the service answers /health, and fail if it never does.",
+    ),
+    timeout: int = typer.Option(
+        180, "--timeout", help="Seconds to wait with --wait."),
 ):
-    """Start the RAG service in the background."""
+    """Start the RAG service in the background.
+
+    `--wait` exists for callers that need the start to be VERIFIABLE rather than
+    merely requested — the installer above all. Spawning returns immediately and
+    the encoder takes several seconds to load, so "the command succeeded" and
+    "the service is serving" are different claims, and an installer that reports
+    the first while the second is false is how a machine ends up with a
+    registered service nobody is running.
+    """
     from ragtools.service.process import start_service
     settings = _get_settings()
     try:
@@ -733,12 +747,38 @@ def service_start(
             console.print("  Supervisor will auto-restart the service on crash.")
         console.print(f"  Listening on http://{settings.service_host}:{settings.service_port}")
         console.print(f"  Logs: {Path(settings.data_dir) / 'logs' / 'service.log'}")
-        console.print("  Note: encoder loading takes 5-10 seconds before service is ready.")
+        if not wait:
+            console.print("  Note: encoder loading takes 5-10 seconds before service is ready.")
     except RuntimeError as e:
         console.print(f"[yellow]{e}[/yellow]")
     except Exception as e:
         console.print(f"[red]Failed to start service:[/red] {e}")
         raise typer.Exit(1)
+
+    if not wait:
+        return
+
+    import time as _time
+
+    import httpx
+
+    url = f"http://{settings.service_host}:{settings.service_port}/health"
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        try:
+            payload = httpx.get(url, timeout=5.0).json()
+        except Exception:  # noqa: BLE001 — not listening yet is the normal case
+            _time.sleep(2)
+            continue
+        # `migrating` is serving — it is answering, and truthfully. Waiting for
+        # `ready` here would block the installer for the length of a full
+        # re-index, which is hours.
+        console.print(f"[green]Service is answering[/green] (status: "
+                      f"{payload.get('status')}, version {payload.get('version')})")
+        return
+    console.print(f"[red]The service did not answer {url} within {timeout}s.[/red]")
+    console.print(f"  See {Path(settings.data_dir) / 'logs' / 'service.log'}")
+    raise typer.Exit(1)
 
 
 @service_app.command("stop")
