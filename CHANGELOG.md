@@ -158,10 +158,22 @@ installed and the module named explicitly in `rag.spec`, gated to Windows.
 
 ### Gates
 
-`tests/test_v340_recovery.py` — 28 tests, **27 of which fail against `v3.3.0`**,
-verified by running them in a detached worktree at that tag. The 28th is labelled
-in its own docstring as not a gate: it passes on both, and exists only to stop
-the new `return True` becoming unconditional.
+`tests/test_v340_recovery.py` — 32 tests. The negative control was run in a
+detached worktree at `v3.3.0`: of the 28 that existed at that point, **27 failed
+there**, which is what makes them gates rather than decoration. The 28th is
+labelled in its own docstring as *not* a gate — it passes on both, and exists
+only to stop the new `return True` becoming unconditional. Four tests were added
+after that run (the v3.3.0 plan-store schema upgrade, the crash-context
+snapshot, the resume route, and the dashboard fragment) and each names in its
+docstring the v3.3.0 behaviour it pins.
+
+Beyond the unit level, the recovery was **executed**: a stalled plan
+(`done=1, blocked=2`, stale block reason) driven through the real service with a
+real encoder and a real store reached 3/3 done, plan `complete`, `/health: ready`,
+and `/api/search` 200 with a live result. A second boot did not repeat the
+migration; the rollback store survived; the plan store was backed up first.
+
+Full suite: **2248 passed, 15 skipped**.
 
 ---
 
