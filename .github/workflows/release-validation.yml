@@ -267,7 +267,17 @@ jobs:
         # report from the field describes as the state that machine is now in:
         # "ragw.exe (PID 3076) and the task-registered images are now the
         # running set". Only this leg proves the defect is fixed.
-        from: ["2.7.0", "3.0.1"]
+        #
+        # 3.3.0 is the release this one exists to rescue, and it is the upgrade
+        # a real machine is about to perform. What this leg proves is that the
+        # PACKAGED path works from there — installer over installer, previous
+        # processes alive. What it does NOT prove is recovery of a STALLED
+        # migration: a runner's fresh 3.3.0 has no plan to be stuck in. That
+        # half is covered by `tests/test_v340_recovery.py`, which synthesises the
+        # exact stalled shape, and by the live end-to-end recovery. Saying which
+        # is which matters — a leg that quietly proves less than its name
+        # suggests is how a gate becomes decoration.
+        from: ["2.7.0", "3.0.1", "3.3.0"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
