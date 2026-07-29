@@ -407,8 +407,14 @@ class WindowsAdapter:
         found: list[Registration] = []
 
         # 1. The current mechanism.
+        #
+        # `/fo LIST /v` is not decoration. The default output is a three-column
+        # summary — TaskName, Next Run Time, Status — and the registered command
+        # is simply not in it, so every target came back empty and `selfcheck`
+        # reported "no autostart registered" for two correctly-registered tasks.
+        # Only the verbose list format emits `Task To Run:`.
         task = self._task_path(kind)
-        probe = self._run(["schtasks", "/query", "/tn", task])
+        probe = self._run(["schtasks", "/query", "/tn", task, "/fo", "LIST", "/v"])
         if probe.ok:
             found.append(Registration(
                 name=task, kind=kind, mechanism="task-scheduler",
@@ -419,7 +425,8 @@ class WindowsAdapter:
         for legacy_name, legacy_kind in LEGACY_TASKS.items():
             if legacy_kind != kind:
                 continue
-            legacy_probe = self._run(["schtasks", "/query", "/tn", legacy_name])
+            legacy_probe = self._run(
+                ["schtasks", "/query", "/tn", legacy_name, "/fo", "LIST", "/v"])
             if legacy_probe.ok:
                 found.append(Registration(
                     name=legacy_name, kind=kind, mechanism="task-scheduler",
@@ -588,12 +595,54 @@ def render_task_xml(spec: AutostartSpec, *, user: str, task_path: str) -> str:
 
 
 def _task_target(query_output: str) -> str:
-    """Best-effort task command from `schtasks /query` output.
+    """The registered command, from ``schtasks /query /fo LIST /v`` output.
 
-    Advisory only — the target is shown to a human deciding whether to remove a
-    registration, never parsed for control flow.
+    Load-bearing, and it has to actually work. `selfcheck.check_autostart_targets`
+    is the check that catches "the machine reverts to the previous build at the
+    next logon", and it decides entirely on this value.
+
+    The previous implementation could not return one. It scanned for a line
+    containing both a backslash and ``.exe`` — against the output of
+    ``schtasks /query /tn <task>`` with no format flags, which does not contain
+    the command at all. Measured::
+
+        Folder: \\RAGTools
+        TaskName                Next Run Time          Status
+        ======================= ====================== ==============
+        Service                 N/A                    Ready
+
+    Zero lines with ``.exe``; the TaskName column carries the leaf name with no
+    backslash either, so both halves of the predicate failed. It returned ``""``
+    on every real Windows machine, and `selfcheck` read that as "no autostart
+    registered" — a SKIP. The check could not pass, and, far worse, could not
+    FAIL: a task pointing at the previous install directory produced the same
+    empty string and the same reassuring skip.
+
+    ``Task To Run:`` is what carries it, and only the verbose list format emits
+    it. Localised Windows uses a translated label, so the fallback recognises the
+    value by shape rather than by its label.
     """
-    for line in query_output.splitlines():
-        if "\\" in line and (".exe" in line.lower() or ".vbs" in line.lower()):
-            return line.strip()
+    lines = query_output.splitlines()
+    for index, line in enumerate(lines):
+        label, sep, value = line.partition(":")
+        if not sep or "task to run" not in label.strip().lower():
+            continue
+        # schtasks wraps long commands onto continuation lines with no label.
+        parts = [value.strip()]
+        for following in lines[index + 1:]:
+            if not following.strip() or ":" in following.partition(":")[1]:
+                break
+            parts.append(following.strip())
+        target = " ".join(p for p in parts if p).strip()
+        if target:
+            return target
+
+    # Localised label, or an unexpected layout: fall back to the value's shape.
+    # An executable path is the thing we need, and it looks like one.
+    for line in lines:
+        candidate = line.partition(":")[2].strip() or line.strip()
+        lowered = candidate.lower()
+        if ("\\" in candidate and (".exe" in lowered or ".vbs" in lowered)
+                and not lowered.startswith("taskname")):
+            return candidate
     return ""
