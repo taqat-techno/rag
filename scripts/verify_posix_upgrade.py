@@ -132,8 +132,19 @@ def main(argv=None) -> int:
     version = (run([str(binary), "version"], env=env).stdout or "").strip()
     expected = version.replace("ragtools v", "").strip()
     sc = run([str(binary), "selfcheck", "--expect-version", expected], env=env)
-    check("selfcheck runs and reports", sc.returncode in (0, 1),
-          (sc.stdout or sc.stderr).strip().splitlines()[-1] if sc.stdout else "")
+    # The exit code is now a CATEGORY, not a bit: 0 clean, 1 installation
+    # integrity, 2 runtime, 3 migration in progress, 4 warnings (see
+    # `ragtools.selfcheck`). This asserted `in (0, 1)`, which was right when a
+    # failure could only mean "the installation is wrong" and became wrong the
+    # moment a runtime condition got its own code — nothing is listening here,
+    # so a packaged artifact reports 2.
+    #
+    # What this step actually verifies is that selfcheck RAN and produced a
+    # verdict, so the assertion is "the code is one this release defines".
+    # Anything else means it crashed or exited some other way.
+    check("selfcheck runs and reports a known verdict", sc.returncode in (0, 1, 2, 3, 4),
+          f"exit {sc.returncode}: " +
+          ((sc.stdout or sc.stderr).strip().splitlines()[-1] if sc.stdout else ""))
 
     # --- 5. the managed engine is present in the packaged artifact --------
     engine = bundle / "bin" / "qdrant"

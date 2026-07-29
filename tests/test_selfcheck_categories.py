@@ -218,6 +218,54 @@ def test_a_runtime_failure_never_prescribes_a_reboot(installer):
     assert "rag selfcheck" in runtime
 
 
+def test_no_verifier_script_assumes_the_old_pass_fail_bit():
+    """The exit code is a CATEGORY now, and scripts that predate that break.
+
+    `verify_posix_upgrade.py` asserted `returncode in (0, 1)` — correct when a
+    failure could only mean "the installation is wrong", and wrong the moment a
+    runtime condition got its own code. A packaged artifact with no service
+    running reports 2, so the check failed on a machine that was behaving
+    exactly as designed. Caught by reading the callers, not by a test, which is
+    why there is now a test.
+    """
+    import re
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    offenders = []
+    for path in sorted(scripts.glob("*.py")):
+        lines = path.read_text(encoding="utf-8").splitlines()
+
+        # Only the variables actually assigned from a selfcheck invocation.
+        # Scanning every `returncode in (...)` in a file that merely mentions
+        # selfcheck flagged an unrelated `service stop` check — the same
+        # over-broad-pattern mistake this suite exists to avoid.
+        subjects = {
+            m.group(1)
+            for line in lines
+            if "selfcheck" in line and not line.lstrip().startswith("#")
+            for m in [re.match(r"\s*(\w+)\s*=.*selfcheck", line)] if m
+        }
+        if not subjects:
+            continue
+
+        for line in lines:
+            if line.lstrip().startswith("#"):
+                continue
+            for name in subjects:
+                match = re.search(rf"\b{re.escape(name)}\.returncode\s+in\s+\(([^)]*)\)",
+                                  line)
+                if not match:
+                    continue
+                accepted = {p.strip() for p in match.group(1).split(",") if p.strip()}
+                missing = {"2", "3"} - accepted
+                if missing:
+                    offenders.append(f"{path.name}: {name}.returncode accepts "
+                                     f"{sorted(accepted)}, missing {sorted(missing)}")
+    assert not offenders, (
+        "a verifier script rejects exit codes this release defines:\n  "
+        + "\n  ".join(offenders))
+
+
 def test_the_file_replacement_message_survives_for_the_case_it_describes(installer):
     """It was never wrong — only wrongly applied to everything else."""
     verify = installer.split("procedure VerifyInstallation()")[-1]
