@@ -268,35 +268,77 @@ def test_a_deliberate_secondary_must_say_so_twice(tmp_path):
 
 @pytest.fixture
 def occupied():
-    """A real listening socket, so `port_is_free` answers from the kernel."""
+    """A real listening socket, so `port_is_free` answers from the kernel.
+
+    ``listen(16)``, not ``listen(1)``. With a backlog of one, the first probe
+    fills the accept queue and the SECOND is refused — so a test that probes
+    twice saw the same port as occupied and then free. That is the documented
+    weakness of connect-probing, and it is real; it is just not what a running
+    Qdrant looks like, and pinning it here would be testing the fixture. The
+    weakness itself is covered by
+    `test_a_wrongly_free_port_is_caught_by_the_child_check`.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
-    sock.listen(1)
+    sock.listen(16)
     yield sock.getsockname()[1]
     sock.close()
 
 
-def test_an_occupied_port_stays_occupied_when_its_backlog_is_full(tmp_path, occupied):
-    """The port check must BIND, not connect.
+def test_a_port_freed_moments_ago_reads_as_free():
+    """The error the port check must NOT make.
 
-    Connecting asks "will something talk to me", which is a different question
-    and a fragile one: a server that has not accepted its backlog refuses
-    further connections, so a busy port reported itself FREE and the caller
-    would have spawned an engine straight onto it — the exact failure this
-    module exists to prevent. Measured, not theorised.
+    A false "occupied" is unrecoverable in the moment — managed mode refuses,
+    the service degrades to embedded, and the index looks empty. A port our own
+    engine released seconds ago is the ordinary restart case, and a `bind` probe
+    calls it occupied on Linux and the BSDs while accepted connections linger in
+    TIME_WAIT. That was tried here and reverted.
     """
     import socket as _socket
+    import time as _time
 
-    for _ in range(5):
-        try:
-            c = _socket.socket()
-            c.settimeout(0.3)
-            c.connect(("127.0.0.1", occupied))
-        except OSError:
-            pass
+    srv = _socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+    client = _socket.socket()
+    client.connect(("127.0.0.1", port))
+    accepted, _ = srv.accept()
+    client.sendall(b"x")
+    accepted.recv(1)
+    client.close()
+    accepted.close()
+    srv.close()
+    _time.sleep(0.2)
 
-    assert own.port_is_free(occupied) is False, (
-        "a port whose accept backlog is saturated was reported free")
+    assert own.port_is_free(port) is True, (
+        "a port released moments ago was reported occupied; an ordinary restart "
+        "would refuse managed storage and degrade to an empty-looking index")
+
+
+def test_a_wrongly_free_port_is_caught_by_the_child_check(tmp_path):
+    """Why biasing toward "free" is safe, stated as a test.
+
+    The probe is allowed to miss an occupied port — a wedged server whose accept
+    backlog is full can refuse connections and read as free. Nothing is lost,
+    because the spawn is self-verifying: our child cannot bind, it exits, and
+    `wait_ready` refuses instead of adopting whatever is there. That is the D1
+    fix doing the work the probe deliberately does not.
+    """
+    supervisor = QdrantSupervisor(
+        binary_path="q", storage_path="/s", http_port=21500, grpc_port=21501,
+        spawn=lambda cmd: DeadChild(), http_get=Answering(), sleep=lambda s: None,
+        is_synced_path=lambda p: False,
+    )
+    supervisor.start()
+
+    with pytest.raises(ManagedStartError, match="another process"):
+        supervisor.wait_ready(timeout=2)
+
+
+def test_a_live_listener_is_still_seen_as_occupied(tmp_path, occupied):
+    """The ordinary case must keep working: a healthy engine holds its port."""
+    assert own.port_is_free(occupied) is False
     assert own.inspect_port(FakeSettings(tmp_path), occupied).action == "refuse"
 
 

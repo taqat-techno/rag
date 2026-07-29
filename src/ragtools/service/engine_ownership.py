@@ -268,30 +268,39 @@ def listener_identity(port: int) -> Optional[tuple[int, str]]:
 
 
 def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
-    """Can we bind ``port``? Asked by BINDING it, not by connecting to it.
+    """Is anything actively accepting on ``port``? Deliberately biased to "free".
 
-    Connecting answers "will something talk to me", which is a different
-    question and a fragile one: a server that has not accepted its backlog
-    refuses further connections, so a busy port reports itself free. Measured —
-    a listening socket with an unaccepted connection queued made this return
-    True, and the caller would then have spawned an engine onto an occupied
-    port, which is the entire failure being prevented.
+    This check is allowed to be wrong in exactly one direction, and the two
+    errors are not remotely equal:
 
-    Binding asks the question we actually have. It fails with EADDRINUSE
-    precisely when something already holds the port, and it does not depend on
-    the other process behaving well. ``SO_REUSEADDR`` is deliberately NOT set:
-    it would let the bind succeed against a socket in TIME_WAIT and, on some
-    platforms, against a live listener — which is the false "free" all over
-    again.
+    * A false **"free"** costs nothing. We spawn, our child cannot bind, and
+      :meth:`QdrantSupervisor.wait_ready` refuses with "another process holds
+      this port" — the child-liveness check does the real work. The spawn is
+      self-verifying, which is the whole point of that fix.
+    * A false **"occupied"** is unrecoverable in the moment: managed mode
+      refuses, the service degrades to embedded, and the user's index looks
+      empty until something restarts.
+
+    So the probe must never claim "occupied" without evidence, and ``connect``
+    is the check that behaves that way. A TIME_WAIT socket does not accept
+    connections, so a port freed moments ago by our own exiting engine reads as
+    free — which it is.
+
+    A ``bind`` probe was tried here and reverted. It answers "could I bind",
+    which sounds like the same question and is not: on Linux and the BSDs, a
+    plain ``bind`` fails with ``EADDRINUSE`` while connections the previous
+    server accepted linger in TIME_WAIT. That turns an ordinary service restart
+    into a refusal to use managed storage. Adding ``SO_REUSEADDR`` to dodge it
+    reintroduces the false "free" on Windows, where it will happily bind over a
+    live listener. There is no setting of that flag that is right on every
+    platform, and there does not need to be — the downstream check already
+    covers the case ``connect`` gets wrong.
     """
     import socket
 
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind((host, port))
-        return True
-    except OSError:
-        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.35)
+        return sock.connect_ex((host, port)) != 0
 
 
 def process_alive(pid: int) -> bool:
