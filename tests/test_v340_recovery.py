@@ -450,6 +450,63 @@ def stalled(tmp_path):
     return settings, plan, units
 
 
+def test_a_v330_plan_store_gains_the_new_column_in_place(tmp_path):
+    """THE ACTUAL UPGRADE PATH. The fixture's `relayout.db` was written by v3.3.0.
+
+    It has no `empty_reason` column, and `reconcile`/`validate` both SELECT it —
+    so if the tolerant ALTER did not run first, the recovery would raise
+    `no such column` on the one machine this release exists to rescue.
+    `CREATE TABLE IF NOT EXISTS` does not add columns; `_add_retry_columns` does.
+    """
+    import sqlite3
+
+    settings = types.SimpleNamespace(state_db=str(tmp_path / "index_state.db"),
+                                     data_dir=str(tmp_path),
+                                     collection_name="markdown_kb",
+                                     enabled_projects=[])
+    db = tmp_path / "relayout.db"
+    conn = sqlite3.connect(str(db))
+    # Exactly the v3.3.0 shape: no `empty_reason`.
+    conn.executescript("""
+        CREATE TABLE relayout_plan (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
+            from_backend TEXT NOT NULL, to_backend TEXT NOT NULL,
+            from_strategy TEXT NOT NULL, to_strategy TEXT NOT NULL,
+            status TEXT NOT NULL, finished_at REAL);
+        CREATE TABLE relayout_unit (
+            plan_id INTEGER NOT NULL, kind TEXT NOT NULL, unit_id TEXT NOT NULL,
+            status TEXT NOT NULL, points_before INTEGER NOT NULL DEFAULT 0,
+            points_after INTEGER NOT NULL DEFAULT 0, error TEXT,
+            updated_at REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt REAL, PRIMARY KEY (plan_id, kind, unit_id));
+        INSERT INTO relayout_plan VALUES
+            (1, 0.0, 'embedded', 'managed', 'shared', 'per_project', 'running', NULL);
+        INSERT INTO relayout_unit VALUES
+            (1, 'project', 'alpha', 'done', 1000, 0, NULL, 0.0, 0, NULL);
+    """)
+    conn.commit()
+    conn.close()
+
+    assert "empty_reason" not in {
+        row[1] for row in sqlite3.connect(str(db)).execute(
+            "PRAGMA table_info(relayout_unit)")}, "fixture is not v3.3.0-shaped"
+
+    # Reading the plan must bring the column into being, not raise.
+    report = relayout.progress(settings, 1)
+    assert report is not None and report.done == 1
+
+    columns = {row[1] for row in sqlite3.connect(str(db)).execute(
+        "PRAGMA table_info(relayout_unit)")}
+    assert "empty_reason" in columns, (
+        "a v3.3.0 plan store did not gain the column, so reconcile would raise "
+        "`no such column: empty_reason` on the machine being rescued")
+
+    owner = RecoveringOwner(settings, counts={"proj_alpha": 0})
+    assert relayout.reconcile(owner, settings, 1) is not None
+    ok, problems = relayout.validate(owner, settings, 1)
+    assert not ok and problems
+
+
 def test_reconcile_resets_a_done_unit_whose_collection_is_empty(stalled):
     """The `1/25 done` beside 25 empty collections.
 

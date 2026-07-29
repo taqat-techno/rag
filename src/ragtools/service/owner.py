@@ -171,7 +171,8 @@ AVAILABILITY_STALE = "stale_searchable"
 AVAILABILITY_STORAGE_DOWN = "storage_unavailable"
 
 
-def _availability(live_points: int | None, summary: dict, migration: dict | None) -> str:
+def _availability(live_points: int | None, summary: dict, migration: dict | None,
+                  freshness_level: str = "") -> str:
     """One word for "can this index answer a question right now?".
 
     Ordering matters: a migration in flight explains an empty store, and saying
@@ -187,7 +188,10 @@ def _availability(live_points: int | None, summary: dict, migration: dict | None
             return AVAILABILITY_REBUILDING
         return AVAILABILITY_PARTIAL if live_points else AVAILABILITY_REBUILDING
     if live_points:
-        return AVAILABILITY_READY
+        # Searchable, but the content may have moved on. A distinct state
+        # because it has a distinct remedy — run an index, not a rebuild.
+        return (AVAILABILITY_STALE if freshness_level == "stale"
+                else AVAILABILITY_READY)
     # Nothing live. Whether that is "you have not indexed yet" or "your index
     # vanished" is decided by whether anything was EVER recorded.
     return AVAILABILITY_PARTIAL if summary.get("total_chunks") else AVAILABILITY_EMPTY
@@ -1757,6 +1761,10 @@ class QdrantOwner:
             summary = {"total_files": 0, "total_chunks": 0, "projects": [], "last_indexed": None}
 
         migration = self._migration_snapshot()
+        freshness = compute_index_freshness(
+            summary.get("last_indexed"),
+            getattr(self._settings, "stale_index_hours", 24),
+        )
         return {
             "points_count": points_count,
             # THE TWO NUMBERS, NAMED. `points_count` (live) and `total_chunks`
@@ -1769,7 +1777,8 @@ class QdrantOwner:
             "historical_chunks": summary.get("total_chunks", 0),
             "historical_files": summary.get("total_files", 0),
             "historical_as_of": summary.get("last_indexed"),
-            "index_availability": _availability(points_count, summary, migration),
+            "index_availability": _availability(points_count, summary, migration,
+                                                freshness.get("level", "")),
             "migration": migration,
             "index_activity": self.index_activity(),
             "collection_name": self._settings.collection_name,
@@ -1784,10 +1793,7 @@ class QdrantOwner:
             "scale": compute_scale_warning(
                 _worst_points, capabilities=self.capabilities(),
                 collection=_worst_name, collection_count=_collection_count),
-            "freshness": compute_index_freshness(
-                summary.get("last_indexed"),
-                getattr(self._settings, "stale_index_hours", 24),
-            ),
+            "freshness": freshness,
             **summary,
         }
 
