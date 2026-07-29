@@ -482,7 +482,7 @@ def reset_attempts(settings, plan_id: int) -> int:
 
 def mark(settings, plan_id: int, unit: Unit, status: str, *,
          points_after: int = 0, error: str = "", count_attempt: bool = False,
-         empty_reason: str = "") -> None:
+         empty_reason: str = "", fresh_attempts: bool = False) -> None:
     """Record one unit's outcome. Committed immediately — a crash one unit later
     must not lose the unit that just succeeded.
 
@@ -507,6 +507,21 @@ def mark(settings, plan_id: int, unit: Unit, status: str, *,
                     " WHERE plan_id=? AND kind=? AND unit_id=?",
                     (status, points_after, error or None, time.time(), attempts,
                      time.time() + delay, plan_id, unit.kind, unit.unit_id))
+            elif fresh_attempts:
+                # A RESET UNIT MUST BE RUNNABLE. `units_to_do` skips anything
+                # whose attempts have run out, and a unit can reach `done` with
+                # a full attempt count (fail three times, then succeed). Demote
+                # that unit without clearing the count and it becomes pending
+                # and permanently unofferable — the plan can never finish, and
+                # nothing says why. Reconciliation is not the unit's failure; it
+                # is ours, and it carries the same "the cause was fixed"
+                # authority as an operator running `--resume`.
+                conn.execute(
+                    "UPDATE relayout_unit SET status=?, points_after=?, error=?,"
+                    " updated_at=?, empty_reason=?, attempts=0, next_attempt=NULL"
+                    " WHERE plan_id=? AND kind=? AND unit_id=?",
+                    (status, points_after, error or None, time.time(),
+                     empty_reason or None, plan_id, unit.kind, unit.unit_id))
             else:
                 conn.execute(
                     "UPDATE relayout_unit SET status=?, points_after=?, error=?,"
@@ -918,7 +933,8 @@ def reconcile(owner, settings, plan_id: Optional[int] = None) -> Optional[Reconc
             # Marked done, holds nothing, and nothing explains why.
             mark(settings, plan_id, unit, STATUS_PENDING,
                  error="reset by reconciliation: recorded done but the "
-                       "collection holds no points")
+                       "collection holds no points",
+                 fresh_attempts=True)
             report.reset.append((unit.kind, unit.unit_id))
             report.notes.append(
                 f"{unit.kind} {unit.unit_id}: RESET — recorded done with an "
@@ -926,7 +942,7 @@ def reconcile(owner, settings, plan_id: Optional[int] = None) -> Optional[Reconc
             continue
 
         if status == STATUS_BLOCKED and ready.ok:
-            mark(settings, plan_id, unit, STATUS_PENDING)
+            mark(settings, plan_id, unit, STATUS_PENDING, fresh_attempts=True)
             report.unblocked.append((unit.kind, unit.unit_id))
 
     if report.unblocked and ready.ok:

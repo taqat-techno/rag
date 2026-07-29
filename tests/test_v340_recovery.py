@@ -527,6 +527,34 @@ def test_reconcile_resets_a_done_unit_whose_collection_is_empty(stalled):
     assert after.done == 0, "a done unit over an empty collection survived"
 
 
+def test_a_reset_unit_is_actually_runnable_again(stalled):
+    """A reset that cannot be retried is worse than no reset at all.
+
+    `units_to_do` skips any non-blocked unit whose attempts have run out, and a
+    unit CAN reach `done` with a full attempt count — fail three times, then
+    succeed. Demote that unit without clearing the count and it becomes pending
+    and permanently unofferable: the plan can never complete, and nothing says
+    why. Reconciliation carries the same "the cause was fixed" authority as an
+    operator running `--resume`, because the mis-recording was ours.
+    """
+    settings, plan, units = stalled
+    # Burn the budget, then record it done over an empty collection.
+    for _ in range(relayout.MAX_ATTEMPTS):
+        relayout.mark(settings, plan, units[0], relayout.STATUS_FAILED,
+                      error="transient", count_attempt=True)
+    relayout.mark(settings, plan, units[0], relayout.STATUS_DONE, points_after=0)
+    assert relayout.exhausted_units(settings, plan) == [], (
+        "fixture precondition: the unit is done, so it is not yet 'exhausted'")
+
+    owner = RecoveringOwner(settings, counts=empty_collections())
+    relayout.reconcile(owner, settings, plan)
+
+    offered = {(u.kind, u.unit_id) for u in relayout.units_to_do(settings, plan)}
+    assert ("project", "project-0") in offered, (
+        "the falsely-done unit was reset and then never offered again — the plan "
+        "can never finish and nothing reports why")
+
+
 def test_reconcile_preserves_verified_work(stalled):
     """Re-indexing what is already correct turns 8 hours into 16."""
     settings, plan, _units = stalled
