@@ -573,11 +573,37 @@ def validate(owner, settings, plan_id: int) -> tuple[bool, list[str]]:
         conn.close()
 
     for kind, unit_id, before, after in rows:
+        if int(after) == POINTS_UNKNOWN:
+            # Not counted. That is a reason to keep the old index, and NOT a
+            # reason to claim the rebuild produced nothing.
+            problems.append(
+                f"{kind} {unit_id}: rebuilt, but its points could not be counted")
+            continue
         if int(before) > 0 and int(after) == 0:
             problems.append(
                 f"{kind} {unit_id}: held {before} points before the migration and "
                 f"none after")
     return (not problems), problems
+
+
+def units_all_done(settings, plan_id: int) -> bool:
+    """Has every unit been rebuilt? Deliberately separate from :func:`validate`.
+
+    Two different decisions were gated on one answer, and they have very
+    different costs:
+
+    * **Is the rebuild finished?** — decides whether searches work again. Being
+      wrong here disables the product.
+    * **Is the new index verified?** — decides whether the OLD index may be
+      deleted. Being wrong here destroys data.
+
+    Collapsing them meant a failed point COUNT — a diagnostic — held searches
+    off forever on a machine whose index was complete and correct. They are
+    separated so the conservative answer on the destructive question can no
+    longer take the product down with it.
+    """
+    report = progress(settings, plan_id)
+    return bool(report and not (report.pending or report.failed or report.blocked))
 
 
 def finalize(settings, plan_id: int) -> None:
@@ -749,9 +775,22 @@ def run_pending(owner, settings, *, plan_id: Optional[int] = None,
             except Exception:  # noqa: BLE001
                 pass
 
-    ok, problems = validate(owner, settings, plan_id)
-    if ok:
-        _retire_old_storage(owner)
+    # TWO decisions, taken separately — see `units_all_done`.
+    verified, problems = validate(owner, settings, plan_id)
+    if units_all_done(settings, plan_id):
+        if verified:
+            _retire_old_storage(owner)
+        else:
+            # The rebuild finished; something about it could not be confirmed.
+            # Keep the previous index and say so — but do NOT hold the product
+            # hostage to a diagnostic.
+            for problem in problems:
+                logger.warning("relayout finished with an unverified unit: %s",
+                               problem)
+            logger.warning(
+                "relayout: the previous index has been KEPT because the rebuild "
+                "could not be fully verified. Reclaim it with `rag storage "
+                "reclaim` once you are satisfied.")
         finalize(settings, plan_id)
     else:
         for problem in problems:
@@ -760,11 +799,60 @@ def run_pending(owner, settings, *, plan_id: Optional[int] = None,
     return progress(settings, plan_id) or Progress(plan_id=plan_id, status=PLAN_RUNNING)
 
 
+#: Recorded when a unit rebuilt but its points could not be counted. Distinct
+#: from 0, which means "counted, and there really are none".
+POINTS_UNKNOWN = -1
+
+
 def _points_for_project(owner, project_id: str) -> int:
+    """How many points the rebuilt project holds, or ``POINTS_UNKNOWN``.
+
+    This called ``owner.router.collection_for(project_id)``. **There is no such
+    method on CollectionRouter** — it is ``write_collection`` — so every call
+    raised ``AttributeError``, the bare ``except`` swallowed it, and every unit
+    on every machine recorded 0 points.
+
+    The consequences were not subtle. ``validate`` sees "held N points before
+    and none after" for every project, refuses, ``finalize`` never runs, the
+    plan stays ``running`` forever, and ``guard_ready`` therefore raises on
+    EVERY search. A v3.1.0 machine that had rebuilt its index perfectly — 15
+    collections, 147,105 points, all present and correct — reported
+    `migration/reindex in progress` and refused to answer anything, permanently.
+
+    Returning 0 for "I could not count" is what made a programming error look
+    exactly like total data loss. It now says which it is, and says so loudly:
+    a count that fails is a bug worth seeing, not a number worth inventing.
+    """
+    def unknown(reason: str) -> int:
+        logger.warning(
+            "relayout: could not count points for project %s (%s); recording the "
+            "rebuild as UNVERIFIED rather than as empty", project_id, reason)
+        return POINTS_UNKNOWN
+
     try:
-        return int(owner._count_points(owner.router.collection_for(project_id)))
-    except Exception:  # noqa: BLE001
-        return 0
+        name = owner.router.write_collection(project_id)
+        count = int(owner._count_points(name))
+    except Exception as exc:  # noqa: BLE001
+        return unknown(f"{type(exc).__name__}: {exc}")
+
+    if count:
+        return count
+
+    # A ZERO HAS TO BE CORROBORATED BEFORE IT IS BELIEVED.
+    #
+    # `_count_points` swallows its own failures and returns 0 — correct for the
+    # status display it was written for, where a missing collection genuinely is
+    # zero. Here it is not: a 0 that means "could not ask" and a 0 that means
+    # "empty" lead to opposite decisions, and taking the wrong one disables
+    # search on a correctly rebuilt index. So the collection must demonstrably
+    # exist before its emptiness counts as a fact.
+    try:
+        existing = {c.name for c in owner._client.get_collections().collections}
+    except Exception as exc:  # noqa: BLE001
+        return unknown(f"the collection list is unavailable ({type(exc).__name__})")
+    if name not in existing:
+        return unknown(f"collection {name!r} does not exist")
+    return 0
 
 
 def _retire_old_storage(owner) -> None:

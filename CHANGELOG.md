@@ -171,6 +171,38 @@ rebuild, an MCP client talking to the store directly got the ordinary "no
 matches" shape from an index that had not been built yet: wrong, and completely
 convincing.
 
+### The migration could never finish, so search stayed off forever
+
+The most user-visible defect in this release, and it was found on a real
+installed machine rather than in CI.
+
+`_points_for_project` called `owner.router.collection_for(project_id)`.
+`CollectionRouter` has no such method — it is `write_collection` — so every call
+raised `AttributeError`, a bare `except Exception` swallowed it, and every unit
+recorded `points_after = 0`.
+
+`validate` then read that as *"held 41,832 points before the migration and none
+after"*, project after project. It refused, `finalize` never ran, the plan
+stayed `running`, and `guard_ready` therefore raised on **every query for the
+rest of that machine's life**. The observed machine had rebuilt its index
+perfectly — 15 collections, 147,105 points, all present and correct on the
+managed engine — and answered `migration/reindex in progress` to everything.
+
+Three faults, all fixed:
+
+* the method name was wrong, and no test exercised that call with a real router;
+* returning `0` for *"I could not count"* made a programming error
+  indistinguishable from total data loss. A failed count is now
+  `POINTS_UNKNOWN`, logged loudly, and never invented;
+* **one gate answered two questions.** "Is the rebuild finished?" decides
+  whether search works. "Is it verified?" decides whether the OLD index may be
+  deleted. Being wrong about the first disables the product; being wrong about
+  the second destroys data. They are now separate, so a diagnostic failure keeps
+  the previous index — and says so — without holding the product hostage.
+
+The one thing that did go right: because validation refused, `_retire_old_storage`
+never ran, so no data was lost anywhere.
+
 ### A shutdown race that crashed the interpreter
 
 Found by this release's own Linux build, which died with `Fatal Python error:
