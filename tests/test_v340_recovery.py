@@ -813,6 +813,46 @@ def test_status_separates_live_points_from_historical_bookkeeping():
         == "blocked"
 
 
+def test_the_dashboard_does_not_present_a_rebuilt_away_index_as_current():
+    """The visible half. `/ui/dash/status` rendered `total_chunks` and nothing else.
+
+    So a machine whose every collection held zero points showed
+    "6,546 files · 91,516 chunks" and looked healthy at the exact moment nothing
+    was searchable.
+
+    NEGATIVE CONTROL: on v3.3.0 the fragment has no live count, no availability
+    attribute, and no rebuild banner — the assertions below have nothing to find.
+    """
+    from ragtools.service import pages
+
+    status = {
+        "total_files": 6546, "total_chunks": 91516, "projects": ["a", "b"],
+        "points_count": 0, "live_points": 0,
+        "index_availability": "rebuilding",
+        "migration": {"plan": 1, "done": 1, "total": 25, "blocked": 24,
+                      "stalled": False, "blocked_reason_recorded": ""},
+        "index_activity": {"phase": "chunk", "done": 12, "total": 900},
+        "freshness": {"level": "stale", "message": "31 hours old"},
+        "scale": {}, "stale": False,
+    }
+
+    original = pages.get_owner
+    pages.get_owner = lambda: types.SimpleNamespace(  # type: ignore[assignment]
+        get_status=lambda: status)
+    try:
+        html = pages.ui_dash_status()
+    finally:
+        pages.get_owner = original                   # type: ignore[assignment]
+
+    assert 'data-availability="rebuilding"' in html
+    assert "searchable" in html, "no live count is shown at all"
+    assert "chunks (before rebuild)" in html, (
+        "91,516 historical chunks are still labelled as though they were current")
+    assert "being rebuilt" in html, "no banner explains why search is unavailable"
+    assert "1 of 25" in html, "no rebuild progress"
+    assert "chunk" in html and "12" in html, "index_activity is not surfaced"
+
+
 def test_index_activity_is_reachable_from_status():
     """"What is it doing?" was computed and surfaced nowhere.
 

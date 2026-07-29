@@ -155,6 +155,27 @@ _ISSUE_HEADLINES = {
     "scale_warn": "The index is nearing what this storage engine handles well",
     "scale_over": "The index is larger than this storage engine handles well",
     "index_stale": "Search results may be out of date",
+    # The state the dashboard could not express. It rendered `total_chunks` from
+    # the state DB — "6,546 files · 91,516 chunks" — while every collection in
+    # the live store held zero points, so the page looked healthy at the exact
+    # moment nothing was searchable.
+    "index_rebuilding": "Search is unavailable — the index is being rebuilt",
+    "index_blocked": "Search is unavailable — the rebuild has stopped",
+    "index_empty": "Nothing is indexed yet",
+    "index_partial": "Search is unavailable — the index is incomplete",
+    "storage_unavailable": "Storage is not responding",
+}
+
+#: How each availability verdict renders. `None` means "nothing to say".
+_AVAILABILITY_ISSUE = {
+    "rebuilding": ("index_rebuilding", None),
+    "blocked": ("index_blocked", None),
+    "empty": ("index_empty",
+              "Add a project and run an index, and its files become searchable."),
+    "partial_unavailable": ("index_partial", None),
+    "storage_unavailable": ("storage_unavailable",
+                            "The vector store could not be reached, so the "
+                            "counts below are the last known values."),
 }
 
 
@@ -198,6 +219,30 @@ def ui_dash_status():
     if fresh.get("level") == "stale":
         issues.append(("index_stale", fresh.get("message", "")))
 
+    # THE HEADLINE STATE, and it goes first because it is the one that decides
+    # whether anything below is worth reading.
+    availability = s.get("index_availability") or ""
+    migration = s.get("migration") or {}
+    mapped = _AVAILABILITY_ISSUE.get(availability)
+    if mapped is not None:
+        key, detail = mapped
+        if migration and availability in ("rebuilding", "blocked"):
+            done, total = migration.get("done", 0), migration.get("total", 0)
+            detail = (f"{done} of {total} projects rebuilt so far. The counts "
+                      f"below describe the index from BEFORE the rebuild.")
+            activity = s.get("index_activity") or {}
+            if activity.get("phase"):
+                detail += (f" Currently {activity['phase']}"
+                           f" ({activity.get('done', 0)}/"
+                           f"{activity.get('total', 0)}).")
+            if availability == "blocked":
+                recorded = migration.get("blocked_reason_recorded") or ""
+                if recorded:
+                    # Labelled as recorded. Presenting a hours-old error as
+                    # current state is how a status page loses its credibility.
+                    detail += f" Last recorded reason: {recorded}"
+        issues.insert(0, (key, detail or ""))
+
     degraded = bool(issues)
     issue_keys = [k for k, _ in issues]
 
@@ -224,10 +269,31 @@ def ui_dash_status():
     stale_note = ('<span class="badge badge-muted">Updating…</span>'
                   if s.get("stale") else "")
 
+    # LIVE, beside the bookkeeping. `total_chunks` comes from the state DB and
+    # can describe an index that no longer exists — during the per-project
+    # migration it described the OLD shared collection while every new
+    # collection held nothing. Showing only that number is what made an empty,
+    # unsearchable install look like a healthy one.
+    live = s.get("live_points", s.get("points_count"))
+    if live is None:
+        live_stat = ('<div class="dash-stat"><strong>—</strong> '
+                     '<span>searchable (unknown)</span></div>')
+    else:
+        live_stat = (f'<div class="dash-stat"><strong>{live:,}</strong> '
+                     f'<span>searchable</span></div>')
+
+    # When the two disagree, the historical pair is labelled rather than dropped.
+    # It is still the truth about something — just not about what you can search.
+    historical_label = ("chunks (before rebuild)"
+                        if (live is not None and live == 0 and chunks)
+                        else "chunks")
+
     return f"""
-    <div class="dash-status-row" data-degraded="{str(degraded).lower()}">
+    <div class="dash-status-row" data-degraded="{str(degraded).lower()}"
+         data-availability="{escape(availability)}">
+        {live_stat}
         <div class="dash-stat"><strong>{files:,}</strong> <span>files</span></div>
-        <div class="dash-stat"><strong>{chunks:,}</strong> <span>chunks</span></div>
+        <div class="dash-stat"><strong>{chunks:,}</strong> <span>{historical_label}</span></div>
         <div class="dash-stat"><strong>{projects_count:,}</strong> <span>projects</span></div>
         <div class="dash-status-badges">{stale_note}{watcher_badge}</div>
     </div>
