@@ -201,6 +201,33 @@ def test_the_crash_record_names_the_encoder_behind_the_system_exit(tmp_path):
     assert "logs" in payload and payload["logs"]["engine"] == "qdrant.log"
 
 
+def test_the_crash_context_is_snapshotted_before_teardown_clears_it(tmp_path):
+    """`finally` nulls `_engine` and `_settings` before uvicorn re-raises.
+
+    So a crash record built by asking "what is the engine doing?" at recording
+    time describes a machine with no engine and no migration — about a failure
+    that had both.
+    """
+    import importlib
+
+    from ragtools.service import app as service_app
+    from ragtools.service import run as service_run
+
+    service_app._startup_context = {
+        "engine": {"state": "ready", "pid": 20652},
+        "migration": {"plan": 1, "done": 1, "total": 25, "blocked": 24},
+    }
+    settings = types.SimpleNamespace(data_dir=str(tmp_path))
+    try:
+        service_run._record_fatal_crash(settings, SystemExit(3), "127.0.0.1", 21420)
+    finally:
+        importlib.reload(service_app)
+
+    payload = json.loads((tmp_path / "logs" / "last_crash.json").read_text())
+    assert payload["engine"]["pid"] == 20652
+    assert payload["migration"]["blocked"] == 24
+
+
 # --------------------------------------------------------------------------
 # P2 — lifecycle coverage
 # --------------------------------------------------------------------------

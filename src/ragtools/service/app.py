@@ -394,9 +394,47 @@ def stop_background_writers() -> None:
 _startup_failure: BaseException | None = None
 
 
+#: Engine and migration state AT THE MOMENT startup failed.
+#:
+#: Captured in the ``except`` rather than read later, because ``finally`` clears
+#: both — so by the time `run._record_fatal_crash` looks, `_engine` and
+#: `_settings` are already None and the record would say "no engine, no
+#: migration" about a machine that had both.
+_startup_context: dict | None = None
+
+
 def startup_failure() -> BaseException | None:
     """The real reason startup failed, or None. See :data:`_startup_failure`."""
     return _startup_failure
+
+
+def startup_context() -> dict | None:
+    """Engine/migration state as it was when startup failed, or None."""
+    return _startup_context
+
+
+def _capture_context() -> dict:
+    """Snapshot what the crash recorder will want, before teardown clears it."""
+    context: dict = {"engine": None, "migration": None}
+    try:
+        context["engine"] = engine_status()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ragtools.upgrade import relayout
+
+        settings = _settings
+        if settings is not None:
+            plan = relayout.active_plan(settings)
+            if plan is not None:
+                report = relayout.progress(settings, plan)
+                context["migration"] = (
+                    {"plan": plan, "done": report.done, "total": report.total,
+                     "blocked": report.blocked, "failed": report.failed}
+                    if report is not None else {"plan": plan})
+    except Exception:  # noqa: BLE001
+        pass
+    return context
 
 
 def _start_service() -> None:
@@ -572,7 +610,8 @@ def _stop_service() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: load encoder + open Qdrant. Shutdown: close client."""
-    global _owner, _settings, _engine, _storage_degraded, _startup_failure
+    global _owner, _settings, _engine, _storage_degraded
+    global _startup_failure, _startup_context
 
     if _owner is not None:
         # Already initialized (e.g., by test injection). The job engine still
@@ -600,6 +639,7 @@ async def lifespan(app: FastAPI):
         # the wrong cause in `last_crash.json`.
         if not started:
             _startup_failure = exc
+            _startup_context = _capture_context()
             logger.critical("Service startup FAILED: %s: %s",
                             type(exc).__name__, exc, exc_info=True)
         raise

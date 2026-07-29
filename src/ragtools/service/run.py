@@ -322,6 +322,19 @@ def _runtime_context() -> dict:
     engine have nothing in common except that the process stopped. Recording
     which it was is the difference between a diagnosis and a guess.
     """
+    # PREFER THE SNAPSHOT TAKEN AT THE MOMENT OF FAILURE. The lifespan's
+    # `finally` clears `_engine` and `_settings`, and it has already run by the
+    # time uvicorn re-raises — so asking now would report "no engine, no
+    # migration" about a machine that had both.
+    try:
+        from ragtools.service.app import startup_context
+
+        captured = startup_context()
+        if captured:
+            return captured
+    except Exception:  # noqa: BLE001
+        pass
+
     context: dict = {}
     try:
         from ragtools.service.app import engine_status
