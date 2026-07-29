@@ -152,6 +152,14 @@ class DarwinAdapter:
         """
         return executable
 
+    def child_process_flags(self) -> dict:
+        """Nothing extra. macOS has no console to suppress.
+
+        See the Linux adapter for why this is implemented per adapter rather
+        than defaulted on the Protocol.
+        """
+        return {}
+
     def pid_alive(self, pid: int) -> bool:
         """Whether ``pid`` is a RUNNING process.
 

@@ -139,6 +139,28 @@ def test_console_suppression_goes_through_the_platform_seam():
         encoding="utf-8")
 
 
+def test_every_adapter_implements_the_child_flags_seam():
+    """All three, not just the one this machine happens to run.
+
+    `PlatformAdapter` is a `Protocol`: the concrete adapters conform
+    STRUCTURALLY and do not inherit from it, so a default defined on the
+    Protocol is invisible at runtime. The first version of this change added the
+    method only there and to Windows — which passed on this machine and raised
+    `AttributeError: 'LinuxAdapter' object has no attribute
+    'child_process_flags'` on a real Linux runner.
+    """
+    from ragtools.platform.darwin import DarwinAdapter
+    from ragtools.platform.linux import LinuxAdapter
+    from ragtools.platform.windows import WindowsAdapter
+
+    for cls in (LinuxAdapter, DarwinAdapter, WindowsAdapter):
+        assert hasattr(cls, "child_process_flags"), (
+            f"{cls.__name__} does not implement child_process_flags; a Protocol "
+            f"default does not reach a class that only conforms structurally")
+        flags = cls.child_process_flags(cls.__new__(cls))
+        assert isinstance(flags, dict), f"{cls.__name__} returned {flags!r}"
+
+
 def test_the_engine_log_rotates(tmp_path):
     log = tmp_path / "logs" / "qdrant.log"
     log.parent.mkdir(parents=True)

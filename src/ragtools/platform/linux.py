@@ -121,6 +121,16 @@ class LinuxAdapter:
         """
         return executable
 
+    def child_process_flags(self) -> dict:
+        """Nothing extra. POSIX has no console to suppress.
+
+        `PlatformAdapter` is a Protocol, so the concrete adapters conform
+        structurally rather than inheriting — a default on the Protocol is
+        invisible at runtime, which is how the first version of this shipped an
+        `AttributeError` on Linux that only a real Linux runner could catch.
+        """
+        return {}
+
     def pid_alive(self, pid: int) -> bool:
         """Whether ``pid`` is a RUNNING process.
 
