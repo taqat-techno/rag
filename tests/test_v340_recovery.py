@@ -415,6 +415,10 @@ class RecoveringOwner:
     def _scan_files(self, project_id=None):
         return [("p", Path(f"f{i}.md")) for i in range(self.files)]
 
+    def storage_reachable(self):
+        return (self.reachable, "" if self.reachable
+                else "ConnectionError: [WinError 10061] actively refused")
+
     def run_full_index(self, project_id=None):
         self.indexed.append(project_id)
         self.counts[f"proj_{project_id}"] = 1000
@@ -811,6 +815,49 @@ def test_status_separates_live_points_from_historical_bookkeeping():
     assert _availability(0, {}, None) == AVAILABILITY_EMPTY
     assert _availability(0, historical, {"plan": 1, "done": 1, "stalled": True}) \
         == "blocked"
+
+
+def test_the_advertised_recovery_command_is_executed_not_only_offered(stalled):
+    """`/health.retry` names a command; something has to have run it.
+
+    v3.3.0 advertised "restart the service — it resumes automatically on start",
+    the service *was* restarted, and the machine stayed at 1/25. A remedy the
+    product prints is a claim about behaviour, so it gets a test.
+    """
+    import importlib
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from ragtools.service import app as service_app
+    from ragtools.service.routes import migration_resume
+
+    settings, plan, _units = stalled
+    owner = RecoveringOwner(settings, counts=empty_collections())
+
+    resumed: list = []
+    service_app._settings = settings
+    service_app._owner = owner
+    service_app.resume_migration = lambda **kw: bool(resumed.append(kw)) or True  # type: ignore[assignment]
+
+    api = FastAPI()
+    api.post("/api/migration/resume")(migration_resume)
+    try:
+        original = service_app.get_owner
+        service_app.get_owner = lambda: owner        # type: ignore[assignment]
+        import ragtools.service.routes as routes_mod
+        routes_original = routes_mod.get_owner
+        routes_mod.get_owner = lambda: owner         # type: ignore[assignment]
+        try:
+            response = TestClient(api).post("/api/migration/resume")
+        finally:
+            service_app.get_owner = original         # type: ignore[assignment]
+            routes_mod.get_owner = routes_original   # type: ignore[assignment]
+    finally:
+        importlib.reload(service_app)
+
+    assert response.status_code == 202, (response.status_code, response.text)
+    assert resumed, "the route reported success without asking for any work"
 
 
 def test_the_dashboard_does_not_present_a_rebuilt_away_index_as_current():
