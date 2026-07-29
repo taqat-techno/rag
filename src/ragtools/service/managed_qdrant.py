@@ -252,6 +252,14 @@ def start_managed_qdrant(settings, plan: Optional[ManagedPlan] = None):
             grpc_port=verdict.claim.grpc_port,
             pinned_version=PINNED_QDRANT_VERSION,
             api_key=plan.api_key,
+            # PASSED HERE TOO. v3.3.0 gave `data_dir` only to the spawn branch,
+            # so a reattached engine reported `log_path: null` on /health with an
+            # empty `log_error` — and /health flags a missing log only when
+            # `log_error` is truthy, so "this engine has no log at all" was
+            # silent. A reattached engine's output is going to that same file,
+            # written by the process that spawned it; the path is knowable and
+            # must be stated.
+            data_dir=str(settings.data_dir),
             http_get=httpx.get,
             sleep=time.sleep,
         )

@@ -156,6 +156,43 @@ def compute_scale_warning(points_count: int, capabilities=None, *,
     }
 
 
+#: The states an index can actually be in, as one word the UI can switch on.
+#:
+#: Derived rather than stored, because every input is already known and a stored
+#: copy is one more thing to get out of date. The point is that "empty" and
+#: "stale" and "rebuilding" have DIFFERENT remedies and were all rendering as a
+#: chunk count from a database that described the previous store.
+AVAILABILITY_READY = "ready"
+AVAILABILITY_EMPTY = "empty"
+AVAILABILITY_REBUILDING = "rebuilding"
+AVAILABILITY_BLOCKED = "blocked"
+AVAILABILITY_PARTIAL = "partial_unavailable"
+AVAILABILITY_STALE = "stale_searchable"
+AVAILABILITY_STORAGE_DOWN = "storage_unavailable"
+
+
+def _availability(live_points: int | None, summary: dict, migration: dict | None) -> str:
+    """One word for "can this index answer a question right now?".
+
+    Ordering matters: a migration in flight explains an empty store, and saying
+    "empty" while a rebuild is running would tell the user their data is gone at
+    the one moment it is merely absent.
+    """
+    if live_points is None:
+        return AVAILABILITY_STORAGE_DOWN
+    if migration:
+        if migration.get("stalled"):
+            return AVAILABILITY_BLOCKED
+        if not migration.get("done"):
+            return AVAILABILITY_REBUILDING
+        return AVAILABILITY_PARTIAL if live_points else AVAILABILITY_REBUILDING
+    if live_points:
+        return AVAILABILITY_READY
+    # Nothing live. Whether that is "you have not indexed yet" or "your index
+    # vanished" is decided by whether anything was EVER recorded.
+    return AVAILABILITY_PARTIAL if summary.get("total_chunks") else AVAILABILITY_EMPTY
+
+
 def compute_index_freshness(last_indexed, stale_after_hours: float = 24, now=None) -> dict:
     """Classify index freshness from a ``last_indexed`` timestamp. Pure function.
 
@@ -1633,6 +1670,8 @@ class QdrantOwner:
                 # None, never 0 — the same distinction `POINTS_UNKNOWN` makes in
                 # the migration, applied where the number is actually shown.
                 "points_count": None,
+                "live_points": None,
+                "index_availability": AVAILABILITY_STORAGE_DOWN,
                 "collections": [{**c, "points": None}
                                 for c in (snapshot.get("collections") or [])],
             })
@@ -1684,6 +1723,26 @@ class QdrantOwner:
             except Exception:  # noqa: BLE001
                 return 0
 
+    def _migration_snapshot(self) -> dict | None:
+        """The live migration state, or None when no plan is running."""
+        try:
+            from ragtools.upgrade import relayout
+
+            plan = relayout.active_plan(self._settings)
+            if plan is None:
+                return None
+            report = relayout.progress(self._settings, plan)
+            if report is None:
+                return {"plan": plan}
+            return {
+                "plan": plan, "done": report.done, "total": report.total,
+                "blocked": report.blocked, "failed": report.failed,
+                "pending": report.pending, "stalled": report.stalled,
+                "blocked_reason_recorded": report.blocked_reason or "",
+            }
+        except Exception:  # noqa: BLE001 — status must never fail on a diagnostic
+            return None
+
     def _compute_status(self) -> dict:
         """Build the status dict. Caller must hold ``self._lock``."""
         points_count, collections = self._collection_points()
@@ -1697,8 +1756,22 @@ class QdrantOwner:
         else:
             summary = {"total_files": 0, "total_chunks": 0, "projects": [], "last_indexed": None}
 
+        migration = self._migration_snapshot()
         return {
             "points_count": points_count,
+            # THE TWO NUMBERS, NAMED. `points_count` (live) and `total_chunks`
+            # (historical, from the state DB) were merged into one flat dict
+            # with no stated relationship, and the dashboard rendered the
+            # historical one. So a machine whose every collection held zero
+            # points advertised "6,546 files · 91,516 chunks" and looked
+            # healthy. Both are true; neither means what the other means.
+            "live_points": points_count,
+            "historical_chunks": summary.get("total_chunks", 0),
+            "historical_files": summary.get("total_files", 0),
+            "historical_as_of": summary.get("last_indexed"),
+            "index_availability": _availability(points_count, summary, migration),
+            "migration": migration,
+            "index_activity": self.index_activity(),
             "collection_name": self._settings.collection_name,
             "collection_strategy": self._router.strategy,
             "collections": collections,

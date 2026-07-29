@@ -81,8 +81,15 @@ def _on_engine_state(status) -> None:
 
     if status.state == CRASHED:
         _park_migration(status.detail or "the managed engine exited")
-    elif status.state == READY and status.restart_attempt:
-        resume_migration()
+    elif status.state == READY:
+        # NOT `and status.restart_attempt`. That condition meant recovery only
+        # resumed after an AUTOMATIC RESTART — so an engine that came back any
+        # other way (a reattach on the next boot, most commonly) left the
+        # migration parked with a reason that had stopped being true. The guard
+        # belongs in `resume_stalled_migration`, which asks whether there is
+        # actually something stalled, rather than in a counter that happens to
+        # be zero on the common path.
+        resume_stalled_migration()
 
 
 def _park_migration(reason: str) -> None:
@@ -108,6 +115,47 @@ def _park_migration(reason: str) -> None:
         logger.exception("could not park the migration after an engine crash")
 
 
+#: The resume worker, so a second one is never started on top of it.
+_resume_thread: threading.Thread | None = None
+
+
+def resume_stalled_migration() -> bool:
+    """Resume a migration that has STOPPED and can now proceed. Returns started.
+
+    The owner nothing had. ``block_all`` persists "storage is unreachable" into
+    every unfinished unit, and in v3.3.0 nothing ever re-tested that claim: a
+    plan parked at 22:38 still reported the same ``WinError 10061`` an hour later
+    beside a healthy engine and 24 units that could have run. The startup resume
+    fires once; the engine hook fired only after an automatic restart. An engine
+    that simply came back was covered by neither.
+
+    Cheap and safe to call on a timer: it asks whether a plan is stalled before
+    it does anything, and :func:`resume_migration` refuses to start a second
+    worker.
+    """
+    settings, owner = _settings, _owner
+    if settings is None or owner is None:
+        return False
+    if storage_is_down():
+        return False          # the blocker is still real; leave it parked
+    try:
+        from ragtools.upgrade import relayout
+
+        plan = relayout.active_plan(settings)
+        if plan is None:
+            return False
+        report = relayout.progress(settings, plan)
+        if report is None or report.complete or not report.stalled:
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+
+    logger.warning(
+        "Relayout plan %s is stalled (%s) and storage is reachable again; "
+        "resuming", plan, report.describe())
+    return resume_migration()
+
+
 def resume_migration(*, reset: bool = False) -> bool:
     """Continue a parked migration. Returns whether one was started.
 
@@ -120,6 +168,8 @@ def resume_migration(*, reset: bool = False) -> bool:
     while the service is up and cannot construct a client while it is down, so
     without this entry point the remedy the product advertises has nowhere to run.
     """
+    global _resume_thread
+
     settings, owner = _settings, _owner
     if settings is None or owner is None:
         return False
@@ -129,6 +179,15 @@ def resume_migration(*, reset: bool = False) -> bool:
         if relayout.active_plan(settings) is None:
             return False
     except Exception:  # noqa: BLE001
+        return False
+
+    # ONE WORKER. This is now reachable from a timer, an engine transition, an
+    # HTTP request and the CLI; without the guard, a stalled plan on a machine
+    # with a flapping engine would accumulate rebuild threads, each taking the
+    # index mutex non-blocking and logging that it was skipped.
+    existing = _resume_thread
+    if existing is not None and existing.is_alive():
+        logger.info("Relayout resume is already running; not starting a second")
         return False
 
     def _run():
@@ -145,7 +204,9 @@ def resume_migration(*, reset: bool = False) -> bool:
         except Exception:  # noqa: BLE001
             logger.exception("could not resume the migration")
 
-    threading.Thread(target=_run, name="relayout-resume", daemon=True).start()
+    _resume_thread = threading.Thread(target=_run, name="relayout-resume",
+                                      daemon=True)
+    _resume_thread.start()
     return True
 
 
@@ -323,25 +384,29 @@ def stop_background_writers() -> None:
     stop_runtime()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup: load encoder + open Qdrant. Shutdown: close client."""
-    global _owner, _settings, _engine, _storage_degraded
+#: The exception that ACTUALLY ended startup, captured where it is raised.
+#:
+#: Uvicorn converts a lifespan failure into ``sys.exit(3)``, and that
+#: ``SystemExit`` carries no ``__cause__`` back to what really happened. So
+#: ``last_crash.json`` recorded ``SystemExit: 3`` and nothing else, and a DNS
+#: failure loading the encoder was indistinguishable from the engine dying.
+#: Captured here, read by :func:`ragtools.service.run._record_fatal_crash`.
+_startup_failure: BaseException | None = None
 
-    if _owner is not None:
-        # Already initialized (e.g., by test injection). The job engine still
-        # starts, so injected-owner tests exercise the same code path the
-        # service does.
-        logger.info("Service using pre-initialized owner")
-        try:
-            start_runtime(_settings or _owner.settings)
-        except Exception:
-            logger.exception("runtime store startup failed (non-fatal)")
-        try:
-            yield
-        finally:
-            stop_background_writers()
-        return
+
+def startup_failure() -> BaseException | None:
+    """The real reason startup failed, or None. See :data:`_startup_failure`."""
+    return _startup_failure
+
+
+def _start_service() -> None:
+    """Everything that must succeed before the service can serve.
+
+    Extracted from ``lifespan`` so the whole sequence sits inside one
+    ``try``/``finally`` — see :func:`_stop_service` for what that fixes. Nothing
+    here changed in the move except that its failures are now cleaned up after.
+    """
+    global _owner, _settings, _engine, _storage_degraded
 
     # Bring the configuration to the current schema BEFORE anything reads it.
     # Ordering is the whole point: QdrantOwner opens the store and creates
@@ -453,11 +518,29 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("maintenance scheduler failed to start (non-fatal)")
 
-    yield
 
-    # Shutdown
+def _stop_service() -> None:
+    """Teardown. Runs on a clean shutdown **and on a failed startup**.
+
+    THE v3.3.0 DEFECT. This block used to live after ``yield`` with nothing
+    guarding it, so a startup that raised — the encoder's DNS failure did
+    exactly this, two seconds after the engine came up — skipped it entirely.
+    The managed engine was left running with no parent, its ownership manifest
+    still vouching for it, and every later boot reattached to a process it had
+    not spawned: no child handle to wait on, and no engine log for that run.
+
+    One orphan explains three of the four faults on the stalled machine. A
+    ``finally`` is the whole fix.
+    """
+    global _owner, _settings, _engine
+
     logger.info("Shutting down service")
-    log_activity("info", "service", "Service shutting down")
+    try:
+        from ragtools.service.activity import log_activity
+
+        log_activity("info", "service", "Service shutting down")
+    except Exception:  # noqa: BLE001 — reporting must not block teardown
+        pass
 
     stop_background_writers()
     if _engine is not None:
@@ -476,9 +559,52 @@ async def lifespan(app: FastAPI):
             logger.exception("managed Qdrant stop failed")
         _engine = None
     if _owner:
-        _owner.close()
+        # Guarded: on a FAILED startup the owner may be half-constructed, and a
+        # teardown that raises would mask the exception that caused it.
+        try:
+            _owner.close()
+        except Exception:
+            logger.exception("owner close failed (non-fatal)")
     _owner = None
     _settings = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: load encoder + open Qdrant. Shutdown: close client."""
+    global _owner, _settings, _engine, _storage_degraded, _startup_failure
+
+    if _owner is not None:
+        # Already initialized (e.g., by test injection). The job engine still
+        # starts, so injected-owner tests exercise the same code path the
+        # service does.
+        logger.info("Service using pre-initialized owner")
+        try:
+            start_runtime(_settings or _owner.settings)
+        except Exception:
+            logger.exception("runtime store startup failed (non-fatal)")
+        try:
+            yield
+        finally:
+            stop_background_writers()
+        return
+
+    started = False
+    try:
+        _start_service()
+        started = True
+        yield
+    except BaseException as exc:      # noqa: BLE001 — re-raised immediately
+        # Only a STARTUP failure is recorded. An exception thrown back in at the
+        # yield belongs to a request, not to boot, and mislabelling it would put
+        # the wrong cause in `last_crash.json`.
+        if not started:
+            _startup_failure = exc
+            logger.critical("Service startup FAILED: %s: %s",
+                            type(exc).__name__, exc, exc_info=True)
+        raise
+    finally:
+        _stop_service()
 
 
 def create_app() -> FastAPI:
@@ -505,6 +631,17 @@ def create_app() -> FastAPI:
     async def _json_error_handler(request: Request, exc: Exception):
         logger.exception("Unhandled error on %s %s", request.method, request.url.path)
         return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+    # Registered BEFORE the router, and per exception TYPE. FastAPI dispatches
+    # the most specific handler, so these take precedence over the blanket
+    # `Exception` handler above — which is what was turning a fully understood
+    # `MigrationInProgress` into an anonymous 500.
+    try:
+        from ragtools.service.errors import install_domain_handlers
+
+        install_domain_handlers(app)
+    except Exception:  # noqa: BLE001 — never let error mapping stop the app
+        logger.exception("could not install domain error handlers")
 
     from ragtools.service.routes import router
     app.include_router(router)

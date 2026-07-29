@@ -197,6 +197,18 @@ def build_default_tasks(owner, *, runtime=None) -> list[Task]:
         if not ok:
             raise RuntimeError(f"the vector store is not reachable: {detail}")
 
+    def _recover_migration():
+        # THE TASK THAT DID NOT EXIST. The table had four entries and not one of
+        # them touched the migration, so a plan parked by an outage stayed parked
+        # after the outage ended — the storage probe below RAISES while storage
+        # is down and does nothing whatsoever when it comes back.
+        #
+        # `LOCK_INDEX`, so it skips while a rebuild is running rather than
+        # stacking a second one on top of it.
+        from ragtools.service.app import resume_stalled_migration
+
+        resume_stalled_migration()
+
     def _refresh_frameworks():
         # Framework corpora are not watcher-refreshed: they are keyed by build
         # identity, so a refresh is a deliberate, periodic act rather than a
@@ -210,6 +222,9 @@ def build_default_tasks(owner, *, runtime=None) -> list[Task]:
         Task("storage-probe", MINUTE, _storage_probe, LOCK_NONE,
              run_at_startup=True,
              description="is the vector store actually reachable"),
+        Task("migration-recovery", 5 * MINUTE, _recover_migration, LOCK_INDEX,
+             run_at_startup=True,
+             description="resume a migration whose blocker has lifted"),
         Task("count-reconciliation", DAY, _reconcile_counts, LOCK_INDEX,
              description="state DB and Qdrant agree on chunk counts"),
         Task("framework-refresh", WEEK, _refresh_frameworks, LOCK_INDEX,

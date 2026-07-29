@@ -104,6 +104,16 @@ hiddenimports = (
     ]
 )
 
+# Windows-only, and named explicitly for the same reason psutil is. `winotify`
+# was declared ONLY in the optional `notifications` extra, which the release
+# build never installed — so the packaged app raised `No module named
+# 'winotify'` and every toast degraded to log-only. The crash notification for a
+# dead service therefore never reached the desktop, on the one platform that has
+# one. The extra is now installed by release.yml; this makes the bundling
+# explicit rather than a side effect of analysis.
+if sys.platform == "win32":
+    hiddenimports += ["winotify"]
+
 a = Analysis(
     [os.path.join(SRC_DIR, "ragtools", "cli.py")],
     pathex=[SRC_DIR],

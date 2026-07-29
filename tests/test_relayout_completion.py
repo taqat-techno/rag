@@ -189,6 +189,12 @@ def test_a_genuinely_empty_rebuild_is_still_a_problem(settings, plan):
     "Genuinely empty" means the collections EXIST and hold nothing — otherwise
     this is the unverifiable case, which is a different finding with a different
     message.
+
+    Caught EARLIER than it used to be. A rebuild that produces no points is now
+    recorded as ``failed`` on the unit, with the reason, instead of being marked
+    ``done`` and objected to afterwards — so the plan cannot finish on top of it
+    and the unit stays retryable. The old assertion looked for the
+    after-the-fact message; the fact itself is what matters.
     """
     owner = Owner(counts={})          # counted, and there really is nothing
     owner._client.get_collections = lambda: types.SimpleNamespace(
@@ -199,7 +205,14 @@ def test_a_genuinely_empty_rebuild_is_still_a_problem(settings, plan):
     verified, problems = relayout.validate(owner, settings, plan)
 
     assert not verified
-    assert any("none after" in p for p in problems), problems
+    assert problems, "an empty rebuild validated clean"
+
+    report = relayout.progress(settings, plan)
+    assert report is not None
+    assert report.done == 0, "a rebuild that wrote nothing recorded a done unit"
+    assert report.failed == 2, report
+    assert all("zero points" in error for _k, _u, error in report.failures), (
+        report.failures)
 
 
 def test_unfinished_units_still_hold_the_plan_open(settings, plan):

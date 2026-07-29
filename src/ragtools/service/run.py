@@ -242,6 +242,112 @@ def main():
         logger.info("Service process exiting")
 
 
+#: Which subsystem a failure belongs to, keyed by the module that raised it.
+#: A crash banner that says "encoder" sends someone to the model; one that says
+#: `SystemExit: 3` sends them to the storage engine, which is where the last
+#: three hours of the `LAKOSHA-TAQAT` investigation went.
+_SUBSYSTEM_BY_MODULE = (
+    ("ragtools.embedding", "encoder"),
+    ("sentence_transformers", "encoder"),
+    ("huggingface_hub", "encoder"),
+    ("transformers", "encoder"),
+    ("ragtools.upgrade", "migration"),
+    ("ragtools.service.engine", "storage"),
+    ("ragtools.storage", "storage"),
+    ("qdrant_client", "storage"),
+    ("ragtools.config", "config"),
+)
+
+
+def _causal_chain(exc: BaseException, limit: int = 8) -> list:
+    """Every exception behind ``exc``, outermost first.
+
+    ``SystemExit`` is the reason this exists. Uvicorn catches a lifespan failure
+    and calls ``sys.exit(3)``, so the exception the operator gets has no
+    ``__cause__`` and no ``__context__`` pointing at what actually broke. The
+    chain is walked anyway — it is free, and it is correct for every OTHER fatal
+    path — while :func:`_startup_cause` supplies the link uvicorn destroys.
+    """
+    import traceback
+
+    chain: list = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and len(chain) < limit and id(current) not in seen:
+        seen.add(id(current))
+        frame = ""
+        module = ""
+        tb = getattr(current, "__traceback__", None)
+        if tb is not None:
+            try:
+                last = traceback.extract_tb(tb)[-1]
+                frame = f"{Path(last.filename).name}:{last.lineno}"
+                module = last.filename
+            except (IndexError, ValueError, OSError):
+                pass
+        chain.append({
+            "type": type(current).__name__,
+            "message": str(current)[:500],
+            "frame": frame,
+            "module": module,
+        })
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _classify(chain: list) -> str:
+    """Name the subsystem from the deepest frame that matches a known module."""
+    for entry in reversed(chain):
+        haystack = f"{entry.get('module', '')}|{entry.get('type', '')}"
+        for needle, subsystem in _SUBSYSTEM_BY_MODULE:
+            if needle.replace(".", "\\") in haystack or needle in haystack:
+                return subsystem
+    return "unknown"
+
+
+def _startup_cause():
+    """The exception the lifespan recorded, which uvicorn then flattened."""
+    try:
+        from ragtools.service.app import startup_failure
+
+        return startup_failure()
+    except Exception:  # noqa: BLE001 — the recorder must never be the crash
+        return None
+
+
+def _runtime_context() -> dict:
+    """Engine and migration state at the moment of the crash.
+
+    A fatal exit with the engine `restart_exhausted` and one with a healthy
+    engine have nothing in common except that the process stopped. Recording
+    which it was is the difference between a diagnosis and a guess.
+    """
+    context: dict = {}
+    try:
+        from ragtools.service.app import engine_status
+
+        context["engine"] = engine_status()
+    except Exception:  # noqa: BLE001
+        context["engine"] = None
+    try:
+        from ragtools.service.app import get_settings
+        from ragtools.upgrade import relayout
+
+        settings = get_settings()
+        plan = relayout.active_plan(settings)
+        if plan is not None:
+            report = relayout.progress(settings, plan)
+            context["migration"] = (
+                {"plan": plan, "done": report.done, "total": report.total,
+                 "blocked": report.blocked, "failed": report.failed}
+                if report is not None else {"plan": plan})
+        else:
+            context["migration"] = None
+    except Exception:  # noqa: BLE001
+        context["migration"] = None
+    return context
+
+
 def _record_fatal_crash(settings: Settings, exc: BaseException, host: str, port: int) -> None:
     """Persist a structured record of a fatal service exit.
 
@@ -249,6 +355,11 @@ def _record_fatal_crash(settings: Settings, exc: BaseException, host: str, port:
       - full traceback + memory snapshot to service.log at CRITICAL level
       - a small last_crash.json file next to the log for the admin panel to
         surface a "previous session crashed" banner on next startup
+
+    **The record names the cause, not only the exit.** v3.3.0 wrote
+    ``{"exception_type": "SystemExit", "message": "3"}`` for a crash whose real
+    cause was a DNS failure loading the embedding model, and the only way to find
+    that out was to read the four log lines above it by hand.
     """
     import json
     import traceback
@@ -256,6 +367,18 @@ def _record_fatal_crash(settings: Settings, exc: BaseException, host: str, port:
 
     logger = logging.getLogger("ragtools.service")
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+    # The lifespan captured the real exception before uvicorn turned it into an
+    # exit code. Prefer it, and keep the outer one so the record still shows how
+    # the process actually ended.
+    cause = _startup_cause()
+    chain = _causal_chain(exc)
+    if cause is not None and cause is not exc:
+        chain = chain + _causal_chain(cause)
+        tb += ("\n--- startup failure that produced this exit ---\n"
+               + "".join(traceback.format_exception(
+                   type(cause), cause, cause.__traceback__)))
+    root = chain[-1] if chain else {"type": type(exc).__name__, "message": str(exc)}
 
     # Memory snapshot helps correlate crashes with OOM / large indexing batches.
     mem_info: dict = {}
@@ -287,17 +410,33 @@ def _record_fatal_crash(settings: Settings, exc: BaseException, host: str, port:
         log_dir = Path(settings.data_dir) / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         marker = log_dir / "last_crash.json"
+        from ragtools import __version__ as _version
+
+        context = _runtime_context()
         payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": _version,
+            "process_role": "service",
             "host": host,
             "port": port,
             "pid": os.getpid(),
+            # PRESERVED KEYS. The admin panel's crash banner reads these, and
+            # `last_crash.json` is a contract with a shipped UI — additions are
+            # safe, renames are not.
             "exception_type": type(exc).__name__,
             "message": str(exc),
             "traceback": tb,
             "memory": mem_info,
+            # New: the part that makes the record diagnosable on its own.
+            "outer": {"type": type(exc).__name__, "message": str(exc)[:500]},
+            "cause_chain": chain,
+            "root_cause": {"type": root.get("type"), "message": root.get("message")},
+            "subsystem": _classify(chain),
+            "engine": context.get("engine"),
+            "migration": context.get("migration"),
+            "logs": {"service": "service.log", "engine": "qdrant.log"},
         }
-        marker.write_text(json.dumps(payload, indent=2))
+        marker.write_text(json.dumps(payload, indent=2, default=str))
     except Exception as write_err:
         # Last-resort: never let the crash recorder cause a second crash
         logger.error("Failed to write last_crash.json: %s", write_err)

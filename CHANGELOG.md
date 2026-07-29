@@ -13,6 +13,158 @@ _Nothing yet._
 
 ---
 
+## [3.4.0] — 2026-07-30
+
+v3.3.0's fixes landed and the stalled machine did not recover. The engine
+supervision state machine is real, wired into the packaged lifespan, and
+reachable; the engine log is real; the client/server version window is enforced.
+None of it was theatre. It simply guarded the wrong step.
+
+**The failure enters one step earlier than the thing that was fixed.** At
+20:41:33 the engine came up. At 20:41:33 the encoder began loading. At 20:41:34 a
+DNS lookup for `huggingface.co` failed. At 20:41:35 uvicorn reported
+`STARTUP_FAILURE` and the process exited 3 — and because the lifespan's teardown
+lived *after* `yield` with nothing guarding it, the engine it had just spawned
+was never stopped.
+
+That orphan is the whole cascade. Its manifest still vouched for it, so every
+later boot **reattached** instead of spawning: no child handle to wait on, and —
+because `data_dir` was passed only to the spawn branch — no engine log for that
+run either. v3.3.0 supervises a spawned engine well. It had never been asked to
+supervise one it inherited.
+
+### The engine is stopped by whatever ends startup, not only by shutdown
+
+`lifespan` now wraps the whole startup sequence in `try`/`finally`, so a failure
+anywhere in it runs the same teardown a clean shutdown runs. The startup
+exception is also captured *where it is raised* (`app.startup_failure`), because
+uvicorn converts a lifespan failure into `sys.exit(3)` and a `SystemExit` carries
+no `__cause__` back to what actually broke.
+
+### The encoder no longer needs the network to load a model that is already here
+
+The installer ships a complete Hugging Face cache inside the bundle, and v3.3.0
+constructed `SentenceTransformer` with a bare Hub repo id and no offline flag —
+so the stack re-validated files it had already recorded as absent, on every
+start. `Encoder` now resolves the local cache and loads with `local_files_only`
+and `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` set, reaching the Hub only on a
+genuine, classified cache miss. A model that cannot be had raises
+`ModelUnavailable` — a named failure, so a crash record can say `encoder` instead
+of `SystemExit`.
+
+The resolver also moved out of `run.py:main`. It was guarded by `sys.frozen` and
+set an environment variable, so the *service* found the bundled model while the
+MCP server and the CLI — different processes of the same installation — did not.
+
+### `last_crash.json` names the cause
+
+Added alongside the existing keys (the shipped crash banner reads those, so
+nothing was renamed): `cause_chain`, `root_cause`, `subsystem`, `engine`,
+`migration`, `logs`, `version`. A startup killed by DNS is now diagnosable from
+the crash record alone, without correlating adjacent WARNING lines by hand.
+
+### One engine log file per engine, with the boundaries marked
+
+`qdrant.log` was already opened in append mode — the previous report's
+"truncate mode" was wrong, and rotation *preserves* the old content as
+`qdrant.log.1`. The real gaps were that rotation only triggered past 10 MB, so
+two engines' output interleaved in one file with nothing marking the boundary,
+and that nothing recorded the exit at all in the file you would actually read.
+
+Now: every start rolls a non-empty log aside (5 generations), the service writes
+an `=== ragtools engine-start … ===` banner with pid/exe/storage/ports, and an
+observed exit writes `=== ragtools engine-exit … exit_code=… ===`. A reattached
+engine reports where its output goes instead of `log_path: null`.
+
+### A restart that reattaches no longer stops the watcher
+
+`_handle_death` returned `proc is not None`, so a restart that reattached told
+the caller to stop watching — reopening the exact v3.2.0 hole on the recovery
+path. It now keeps watching by pid, and when there is genuinely neither a handle
+nor a pid it says the engine is **unsupervised** rather than spinning on nothing.
+
+### The migration reconciles instead of trusting what it wrote down
+
+The stalled machine held one unit marked `done` beside 25 collections holding
+zero points, and 24 units blocked for a reason that had stopped being true hours
+earlier. Nothing ever re-examined either claim.
+
+`relayout.reconcile()` runs before every resume: it counts what each unit's
+collection actually holds and makes the record agree. A count is evidence and a
+status is a claim — except when the count could not be taken, which demotes
+nothing, because "I could not ask" must never read as "there is nothing there".
+Verified work is preserved. A blocked unit whose blocker has lifted becomes
+runnable and its stale reason is cleared. The plan store is backed up first, the
+same plan is continued, and nothing is deleted.
+
+### `done` now means something
+
+Two paths could mark a unit complete having written nothing. Framework units
+recorded `points_after = 0` as a **literal** — never counted. And `validate`
+objected only to `before > 0 and after == 0`, so any unit the inventory captured
+at zero (every framework corpus, and every project configured but never indexed)
+passed with an empty collection.
+
+A zero must now explain itself. `classify_empty` decides from the **source**, not
+the store: no indexable files is `done` with a recorded reason; a missing project
+path is a `failed` unit, which is the honest answer and keeps it visible and
+retryable. Framework corpora are counted like anything else.
+
+### Something owns unblocking
+
+`build_default_tasks` had four entries and none touched the migration — the
+storage probe raised while storage was down and did nothing when it came back. A
+`migration-recovery` task now re-tests a persisted block every five minutes,
+skipping while an index holds the mutex. Engine recovery resumes whenever a plan
+is stalled rather than only after an automatic restart counter, and
+`resume_migration` refuses to start a second worker on top of a running one.
+
+### Domain conditions are HTTP a caller can act on
+
+`/api/search` returned `500 {"detail": "Internal Server Error"}` during a
+migration — the service understood the situation completely, raised a
+purpose-built `MigrationInProgress` carrying a full progress report, and let it
+fall through to the blanket handler. The same condition was already handled
+correctly one interface over, in the MCP server.
+
+Handlers are now registered per exception type: `MigrationInProgress` → **409**
+with plan/done/total/blocked and a remediation, `OperationRefused` → **409**,
+`StorageWentAway` → **503** with `Retry-After`, `ModelUnavailable` → **503**. The
+recorded block reason is reported as `blocked_reason_recorded`, because a
+two-hour-old `WinError 10061` is a historical record, not current state.
+
+### The dashboard stops reporting an index that does not exist
+
+`points_count` (live) and `total_chunks` (historical, from the state DB) were
+merged into one flat dict with no stated relationship, and the dashboard rendered
+the historical one — so a machine whose every collection held zero points
+advertised "6,546 files · 91,516 chunks". Status now carries `live_points`,
+`historical_chunks`, `historical_files`, `historical_as_of`, `migration`,
+`index_activity`, and an `index_availability` verdict
+(`ready` · `empty` · `rebuilding` · `blocked` · `partial_unavailable` ·
+`stale_searchable` · `storage_unavailable`).
+
+`index_activity()` — phase, done, total, and seconds since the last progress tick
+— existed in v3.3.0 and its only consumer was the job handler. It is the one
+signal that answers "is the rebuild alive or stuck", and it is now on status.
+
+### `winotify` is actually in the bundle
+
+It was declared only in the optional `notifications` extra, which the release
+build never installed (`pip install -e ".[dev,build,tray]"`). So the packaged app
+raised `No module named 'winotify'` and every toast degraded to log-only — the
+crash notification for a dead service never reached the desktop. The extra is now
+installed and the module named explicitly in `rag.spec`, gated to Windows.
+
+### Gates
+
+`tests/test_v340_recovery.py` — 28 tests, **27 of which fail against `v3.3.0`**,
+verified by running them in a detached worktree at that tag. The 28th is labelled
+in its own docstring as not a gate: it passes on both, and exists only to stop
+the new `return True` becoming unconditional.
+
+---
+
 ## [3.3.0] — 2026-07-29
 
 v3.2.0 fixed how the managed engine is *adopted*. It did not give the engine an

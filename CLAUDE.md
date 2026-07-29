@@ -229,6 +229,37 @@ python scripts/eval_retrieval.py --questions tests/fixtures/eval_questions.json 
 - Do NOT spawn a child process without explicit `stdout=`/`stderr=`. Inheritance
   under a GUI-subsystem parent hands it a pipe with no reader, and every write it
   makes fails silently — that is why the v3.2.0 engine death left no evidence.
+- Do NOT start a subprocess in `lifespan` outside a `try`/`finally`. The engine
+  teardown lived after `yield`, so a startup that raised — the encoder's DNS
+  failure, two seconds after the engine came up — skipped it and orphaned the
+  engine. Its manifest still vouched for it, so every later boot took the
+  *reattach* path instead of the spawn path. One missing `finally` chose the
+  harder code path for every subsequent start.
+- Do NOT construct `SentenceTransformer` with a bare Hub repo id. That resolves
+  against the network on every construction, even for a model bundled in the
+  installer, and re-validates files the cache already records as absent. Go
+  through `embedding/encoder.load_model`, which loads `local_files_only` first
+  and reaches the Hub only on a classified cache miss.
+- Do NOT mark a migration unit `done` without counting its collection. Framework
+  units recorded `points_after = 0` as a literal and `validate` objected only to
+  `before > 0 and after == 0`, so any unit captured at zero completed holding
+  nothing. A zero is acceptable only with a recorded `empty_reason`, decided from
+  the SOURCE — the store's emptiness is what is being explained, so it cannot
+  also be the explanation.
+- Do NOT treat a persisted `blocked_reason` as current state. `block_all` writes
+  why a unit was parked; nothing about that record expires. Re-test it
+  (`relayout.reconcile`) and report it as `blocked_reason_recorded`. A
+  two-hour-old `WinError 10061` shown beside a healthy engine is how a health
+  payload loses its credibility.
+- Do NOT let a domain condition reach the blanket exception handler. Register it
+  in `service/errors.py` by TYPE. `/api/search` raised a `MigrationInProgress`
+  carrying a full progress report and returned `500 Internal Server Error`, while
+  the MCP server handled the identical condition correctly — two interfaces,
+  opposite answers.
+- Do NOT put a live count and a historical count in one flat dict. `points_count`
+  (live) and `total_chunks` (state DB) sat side by side with no stated
+  relationship, so a store holding zero points rendered as "91,516 chunks". Name
+  them: `live_points`, `historical_chunks`, and an `index_availability` verdict.
 - Do NOT reach a destructive operation without `service/destructive.py`. Four
   entry points reached `owner.rebuild()` and none of them asked whether storage
   was reachable, while `/health` was reporting that it was not. Preconditions are

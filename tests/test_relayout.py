@@ -175,16 +175,45 @@ def test_a_unit_that_lost_all_its_content_fails_validation(settings):
 
 
 def test_validation_passes_when_every_unit_was_rebuilt(settings):
+    """An empty unit passes only when something recorded WHY it is empty.
+
+    The framework row used to be marked done with a hardcoded ``points_after=0``
+    and validation waved it through, because the only zero it objected to was
+    ``before > 0 and after == 0``. So a corpus that had never received a vector
+    completed exactly like one that had. It passes here because the reason is
+    stated, not because the zero is tolerated — see the companion test below.
+    """
     plan = plan_with(settings, [Unit(KIND_PROJECT, "alpha", 500),
                                 Unit(KIND_FRAMEWORK, "fw_x", 0)])
     relayout.mark(settings, plan, Unit(KIND_PROJECT, "alpha"), STATUS_DONE,
                   points_after=512)
     relayout.mark(settings, plan, Unit(KIND_FRAMEWORK, "fw_x"), STATUS_DONE,
-                  points_after=0)
+                  points_after=0, empty_reason="no indexable files")
 
     ok, problems = relayout.validate(None, settings, plan)
 
     assert ok, problems
+
+
+def test_an_unexplained_zero_no_longer_validates(settings):
+    """The gap that let `1/25 done` sit beside 25 empty collections.
+
+    NEGATIVE CONTROL: on v3.3.0 this passes — `validate` only ever asked
+    `before > 0 and after == 0`, so a unit the inventory captured at zero could
+    complete holding nothing and be waved through.
+    """
+    plan = plan_with(settings, [Unit(KIND_FRAMEWORK, "fw_x", 0),
+                                Unit(KIND_PROJECT, "never_indexed", 0)])
+    relayout.mark(settings, plan, Unit(KIND_FRAMEWORK, "fw_x"), STATUS_DONE,
+                  points_after=0)
+    relayout.mark(settings, plan, Unit(KIND_PROJECT, "never_indexed"),
+                  STATUS_DONE, points_after=0)
+
+    ok, problems = relayout.validate(None, settings, plan)
+
+    assert not ok, "a rebuild that wrote nothing, anywhere, validated clean"
+    assert len(problems) == 2, problems
+    assert all("no recorded reason" in p for p in problems), problems
 
 
 def test_a_plan_is_only_complete_once_finalized(settings):

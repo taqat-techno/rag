@@ -271,7 +271,14 @@ class EngineLifecycle:
         with self._lock:
             pid = self._status.pid
         while not self._stopping.wait(self._poll_interval):
-            if not pid or process_alive(pid):
+            if not pid:
+                # Spinning on a pid we do not have is a watcher that looks alive
+                # and observes nothing — the failure mode this whole module
+                # exists to end. Say so and stop.
+                logger.warning("Managed engine: no pid to watch; the engine is "
+                               "UNSUPERVISED for the rest of this service run")
+                return
+            if process_alive(pid):
                 continue
             if self._stopping.is_set():
                 return
@@ -291,6 +298,11 @@ class EngineLifecycle:
         while not self._stopping.is_set():
             proc = getattr(self._supervisor, "proc", None)
             if proc is None:
+                # A RESTART THAT REATTACHED HAS NO CHILD HANDLE. Returning here
+                # is what left the engine unwatched for the rest of the run —
+                # the v3.2.0 hole, reopened by the very path that recovers from
+                # it. "We cannot wait on it" is a reason to watch differently.
+                self._poll_reattached()
                 return
             try:
                 code = proc.wait()
@@ -327,6 +339,7 @@ class EngineLifecycle:
             if self._status.log_path else
             "No engine log was available for this run")
         self._set_state(CRASHED, detail=detail, exit_code=code)
+        self._write_death_marker(pid, code, uptime)
         self._invalidate_manifest()
         _log_activity("error", "storage", detail)
 
@@ -360,7 +373,11 @@ class EngineLifecycle:
                 self._url = url
                 proc = getattr(supervisor, "proc", None)
                 with self._lock:
-                    self._status.pid = getattr(proc, "pid", None)
+                    # `or _manifest_pid()`: a restart that REATTACHED has no
+                    # child handle, and recording pid=None there would leave the
+                    # poll loop with nothing to watch.
+                    self._status.pid = (getattr(proc, "pid", None)
+                                        or self._manifest_pid())
                     self._status.started_at = self._clock()
                     self._status.exit_code = None
                     self._status.log_path = getattr(supervisor, "log_path", None)
@@ -369,7 +386,18 @@ class EngineLifecycle:
                                   f"{attempt} attempt(s)", attempt=attempt)
                 _log_activity("success", "storage",
                               f"Managed engine restarted (attempt {attempt})")
-                return proc is not None
+                # This returned `proc is not None`, so a restart that reattached
+                # told the caller to STOP WATCHING — reopening the exact hole
+                # this class exists to close, on the recovery path of all
+                # places. `_watch` switches to pid polling when there is no
+                # handle, so a pid is enough to keep going.
+                if proc is None and not self._status.pid:
+                    logger.warning(
+                        "Managed engine restarted, but there is neither a child "
+                        "handle nor a recorded pid to watch it by; it is "
+                        "UNSUPERVISED for the rest of this service run")
+                    return False
+                return True
 
             logger.warning("Managed engine restart attempt %d of %d failed",
                            attempt, self._max_restarts)
@@ -382,6 +410,29 @@ class EngineLifecycle:
         logger.error("Managed Qdrant: %s", exhausted)
         _log_activity("error", "storage", exhausted)
         return False
+
+    def _write_death_marker(self, pid, code, uptime) -> None:
+        """Record the exit IN THE ENGINE'S OWN LOG, not only in ours.
+
+        A process that dies does not get to write its epitaph, so the last thing
+        in ``qdrant.log`` is whatever the engine happened to be saying — with no
+        indication that it was the last thing. Whoever reads ``qdrant.log.1``
+        after the next crash needs the boundary marked, in the file they are
+        already reading, or they are back to correlating two logs by timestamp.
+        """
+        try:
+            from ragtools.storage_managed import engine_marker, write_engine_marker
+
+            data_dir = getattr(self._settings, "data_dir", None)
+            if not data_dir:
+                return
+            write_engine_marker(data_dir, engine_marker(
+                "engine-exit", pid=pid,
+                exit_code=code if code is not None else "unknown-reattached",
+                uptime_s=f"{uptime:.0f}" if uptime else "0",
+                expected="no"))
+        except Exception:  # noqa: BLE001 — a marker must never break the machine
+            logger.debug("could not write the engine-exit marker", exc_info=True)
 
     def _manifest_pid(self):
         """The pid our own record vouches for, when we have no child handle."""

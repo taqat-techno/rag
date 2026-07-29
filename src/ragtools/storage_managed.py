@@ -37,7 +37,10 @@ PINNED_QDRANT_VERSION = "1.15.5"
 #: covers both files.
 ENGINE_LOG_NAME = "qdrant.log"
 ENGINE_LOG_MAX_BYTES = 10 * 1024 * 1024
-ENGINE_LOG_BACKUPS = 3
+#: Five, not three. Each engine process now gets its own generation, and the
+#: bounded restart policy alone can burn three in under two minutes — which
+#: would roll the crash that started the storm off the end of the shelf.
+ENGINE_LOG_BACKUPS = 5
 
 
 class ManagedStartError(RuntimeError):
@@ -50,17 +53,32 @@ def engine_log_path(data_dir) -> Path:
 
 
 def rotate_engine_log(path: Path, *, max_bytes: int = ENGINE_LOG_MAX_BYTES,
-                      backups: int = ENGINE_LOG_BACKUPS) -> None:
-    """Roll the engine log if it is oversized. Called before the child opens it.
+                      backups: int = ENGINE_LOG_BACKUPS,
+                      per_instance: bool = True) -> None:
+    """Roll the engine log so ONE FILE HOLDS ONE ENGINE'S LIFE.
 
-    Rotation happens at START, not on a size trigger, because the writer is a
-    child process holding the handle — renaming a file out from under it is how
-    you get a log that silently stops. One roll per engine start is enough: the
-    engine is long-lived, and a run that outgrows 10 MB has already told us what
-    we needed.
+    Rotation happens at START, never on a size trigger while the engine runs,
+    because the writer is a child process holding the handle — renaming a file
+    out from under it is how you get a log that silently stops.
+
+    ``per_instance`` is the v3.4.0 change and it is the point. v3.3.0 rotated
+    only past 10 MB, so a *small* log from an engine that died was appended to by
+    its successor and the two runs interleaved in one file with nothing marking
+    the boundary. Reading it back, you could not tell which lines belonged to the
+    process that crashed. Now every start rolls a non-empty file aside, so
+    ``qdrant.log.1`` is exactly the previous engine and nothing else.
+
+    Failure is non-fatal by design: on Windows a rename fails while another
+    process still holds the file open — precisely the orphaned-engine case — and
+    appending to a shared file beats refusing to log at all.
     """
     try:
-        if not path.is_file() or path.stat().st_size < max_bytes:
+        if not path.is_file():
+            return
+        size = path.stat().st_size
+        if size == 0:
+            return
+        if not per_instance and size < max_bytes:
             return
         for n in range(backups - 1, 0, -1):
             older, newer = path.with_suffix(f".log.{n}"), path.with_suffix(f".log.{n + 1}")
@@ -68,10 +86,12 @@ def rotate_engine_log(path: Path, *, max_bytes: int = ENGINE_LOG_MAX_BYTES,
                 older.replace(newer)
         path.replace(path.with_suffix(".log.1"))
     except OSError as exc:
-        logger.warning("could not rotate the engine log at %s: %s", path, exc)
+        logger.warning("could not rotate the engine log at %s: %s "
+                       "(appending instead; the previous run's output is kept)",
+                       path, exc)
 
 
-def open_engine_log(data_dir):
+def open_engine_log(data_dir, *, per_instance: bool = True):
     """``(handle, path)`` for the engine's output, or ``(None, None)``.
 
     A REAL OS handle, because that is the only kind a child process can inherit
@@ -82,12 +102,41 @@ def open_engine_log(data_dir):
     path = engine_log_path(data_dir)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        rotate_engine_log(path)
+        rotate_engine_log(path, per_instance=per_instance)
         return open(path, "ab", buffering=0), path
     except OSError as exc:
         logger.warning("could not open the engine log at %s: %s — the engine's "
                        "output will be discarded this run", path, exc)
         return None, None
+
+
+def write_engine_marker(data_dir, text: str) -> bool:
+    """Append one SERVICE-written line to the engine log. Never raises.
+
+    The engine's own output says what it was doing; it cannot say which pid it
+    was, when we started it, or why it stopped — a process that dies does not
+    get to write its own epitaph. So the supervisor writes the boundaries, into
+    the same file, and a reader gets one coherent story instead of two half
+    ones in different places.
+    """
+    try:
+        path = engine_log_path(data_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "ab", buffering=0) as handle:
+            handle.write((text.rstrip("\n") + "\n").encode("utf-8", "replace"))
+        return True
+    except OSError as exc:
+        logger.warning("could not write an engine-log marker: %s", exc)
+        return False
+
+
+def engine_marker(kind: str, **fields) -> str:
+    """A machine-greppable marker line: ``=== ragtools <kind> k=v k=v ===``."""
+    from datetime import datetime, timezone
+
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    body = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    return f"=== ragtools {kind} at={stamp} {body} ==="
 
 
 def _spawn_kwargs(stream) -> dict:
@@ -229,7 +278,14 @@ class QdrantSupervisor:
         #: Where the engine's output went this run, and why if it went nowhere.
         #: Surfaced on /health: a logging failure must not block the engine, but
         #: it must not be invisible either.
-        self.log_path: Optional[str] = None
+        #:
+        #: Known from ``data_dir`` ALONE, before anything is opened, because a
+        #: REATTACHED engine never calls :meth:`start` — and v3.3.0 therefore
+        #: reported ``log_path: null`` for it with no ``log_error`` to explain
+        #: the null. "There is no log" and "the log is over there, written by
+        #: the process that spawned it" are different facts.
+        self.log_path: Optional[str] = (
+            str(engine_log_path(data_dir)) if data_dir else None)
         self.log_error: str = ""
         self._log_handle = None
 
@@ -293,6 +349,9 @@ class QdrantSupervisor:
             else:
                 self._log_handle = stream
                 self.log_path = str(path)
+        else:
+            self.log_error = ("no data directory was given to the supervisor, "
+                              "so this engine has nowhere to write")
 
         try:
             self._proc = self._spawn(self.command(), **_spawn_kwargs(stream))
@@ -300,6 +359,20 @@ class QdrantSupervisor:
             # An injected double that accepts only the command. Tests use these,
             # and a signature mismatch must not stop the engine from starting.
             self._proc = self._spawn(self.command())
+
+        # The service writes the boundary the engine cannot write for itself.
+        # A crashed process does not get to record which pid it was or when it
+        # started, and that is exactly what you need when reading `qdrant.log.1`
+        # back after the fact.
+        if self.data_dir and stream is not None:
+            write_engine_marker(self.data_dir, engine_marker(
+                "engine-start",
+                pid=getattr(self._proc, "pid", None),
+                exe=self.binary_path,
+                storage=self.storage_path,
+                http=self.http_port,
+                grpc=self.grpc_port,
+            ))
         return self._proc
 
     def _close_log(self) -> None:

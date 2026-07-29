@@ -713,3 +713,94 @@ depending on the build venv.
 | 23 | Child process stdio | Explicit sink or DEVNULL — never inheritance | Yes |
 | 24 | Destructive preconditions | One shared guard, checked before any mutation; 409 not 500 | Yes |
 | 25 | Client/server pin | Bounded together; build gate on all platforms | Yes |
+
+
+---
+
+## Decision 26 — Whatever Ends Startup Stops What Startup Started
+
+**Context.** `lifespan` started the managed engine, then loaded the encoder. A
+DNS failure in the encoder raised, uvicorn reported `STARTUP_FAILURE`, and the
+teardown — which lived after `yield` — never ran. The engine survived its parent
+with its ownership manifest still vouching for it.
+
+**Decision.** The startup sequence is wrapped in `try`/`finally`. The teardown
+that runs on a clean shutdown is the same teardown that runs on a failed one.
+
+**Consequence.** An orphaned engine is not merely untidy: its manifest makes the
+next boot *reattach*, which is a materially different code path — no child handle
+to wait on, and until v3.4.0 no engine log either. One missing `finally` chose
+the harder path for every subsequent start.
+
+---
+
+## Decision 27 — A Bundled Model Is Loaded Without the Network
+
+**Context.** The installer ships a complete Hugging Face cache. `Encoder`
+constructed `SentenceTransformer` with a bare Hub repo id, which resolves against
+the Hub on every construction — re-validating even files the cache has already
+recorded as absent in `.no_exist`. A transient DNS outage took the whole service
+down.
+
+**Decision.** Resolve the local cache, load with `local_files_only=True` and the
+Hugging Face offline switches set, and reach the network only on a genuine,
+classified cache miss. A model that cannot be loaded raises `ModelUnavailable`.
+
+**Consequence.** Startup does not depend on name resolution. And the failure has
+a name, so `last_crash.json` can say `subsystem: encoder` — the previous record
+said `SystemExit: 3`, which sent the investigation to the storage engine.
+
+---
+
+## Decision 28 — A Status Is a Claim; a Count Is Evidence
+
+**Context.** A machine held one migration unit marked `done` beside 25
+collections holding zero points, and 24 units blocked for a reason that had
+stopped being true hours earlier. Nothing re-examined either.
+
+**Decision.** `relayout.reconcile()` runs before every resume and makes the
+record agree with the store. Where they disagree the count wins — **except when
+the count could not be taken**, which demotes nothing. Verified work is
+preserved, a lifted block is cleared, the plan store is backed up first, the same
+plan is continued, and nothing is deleted.
+
+**Consequence.** "I could not ask" and "there is nothing there" lead to opposite
+decisions. Conflating them is what disabled search on a correctly-rebuilt v3.1.0
+machine, and the rule is now stated once rather than rediscovered per caller.
+
+---
+
+## Decision 29 — An Empty Unit Must Explain Itself
+
+**Context.** Framework units recorded `points_after = 0` as a literal, and
+`validate` objected only to `before > 0 and after == 0`. So any unit the
+inventory captured at zero could complete holding nothing.
+
+**Decision.** A unit is `done` only when it holds points **or** carries a
+recorded `empty_reason`. The reason is decided from the SOURCE, never from the
+store: no indexable files is legitimately empty; a missing project path is a
+`failed` unit.
+
+**Consequence.** A migration cannot finish over a collection that never received
+a vector. The emptiness of the store is the thing being explained, so it cannot
+also be the explanation.
+
+---
+
+## Decision 30 — A Known Condition Is Never an Anonymous 500
+
+**Context.** `/api/search` raised `MigrationInProgress` — a purpose-built
+exception carrying a full progress report — and the blanket handler in
+`create_app` turned it into `500 {"detail": "Internal Server Error"}`. The MCP
+server handled the identical condition correctly, so two interfaces gave opposite
+answers to one question.
+
+**Decision.** Handlers are registered per exception TYPE in `service/errors.py`,
+not per route. 409 for "the state of this resource forbids it"; 503 with
+`Retry-After` for "a dependency is down". Every body carries a stable code, the
+current state, and a remediation.
+
+**Consequence.** A per-route `try` is a thing to forget on the next route — and
+the route that mattered was the one nobody remembered. A persisted block reason
+is reported as `blocked_reason_recorded`, because presenting a two-hour-old
+error as current state is how a health payload loses its credibility.

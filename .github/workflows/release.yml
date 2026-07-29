@@ -33,7 +33,7 @@ jobs:
           key: model-build-cache-all-MiniLM-L6-v2-v1
 
       - name: Install dependencies
-        run: pip install -e ".[dev,build,tray]"
+        run: pip install -e ".[dev,build,tray,notifications]"
 
       - name: The shipped client and server must be compatible
         run: python scripts/check_qdrant_compat.py
@@ -136,7 +136,7 @@ jobs:
           key: model-build-cache-all-MiniLM-L6-v2-macos-v1
 
       - name: Install dependencies
-        run: pip install -e ".[dev,build,tray]"
+        run: pip install -e ".[dev,build,tray,notifications]"
 
       - name: The shipped client and server must be compatible
         run: python scripts/check_qdrant_compat.py
@@ -219,7 +219,7 @@ jobs:
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install dependencies
-        run: pip install -e ".[dev,build,tray]"
+        run: pip install -e ".[dev,build,tray,notifications]"
 
       - name: The shipped client and server must be compatible
         run: python scripts/check_qdrant_compat.py

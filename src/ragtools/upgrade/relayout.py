@@ -237,6 +237,12 @@ def _add_retry_columns(conn: sqlite3.Connection) -> None:
          "ALTER TABLE relayout_unit ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"),
         ("next_attempt",
          "ALTER TABLE relayout_unit ADD COLUMN next_attempt REAL"),
+        # Why a unit legitimately holds zero points. Without it, "rebuilt and
+        # genuinely empty" and "rebuilt and silently lost" are the same row, and
+        # `validate` passed both — which is how a migration reported 1/25 done
+        # over a collection that had never received a vector.
+        ("empty_reason",
+         "ALTER TABLE relayout_unit ADD COLUMN empty_reason TEXT"),
     ):
         if column in present:
             continue
@@ -475,7 +481,8 @@ def reset_attempts(settings, plan_id: int) -> int:
 
 
 def mark(settings, plan_id: int, unit: Unit, status: str, *,
-         points_after: int = 0, error: str = "", count_attempt: bool = False) -> None:
+         points_after: int = 0, error: str = "", count_attempt: bool = False,
+         empty_reason: str = "") -> None:
     """Record one unit's outcome. Committed immediately — a crash one unit later
     must not lose the unit that just succeeded.
 
@@ -503,9 +510,10 @@ def mark(settings, plan_id: int, unit: Unit, status: str, *,
             else:
                 conn.execute(
                     "UPDATE relayout_unit SET status=?, points_after=?, error=?,"
-                    " updated_at=? WHERE plan_id=? AND kind=? AND unit_id=?",
-                    (status, points_after, error or None, time.time(), plan_id,
-                     unit.kind, unit.unit_id))
+                    " updated_at=?, empty_reason=?"
+                    " WHERE plan_id=? AND kind=? AND unit_id=?",
+                    (status, points_after, error or None, time.time(),
+                     empty_reason or None, plan_id, unit.kind, unit.unit_id))
     finally:
         conn.close()
 
@@ -567,12 +575,13 @@ def validate(owner, settings, plan_id: int) -> tuple[bool, list[str]]:
     conn = _connect(settings)
     try:
         rows = conn.execute(
-            "SELECT kind, unit_id, points_before, points_after FROM relayout_unit"
-            " WHERE plan_id=? AND status=?", (plan_id, STATUS_DONE)).fetchall()
+            "SELECT kind, unit_id, points_before, points_after, empty_reason"
+            " FROM relayout_unit WHERE plan_id=? AND status=?",
+            (plan_id, STATUS_DONE)).fetchall()
     finally:
         conn.close()
 
-    for kind, unit_id, before, after in rows:
+    for kind, unit_id, before, after, empty_reason in rows:
         if int(after) == POINTS_UNKNOWN:
             # Not counted. That is a reason to keep the old index, and NOT a
             # reason to claim the rebuild produced nothing.
@@ -580,9 +589,22 @@ def validate(owner, settings, plan_id: int) -> tuple[bool, list[str]]:
                 f"{kind} {unit_id}: rebuilt, but its points could not be counted")
             continue
         if int(before) > 0 and int(after) == 0:
+            # Checked FIRST, because it is the more informative answer for the
+            # same observation: "held 500 and none after" names data loss, where
+            # the general case below only says the zero is unexplained.
             problems.append(
                 f"{kind} {unit_id}: held {before} points before the migration and "
                 f"none after")
+            continue
+        if int(after) == 0 and not empty_reason:
+            # SYMMETRIC NOW. This asked only `before > 0 and after == 0`, so a
+            # unit captured at zero could complete holding nothing and validate
+            # clean — the gap that let a framework corpus, and any project that
+            # had never been indexed, pass without a single vector. An empty
+            # collection is acceptable only when something recorded WHY.
+            problems.append(
+                f"{kind} {unit_id}: rebuilt to zero points with no recorded "
+                f"reason for being empty")
     return (not problems), problems
 
 
@@ -686,6 +708,241 @@ def unattributed_collections(owner) -> list[str]:
     return sorted(existing - owned_collections(owner))
 
 
+def _framework_collection(owner, unit_id: str) -> Optional[str]:
+    """The corpus collection for a framework unit, or None if unknowable."""
+    try:
+        frameworks = getattr(owner, "_frameworks", None)
+        if frameworks is None:
+            return None
+        for record in frameworks.all_frameworks():
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("id") or "") == str(unit_id):
+                name = record.get("collection_name")
+                return str(name) if name else None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def collection_for_unit(owner, kind: str, unit_id: str) -> Optional[str]:
+    """Which collection a unit's points live in. One answer, one place."""
+    if kind == KIND_FRAMEWORK:
+        return _framework_collection(owner, unit_id)
+    try:
+        return owner.router.write_collection(unit_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def points_for_unit(owner, kind: str, unit_id: str) -> int:
+    """Points this unit holds, or :data:`POINTS_UNKNOWN`.
+
+    Framework corpora are counted like anything else. v3.3.0 wrote ``after = 0``
+    for them as a literal — never counted, never countable, and therefore always
+    passing a ``validate`` that only objects when ``before > 0``. A whole class
+    of unit could complete having written nothing, and one of them is the
+    likeliest identity of the ``1/25 done`` on the stalled machine.
+    """
+    if kind == KIND_PROJECT:
+        return _points_for_project(owner, unit_id)
+
+    name = collection_for_unit(owner, kind, unit_id)
+    if not name:
+        logger.warning("relayout: no collection is registered for %s %s; "
+                       "recording the rebuild as UNVERIFIED", kind, unit_id)
+        return POINTS_UNKNOWN
+    try:
+        return int(owner._count_points(name))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("relayout: could not count %s (%s); recording the rebuild "
+                       "as UNVERIFIED", name, exc)
+        return POINTS_UNKNOWN
+
+
+def classify_empty(owner, settings, kind: str, unit_id: str) -> tuple[str, str]:
+    """Is zero points legitimate here? Returns ``(disposition, reason)``.
+
+    ``disposition`` is ``"done"`` when the unit is empty *by design* and
+    ``"failed"`` when it is empty because something went wrong. This is the
+    distinction v3.3.0 did not draw at all: every zero was accepted, so a project
+    whose path had gone missing completed exactly like a project that genuinely
+    contains no indexable files.
+
+    Decided from the SOURCE, never from the vector store — the store's emptiness
+    is the thing being explained, so it cannot also be the explanation.
+    """
+    if kind == KIND_FRAMEWORK:
+        return ("failed", "the framework corpus was rebuilt but holds no points")
+
+    project = None
+    for candidate in (getattr(settings, "enabled_projects", None) or []):
+        if getattr(candidate, "id", None) == unit_id:
+            project = candidate
+            break
+    if project is None:
+        return ("failed",
+                f"project {unit_id!r} rebuilt to zero points and is no longer in "
+                f"the configuration")
+
+    path = Path(getattr(project, "path", "") or "")
+    if not path.exists():
+        # A FAILURE, not a success. It is the honest answer, it is retryable
+        # once the path returns, and it keeps the unit visible instead of
+        # burying it in a completed plan.
+        return ("failed", f"project path does not exist: {path}")
+
+    try:
+        # The INDEXER's own definition of "indexable", not a second one. If this
+        # asked a different question than `run_full_index` does, a project could
+        # be "empty by design" here and full of files there.
+        count = len(owner._scan_files(unit_id))
+    except Exception as exc:  # noqa: BLE001 — cannot prove empty => not empty
+        return ("failed",
+                f"rebuilt to zero points and the source could not be counted "
+                f"({type(exc).__name__}: {exc})")
+
+    if count == 0:
+        return ("done", "no indexable files")
+    return ("failed",
+            f"{count} indexable file(s) on disk but the collection holds no points")
+
+
+@dataclass
+class Reconciliation:
+    """What :func:`reconcile` changed, and why. Reported, never silent."""
+
+    plan_id: int
+    preserved: list = field(default_factory=list)
+    reset: list = field(default_factory=list)
+    unblocked: list = field(default_factory=list)
+    unknown: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.reset or self.unblocked)
+
+    def describe(self) -> str:
+        return (f"reconciled plan {self.plan_id}: {len(self.preserved)} verified, "
+                f"{len(self.reset)} reset, {len(self.unblocked)} unblocked, "
+                f"{len(self.unknown)} uncountable")
+
+
+def _backup_plan_db(settings) -> Optional[Path]:
+    """Copy the plan store aside before rewriting persisted state."""
+    import shutil
+    from datetime import datetime, timezone
+
+    source = _db_path(settings)
+    if not source.exists():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = source.with_name(f"{source.name}.bak-{stamp}")
+    try:
+        shutil.copy2(source, target)
+        return target
+    except OSError as exc:
+        logger.warning("could not back up the plan store: %s", exc)
+        return None
+
+
+def reconcile(owner, settings, plan_id: Optional[int] = None) -> Optional[Reconciliation]:
+    """Make the persisted plan agree with what the store actually holds.
+
+    THE RECOVERY. A machine can be left with a plan that says one unit is done
+    while every collection is empty, and 24 units blocked for a reason that
+    stopped being true hours ago. Nothing in v3.3.0 ever re-examined either
+    claim, so the plan was frozen in the shape the outage left it.
+
+    Rules, in the order they matter:
+
+    * **A count is evidence; a status is a claim.** Where they disagree the count
+      wins — except when the count could not be taken, which demotes nothing.
+      "I could not ask" must never read as "there is nothing there"; that
+      conflation is what disabled search on a correctly-rebuilt v3.1.0 machine.
+    * **Verified work is preserved.** A unit holding points stays done, and its
+      recorded count is refreshed. Re-indexing what is already correct is how an
+      eight-hour migration becomes a sixteen-hour one.
+    * **The blocking reason is re-tested, not trusted.** A blocked unit whose
+      blocker has lifted becomes runnable and its stale error is cleared.
+    * **The same plan is continued.** A second plan would re-capture an inventory
+      from a state DB that now describes a half-built store — the one ordering
+      this module's docstring calls the most dangerous in the feature.
+    * **Nothing is deleted.** Not the old embedded store, not a collection, not a
+      project. Reconciliation only ever moves a row's status.
+    """
+    plan_id = plan_id if plan_id is not None else active_plan(settings)
+    if plan_id is None:
+        return None
+
+    report = Reconciliation(plan_id=plan_id)
+    backup = _backup_plan_db(settings)
+    if backup is not None:
+        report.notes.append(f"plan store backed up to {backup.name}")
+
+    ready = preflight(owner)
+
+    conn = _connect(settings)
+    try:
+        rows = conn.execute(
+            "SELECT kind, unit_id, status, points_before, points_after, empty_reason"
+            " FROM relayout_unit WHERE plan_id=? ORDER BY kind, unit_id",
+            (plan_id,)).fetchall()
+    finally:
+        conn.close()
+
+    for kind, unit_id, status, before, after, empty_reason in rows:
+        unit = Unit(str(kind), str(unit_id), int(before or 0))
+
+        if status == STATUS_DONE:
+            live = points_for_unit(owner, unit.kind, unit.unit_id)
+            if live == POINTS_UNKNOWN:
+                report.unknown.append((unit.kind, unit.unit_id))
+                report.notes.append(
+                    f"{unit.kind} {unit.unit_id}: left done — its points could "
+                    f"not be counted, and an unaskable question is not evidence "
+                    f"of loss")
+                continue
+            if live > 0:
+                if int(after or 0) != live:
+                    mark(settings, plan_id, unit, STATUS_DONE, points_after=live,
+                         empty_reason=empty_reason or "")
+                report.preserved.append((unit.kind, unit.unit_id, live))
+                continue
+            if empty_reason:
+                report.preserved.append((unit.kind, unit.unit_id, 0))
+                report.notes.append(
+                    f"{unit.kind} {unit.unit_id}: empty by design ({empty_reason})")
+                continue
+            # Marked done, holds nothing, and nothing explains why.
+            mark(settings, plan_id, unit, STATUS_PENDING,
+                 error="reset by reconciliation: recorded done but the "
+                       "collection holds no points")
+            report.reset.append((unit.kind, unit.unit_id))
+            report.notes.append(
+                f"{unit.kind} {unit.unit_id}: RESET — recorded done with an "
+                f"empty collection and no recorded reason")
+            continue
+
+        if status == STATUS_BLOCKED and ready.ok:
+            mark(settings, plan_id, unit, STATUS_PENDING)
+            report.unblocked.append((unit.kind, unit.unit_id))
+
+    if report.unblocked and ready.ok:
+        report.notes.append(
+            f"{len(report.unblocked)} unit(s) unblocked: storage is reachable "
+            f"again, so the recorded block no longer describes reality")
+    elif not ready.ok:
+        report.notes.append(f"storage is still unreachable ({ready.reason}); "
+                            f"blocked units were left blocked")
+
+    logger.info("relayout %s", report.describe())
+    for note in report.notes:
+        logger.info("relayout reconcile: %s", note)
+    return report
+
+
 def run_pending(owner, settings, *, plan_id: Optional[int] = None,
                 progress_cb=None, reset: bool = False) -> Progress:
     """Rebuild every unit that is not already done, then validate and finish.
@@ -722,6 +979,17 @@ def run_pending(owner, settings, *, plan_id: Optional[int] = None,
             "with `rag upgrade --resume`.", plan_id, ready.reason, parked)
         return progress(settings, plan_id) or Progress(plan_id=plan_id,
                                                        status=PLAN_RUNNING)
+
+    # RECONCILE BEFORE RESUMING. Storage has just been proven reachable, which
+    # is exactly the moment a persisted "blocked because storage is unreachable"
+    # stops being true — and the moment a "done" recorded over an empty
+    # collection can be caught, before the plan is allowed to finish on top of
+    # it. Cheap: one count per unit against a store we have just talked to.
+    try:
+        reconcile(owner, settings, plan_id)
+    except Exception:  # noqa: BLE001 — never let recovery block the rebuild
+        logger.exception("relayout plan %s: reconciliation failed; continuing "
+                         "with the plan as recorded", plan_id)
 
     todo = units_to_do(settings, plan_id)
     exhausted = exhausted_units(settings, plan_id)
@@ -764,13 +1032,42 @@ def run_pending(owner, settings, *, plan_id: Optional[int] = None,
                         "rather than recording it as rebuilt",
                         unit.kind, unit.unit_id)
                     continue
-                after = _points_for_project(owner, unit.unit_id)
+                after = points_for_unit(owner, unit.kind, unit.unit_id)
             else:
                 owner.sync_frameworks(refresh=True)
-                after = 0
-            mark(settings, plan_id, unit, STATUS_DONE, points_after=after)
-            logger.info("relayout: %s %s rebuilt (%s points)",
-                        unit.kind, unit.unit_id, after)
+                # COUNTED, not assumed. This was the literal `0`.
+                after = points_for_unit(owner, unit.kind, unit.unit_id)
+
+            # A ZERO MUST EXPLAIN ITSELF BEFORE IT COUNTS AS SUCCESS.
+            #
+            # `validate` only ever objected to `before > 0 and after == 0`, so a
+            # unit the inventory captured at zero — every framework corpus, and
+            # every project configured but never indexed — completed with an
+            # empty collection and no complaint. On the stalled machine that is
+            # the likeliest identity of the single `done` unit sitting beside 25
+            # empty collections.
+            empty_reason = ""
+            if after == 0:
+                disposition, reason = classify_empty(
+                    owner, settings, unit.kind, unit.unit_id)
+                if disposition != STATUS_DONE:
+                    mark(settings, plan_id, unit, STATUS_FAILED, error=reason,
+                         count_attempt=True)
+                    logger.warning("relayout: %s %s rebuilt to ZERO points — %s",
+                                   unit.kind, unit.unit_id, reason)
+                    if progress_cb:
+                        try:
+                            progress_cb(unit, "done")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    continue
+                empty_reason = reason
+
+            mark(settings, plan_id, unit, STATUS_DONE, points_after=after,
+                 empty_reason=empty_reason)
+            logger.info("relayout: %s %s rebuilt (%s points%s)",
+                        unit.kind, unit.unit_id, after,
+                        f"; {empty_reason}" if empty_reason else "")
         except Exception as exc:  # noqa: BLE001 — record and carry on
             # Re-check storage before blaming the unit. A backend that died
             # mid-run makes every remaining unit fail for a reason that has
