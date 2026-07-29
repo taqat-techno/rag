@@ -55,9 +55,14 @@ Local-first RAG system over documentation, with **opt-in** source-code and confi
   `/health`.
 - **The managed engine is OWNED, and ownership is proven — never inferred from a
   port.** `service/engine_ownership.py` is the only place that answers "is this
-  engine mine?", using four proofs: the spawned child is alive, the
-  per-installation API key authenticates, the LISTEN pid is our child, and its
-  image is the binary we launched. A durable manifest
+  engine mine?". Two proofs ALWAYS run — the spawned child is alive, and the
+  per-installation API key authenticates — and two are defence in depth (the
+  LISTEN pid is our child; its image is the binary we launched). The latter two
+  need `psutil`, which is NOT a declared dependency, so they are absent on a
+  packaged install; the boundary is carried by the first two, which are the ones
+  that close the incident. The port check BINDS rather than connects — a server
+  with a saturated accept backlog refuses connections, so connect-probing
+  reported a busy port as free. A durable manifest
   (`<data_dir>/qdrant-owner.json`) records instance id, pid, executable, storage
   path, ports and start time.
   - **An occupied port is resolved BEFORE anything is spawned** — reattach when

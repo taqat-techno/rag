@@ -15,19 +15,33 @@ states it for the service layer::
 
 It was never applied one layer down, to the engine. This module applies it.
 
-**Four independent proofs, cheapest first.** Any one failing means "not mine":
+**Two proofs that always run, and two that are defence in depth.** Any one
+failing means "not mine":
 
-1. **The child is alive.** A process that has exited cannot be the thing
-   answering. This alone breaks the reported incident, and it costs one poll.
-2. **The API key authenticates.** Each installation generates its own; the engine
-   is started with it and the client presents it. Another instance's engine
-   rejects us outright, so adoption becomes impossible rather than merely
-   unlikely. It is also the only proof that defends against a *foreign* Qdrant —
-   somebody else's application — holding the port.
-3. **The listener is our process.** The PID holding the port must be the child we
-   spawned. ``process.py:_port_listener_pid`` already answers exactly this
-   question one layer up; this is the same question about the engine.
-4. **The executable matches.** That PID's image must be the binary we launched.
+1. **The child is alive.** ALWAYS AVAILABLE. A process that has exited cannot be
+   the thing answering. This alone breaks the reported incident, and it costs
+   one poll.
+2. **The API key authenticates.** ALWAYS AVAILABLE. Each installation generates
+   its own; the engine is started with it and the client presents it. Another
+   instance's engine rejects us outright, so adoption becomes impossible rather
+   than merely unlikely. It is also the only proof that defends against a
+   *foreign* Qdrant — somebody else's application — holding the port.
+3. **The listener is our process.** BEST EFFORT. The PID holding the port must
+   be the child we spawned.
+4. **The executable matches.** BEST EFFORT. That PID's image must be the binary
+   we launched.
+
+**3 and 4 need ``psutil``, which this project does not declare as a dependency**
+— five modules already import it opportunistically and degrade when it is
+absent, and a packaged bundle generally has none. Saying "four proofs" without
+that sentence would describe a boundary the shipped product does not have. What
+the shipped product does have is 1 and 2, and they are the two that close the
+incident: a dead child is refused outright, and an engine that is not ours
+cannot authenticate us. 3 and 4 turn a later refusal into an earlier, clearer
+one when they are available.
+
+**The port check binds rather than connects** — see :func:`port_is_free`. That
+distinction is load-bearing and was measured, not assumed.
 
 **The port is the lock.** No separate lock file: the resource actually contended
 is the TCP port, a held port is self-cleaning in a way a lock file is not, and a
@@ -254,12 +268,30 @@ def listener_identity(port: int) -> Optional[tuple[int, str]]:
 
 
 def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
-    """Whether ``port`` accepts a connection. Cheap, and needs no psutil."""
+    """Can we bind ``port``? Asked by BINDING it, not by connecting to it.
+
+    Connecting answers "will something talk to me", which is a different
+    question and a fragile one: a server that has not accepted its backlog
+    refuses further connections, so a busy port reports itself free. Measured —
+    a listening socket with an unaccepted connection queued made this return
+    True, and the caller would then have spawned an engine onto an occupied
+    port, which is the entire failure being prevented.
+
+    Binding asks the question we actually have. It fails with EADDRINUSE
+    precisely when something already holds the port, and it does not depend on
+    the other process behaving well. ``SO_REUSEADDR`` is deliberately NOT set:
+    it would let the bind succeed against a socket in TIME_WAIT and, on some
+    platforms, against a live listener — which is the false "free" all over
+    again.
+    """
     import socket
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.35)
-        return sock.connect_ex((host, port)) != 0
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, port))
+        return True
+    except OSError:
+        return False
 
 
 def process_alive(pid: int) -> bool:

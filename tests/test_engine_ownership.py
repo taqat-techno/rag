@@ -276,6 +276,44 @@ def occupied():
     sock.close()
 
 
+def test_an_occupied_port_stays_occupied_when_its_backlog_is_full(tmp_path, occupied):
+    """The port check must BIND, not connect.
+
+    Connecting asks "will something talk to me", which is a different question
+    and a fragile one: a server that has not accepted its backlog refuses
+    further connections, so a busy port reported itself FREE and the caller
+    would have spawned an engine straight onto it — the exact failure this
+    module exists to prevent. Measured, not theorised.
+    """
+    import socket as _socket
+
+    for _ in range(5):
+        try:
+            c = _socket.socket()
+            c.settimeout(0.3)
+            c.connect(("127.0.0.1", occupied))
+        except OSError:
+            pass
+
+    assert own.port_is_free(occupied) is False, (
+        "a port whose accept backlog is saturated was reported free")
+    assert own.inspect_port(FakeSettings(tmp_path), occupied).action == "refuse"
+
+
+def test_the_boundary_holds_without_psutil(tmp_path, occupied, monkeypatch):
+    """`psutil` is not a declared dependency, so proofs 3 and 4 are absent on a
+    packaged install. The refusal must not depend on them."""
+    monkeypatch.setattr(own, "listener_identity", lambda port: None)
+    settings = FakeSettings(tmp_path)
+
+    assert own.inspect_port(settings, occupied).action == "refuse"
+
+    own.write_manifest(settings, own.EngineClaim(
+        instance_id="me", pid=999_999, executable="q", storage_path="s",
+        http_port=occupied, grpc_port=occupied + 1, started_at=0.0))
+    assert own.inspect_port(settings, occupied).action == "refuse"
+
+
 def test_a_free_port_is_spawned_on(tmp_path):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
