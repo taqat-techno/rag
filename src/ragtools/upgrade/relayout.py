@@ -48,8 +48,27 @@ STATUS_PENDING = "pending"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 
+#: The storage backend was unreachable, so this unit was never attempted.
+#:
+#: A distinct state because it is a distinct fact, and collapsing it into
+#: ``failed`` is what produced the observed CPU loop: an unreachable engine and
+#: a corrupt file were recorded identically, so the retry policy could not tell
+#: "try again when storage returns" from "this will never work". Blocked units
+#: consume no attempts — nothing about them failed.
+STATUS_BLOCKED = "blocked"
+
 PLAN_RUNNING = "running"
 PLAN_COMPLETE = "complete"
+
+#: How many times a unit is retried automatically before it is left alone.
+#: `rag upgrade --resume` clears this: an operator who has fixed the cause is
+#: entitled to a fresh budget, and only they know the cause was fixed.
+MAX_ATTEMPTS = 3
+
+#: Backoff between automatic attempts. Bounded and short — the expensive part is
+#: the rebuild, not the wait, and a long sleep in a startup thread is its own
+#: problem.
+_BACKOFF_SECONDS = (0.0, 30.0, 300.0)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS relayout_plan (
@@ -116,6 +135,9 @@ class Progress:
     done: int = 0
     failed: int = 0
     pending: int = 0
+    blocked: int = 0
+    #: Why the backend was unreachable, when anything is blocked.
+    blocked_reason: str = ""
     failures: list[tuple[str, str, str]] = field(default_factory=list)
 
     @property
@@ -126,12 +148,29 @@ class Progress:
     def in_progress(self) -> bool:
         return self.status == PLAN_RUNNING
 
+    @property
+    def stalled(self) -> bool:
+        """Nothing more will happen on its own. Distinct from "still working".
+
+        An installer, `/health` and `selfcheck` all need to tell "a rebuild is
+        running, wait" from "a rebuild has stopped and needs you" — those want
+        opposite words and opposite remedies.
+        """
+        return not self.complete and bool(self.blocked or self.failed)
+
     def describe(self) -> str:
         if self.complete:
             return f"migration complete ({self.done}/{self.total} units)"
         parts = [f"{self.done}/{self.total} rebuilt"]
         if self.failed:
             parts.append(f"{self.failed} failed")
+        if self.blocked:
+            detail = f"{self.blocked} blocked"
+            if self.blocked_reason:
+                detail += f" ({self.blocked_reason})"
+            parts.append(detail)
+        if self.blocked and not self.done:
+            return "migration/reindex BLOCKED — " + ", ".join(parts)
         return "migration/reindex in progress — " + ", ".join(parts)
 
 
@@ -169,7 +208,28 @@ def _connect(settings) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30)
     conn.executescript(_SCHEMA)
+    _add_retry_columns(conn)
     return conn
+
+
+def _add_retry_columns(conn: sqlite3.Connection) -> None:
+    """Bring an existing plan store up to the retry schema.
+
+    ``CREATE TABLE IF NOT EXISTS`` does not add columns, and a machine that is
+    mid-migration right now — which is exactly the machine this release is for —
+    already has the table. So the columns are added here, tolerantly: a
+    duplicate-column error means another process got there first, or we did on a
+    previous run.
+    """
+    for ddl in (
+        "ALTER TABLE relayout_unit ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE relayout_unit ADD COLUMN next_attempt REAL",
+    ):
+        try:
+            with conn:
+                conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # already present
 
 
 # --- capture, which must happen before anything is destroyed --------------
@@ -320,6 +380,10 @@ def progress(settings, plan_id: Optional[int] = None) -> Optional[Progress]:
             elif status == STATUS_FAILED:
                 result.failed += 1
                 result.failures.append((kind, unit_id, error or "unknown"))
+            elif status == STATUS_BLOCKED:
+                result.blocked += 1
+                if error and not result.blocked_reason:
+                    result.blocked_reason = error
             else:
                 result.pending += 1
         return result
@@ -328,34 +392,142 @@ def progress(settings, plan_id: Optional[int] = None) -> Optional[Progress]:
 
 
 def units_to_do(settings, plan_id: int) -> list[Unit]:
-    """Pending AND failed — retry only what is not finished.
+    """What may be attempted right now. Completed work is never repeated.
 
-    Completed work is never repeated, which is what makes an eight-hour
-    migration survivable across a restart.
+    Bounded, where it used to be unbounded. This returned everything that was
+    not ``done`` — which includes ``failed`` — and ``run_pending`` is called on
+    EVERY service start, so a unit that failed was re-attempted forever. Each
+    attempt is a FULL re-index of that project: the whole tree re-scanned, every
+    file re-chunked and re-embedded from zero. With Task Scheduler restarting
+    the service on failure, that is the observed CPU loop, and nothing in it
+    ever converged.
+
+    So a unit is offered only while it has attempts left and its backoff has
+    elapsed. ``blocked`` units are always offered — nothing about them failed,
+    and the caller has just proven storage is reachable again.
     """
+    now = time.time()
     conn = _connect(settings)
     try:
         rows = conn.execute(
-            "SELECT kind, unit_id, points_before FROM relayout_unit"
-            " WHERE plan_id=? AND status!=? ORDER BY kind, unit_id",
+            "SELECT kind, unit_id, points_before, status, attempts, next_attempt"
+            " FROM relayout_unit WHERE plan_id=? AND status!=?"
+            " ORDER BY kind, unit_id",
             (plan_id, STATUS_DONE)).fetchall()
-        return [Unit(str(k), str(u), int(p)) for k, u, p in rows]
+    finally:
+        conn.close()
+
+    ready: list[Unit] = []
+    for kind, unit_id, points, status, attempts, next_attempt in rows:
+        if status != STATUS_BLOCKED:
+            if int(attempts or 0) >= MAX_ATTEMPTS:
+                continue
+            if next_attempt and float(next_attempt) > now:
+                continue
+        ready.append(Unit(str(kind), str(unit_id), int(points)))
+    return ready
+
+
+def exhausted_units(settings, plan_id: int) -> list[tuple[str, str, int]]:
+    """Units that used up their automatic attempts. For reporting, not retrying."""
+    conn = _connect(settings)
+    try:
+        rows = conn.execute(
+            "SELECT kind, unit_id, attempts FROM relayout_unit"
+            " WHERE plan_id=? AND status!=? AND attempts>=?",
+            (plan_id, STATUS_DONE, MAX_ATTEMPTS)).fetchall()
+        return [(str(k), str(u), int(a or 0)) for k, u, a in rows]
+    finally:
+        conn.close()
+
+
+def reset_attempts(settings, plan_id: int) -> int:
+    """Give every unfinished unit a fresh attempt budget. Returns how many.
+
+    The human-driven retry path. Automatic retries are bounded precisely so a
+    machine cannot loop; an operator who has fixed the cause is a different
+    thing entirely, and only they know the cause was fixed.
+    """
+    conn = _connect(settings)
+    try:
+        with conn:
+            cursor = conn.execute(
+                "UPDATE relayout_unit SET attempts=0, next_attempt=NULL"
+                " WHERE plan_id=? AND status!=?", (plan_id, STATUS_DONE))
+        return int(cursor.rowcount or 0)
     finally:
         conn.close()
 
 
 def mark(settings, plan_id: int, unit: Unit, status: str, *,
-         points_after: int = 0, error: str = "") -> None:
+         points_after: int = 0, error: str = "", count_attempt: bool = False) -> None:
     """Record one unit's outcome. Committed immediately — a crash one unit later
-    must not lose the unit that just succeeded."""
+    must not lose the unit that just succeeded.
+
+    ``count_attempt`` is what bounds the retry. It is deliberately NOT set for
+    ``blocked``: an unreachable backend is not the unit's failure, and charging
+    it an attempt would exhaust the budget of every project on a machine whose
+    engine was simply down.
+    """
     conn = _connect(settings)
     try:
         with conn:
-            conn.execute(
-                "UPDATE relayout_unit SET status=?, points_after=?, error=?,"
-                " updated_at=? WHERE plan_id=? AND kind=? AND unit_id=?",
-                (status, points_after, error or None, time.time(), plan_id,
-                 unit.kind, unit.unit_id))
+            if count_attempt:
+                row = conn.execute(
+                    "SELECT attempts FROM relayout_unit"
+                    " WHERE plan_id=? AND kind=? AND unit_id=?",
+                    (plan_id, unit.kind, unit.unit_id)).fetchone()
+                attempts = int((row[0] if row else 0) or 0) + 1
+                delay = _BACKOFF_SECONDS[min(attempts, len(_BACKOFF_SECONDS)) - 1]
+                conn.execute(
+                    "UPDATE relayout_unit SET status=?, points_after=?, error=?,"
+                    " updated_at=?, attempts=?, next_attempt=?"
+                    " WHERE plan_id=? AND kind=? AND unit_id=?",
+                    (status, points_after, error or None, time.time(), attempts,
+                     time.time() + delay, plan_id, unit.kind, unit.unit_id))
+            else:
+                conn.execute(
+                    "UPDATE relayout_unit SET status=?, points_after=?, error=?,"
+                    " updated_at=? WHERE plan_id=? AND kind=? AND unit_id=?",
+                    (status, points_after, error or None, time.time(), plan_id,
+                     unit.kind, unit.unit_id))
+    finally:
+        conn.close()
+
+
+@dataclass(frozen=True)
+class StorageReadiness:
+    """Whether the backend can be written to at all, decided before any work."""
+
+    ok: bool
+    reason: str = ""
+
+
+def preflight(owner) -> StorageReadiness:
+    """Can we write to storage? Asked BEFORE anything expensive happens.
+
+    The missing check. A rebuild used to scan a project's whole tree, chunk it,
+    embed every file, and only then discover the engine was unreachable —
+    throwing all of it away, then doing it again on the next start. One cheap
+    round-trip answers the question first.
+    """
+    try:
+        owner._client.get_collections()
+        return StorageReadiness(True)
+    except Exception as exc:  # noqa: BLE001 — any refusal is the same answer
+        return StorageReadiness(False, f"{type(exc).__name__}: {exc}")
+
+
+def block_all(settings, plan_id: int, reason: str) -> int:
+    """Park every unfinished unit as ``blocked``. Returns how many."""
+    conn = _connect(settings)
+    try:
+        with conn:
+            cursor = conn.execute(
+                "UPDATE relayout_unit SET status=?, error=?, updated_at=?"
+                " WHERE plan_id=? AND status!=?",
+                (STATUS_BLOCKED, reason, time.time(), plan_id, STATUS_DONE))
+        return int(cursor.rowcount or 0)
     finally:
         conn.close()
 
@@ -372,9 +544,10 @@ def validate(owner, settings, plan_id: int) -> tuple[bool, list[str]]:
     if state is None:
         return False, ["no plan to validate"]
 
-    if state.pending or state.failed:
+    if state.pending or state.failed or state.blocked:
         problems.append(
-            f"{state.pending} unit(s) not attempted, {state.failed} failed")
+            f"{state.pending} unit(s) not attempted, {state.failed} failed, "
+            f"{state.blocked} blocked")
 
     conn = _connect(settings)
     try:
@@ -405,22 +578,75 @@ def finalize(settings, plan_id: int) -> None:
     logger.info("relayout plan %s complete", plan_id)
 
 
-def obsolete_collections(owner) -> list[str]:
-    """Collections the CURRENT layout does not use — the old shared index.
+def owned_collections(owner) -> set[str]:
+    """Every collection THIS installation can prove it created.
 
-    Computed from the router rather than by name-matching, so it stays correct
-    if the layout gains a third form.
+    The allow-list. Three sources, all of them records we wrote ourselves: the
+    configured shared collection (the v2 index this installation built), every
+    project collection in our registry including archived ones, and every
+    framework corpus in our framework registry.
+    """
+    owned: set[str] = set()
+    try:
+        owned.add(owner.settings.collection_name)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        owned |= set(owner.router.all_collections())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        frameworks = getattr(owner, "_frameworks", None)
+        if frameworks is not None:
+            for record in frameworks.all_frameworks():
+                name = record.get("collection_name") if isinstance(record, dict) else None
+                if name:
+                    owned.add(str(name))
+    except Exception:  # noqa: BLE001 — no framework registry in shared mode
+        pass
+    return owned
+
+
+def obsolete_collections(owner) -> list[str]:
+    """Collections THIS installation created that the CURRENT layout no longer uses.
+
+    An ALLOW-list, and the distinction is the whole point. This used to compute
+    ``existing - current`` — every collection on the server that our registry did
+    not recognise. On a shared engine, that is *the other installation's entire
+    index*, and :func:`_retire_old_storage` deletes what this returns. The
+    v3.1.0 incident put two services on one engine; only the fact that
+    validation never passed stopped the canonical index from being destroyed.
+    The safety came from an unrelated bug.
+
+    So: delete only what we can prove we made. "I do not recognise it" is never
+    a reason to delete — see :func:`unattributed_collections`, which reports
+    those instead.
     """
     try:
         current = set(owner.router.all_collections())
         existing = {c.name for c in owner._client.get_collections().collections}
     except Exception:  # noqa: BLE001
         return []
-    return sorted(existing - current)
+    return sorted((owned_collections(owner) & existing) - current)
+
+
+def unattributed_collections(owner) -> list[str]:
+    """Collections on this engine that this installation cannot account for.
+
+    Reported, never deleted. A ``proj_<uuid>`` we no longer have a registry row
+    for is indistinguishable from another installation's live project, and
+    guessing wrong destroys somebody's index. Naming them lets an operator
+    decide; deleting them decides for everyone.
+    """
+    try:
+        existing = {c.name for c in owner._client.get_collections().collections}
+    except Exception:  # noqa: BLE001
+        return []
+    return sorted(existing - owned_collections(owner))
 
 
 def run_pending(owner, settings, *, plan_id: Optional[int] = None,
-                progress_cb=None) -> Progress:
+                progress_cb=None, reset: bool = False) -> Progress:
     """Rebuild every unit that is not already done, then validate and finish.
 
     Idempotent and resumable: it asks the plan what is left rather than assuming
@@ -436,8 +662,38 @@ def run_pending(owner, settings, *, plan_id: Optional[int] = None,
     if plan_id is None:
         return Progress(plan_id=-1, status=PLAN_COMPLETE)
 
+    if reset:
+        reset_attempts(settings, plan_id)
+
+    # PREFLIGHT BEFORE ANY EXPENSIVE WORK.
+    #
+    # This is the ordering the CPU loop was missing. A rebuild scans a whole
+    # project tree, chunks it and embeds every file before its first write; with
+    # the engine unreachable, all of that was discarded and then repeated on the
+    # next service start, forever. One cheap round-trip answers the question
+    # first, and a blocked plan costs nothing until storage returns.
+    ready = preflight(owner)
+    if not ready.ok:
+        parked = block_all(settings, plan_id, ready.reason)
+        logger.error(
+            "relayout plan %s BLOCKED: storage is unreachable (%s). %d unit(s) "
+            "parked; no re-indexing will be attempted until it returns. Resume "
+            "with `rag upgrade --resume`.", plan_id, ready.reason, parked)
+        return progress(settings, plan_id) or Progress(plan_id=plan_id,
+                                                       status=PLAN_RUNNING)
+
     todo = units_to_do(settings, plan_id)
+    exhausted = exhausted_units(settings, plan_id)
     logger.info("relayout plan %s: %d unit(s) to rebuild", plan_id, len(todo))
+    if exhausted:
+        # Never silently capped: a bounded retry that says nothing is
+        # indistinguishable from one that finished.
+        logger.warning(
+            "relayout plan %s: %d unit(s) have used their %d automatic attempts "
+            "and will not be retried on their own — %s. Run `rag upgrade "
+            "--resume` once the cause is fixed.",
+            plan_id, len(exhausted), MAX_ATTEMPTS,
+            "; ".join(f"{k} {u}" for k, u, _ in exhausted[:5]))
 
     for unit in todo:
         if progress_cb:
@@ -456,7 +712,21 @@ def run_pending(owner, settings, *, plan_id: Optional[int] = None,
             logger.info("relayout: %s %s rebuilt (%s points)",
                         unit.kind, unit.unit_id, after)
         except Exception as exc:  # noqa: BLE001 — record and carry on
-            mark(settings, plan_id, unit, STATUS_FAILED, error=f"{type(exc).__name__}: {exc}")
+            # Re-check storage before blaming the unit. A backend that died
+            # mid-run makes every remaining unit fail for a reason that has
+            # nothing to do with any of them, and charging them each an attempt
+            # exhausts the whole plan's budget over one outage.
+            still = preflight(owner)
+            if not still.ok:
+                parked = block_all(settings, plan_id, still.reason)
+                logger.error(
+                    "relayout plan %s BLOCKED mid-run: storage became "
+                    "unreachable (%s); %d unit(s) parked.",
+                    plan_id, still.reason, parked)
+                return progress(settings, plan_id) or Progress(
+                    plan_id=plan_id, status=PLAN_RUNNING)
+            mark(settings, plan_id, unit, STATUS_FAILED,
+                 error=f"{type(exc).__name__}: {exc}", count_attempt=True)
             logger.warning("relayout: %s %s FAILED: %s", unit.kind, unit.unit_id, exc)
         if progress_cb:
             try:
@@ -495,3 +765,14 @@ def _retire_old_storage(owner) -> None:
             logger.info("relayout: retired obsolete collection %s", name)
         except Exception as exc:  # noqa: BLE001
             logger.warning("relayout: could not retire %s: %s", name, exc)
+
+    # Named, never deleted. A collection this installation cannot account for is
+    # indistinguishable from another installation's live index, and on a shared
+    # engine that is exactly what it usually is.
+    strangers = unattributed_collections(owner)
+    if strangers:
+        logger.warning(
+            "relayout: %d collection(s) on this engine were not created by this "
+            "installation and were LEFT ALONE: %s. If another RAG Tools instance "
+            "shares this engine, that is expected; run one canonical service per "
+            "machine.", len(strangers), ", ".join(strangers[:10]))

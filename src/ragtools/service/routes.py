@@ -130,6 +130,14 @@ def health():
     # external server can die while this service keeps saying it is fine — and
     # then every search and index fails against a store nobody declared gone.
     # Cached probe, so polling /health stays cheap.
+    def _storage_degradation() -> str:
+        try:
+            from ragtools.service.app import storage_degradation
+
+            return storage_degradation()
+        except Exception:  # noqa: BLE001 — reporting must never break liveness
+            return ""
+
     storage_ok, storage_detail = True, ""
     try:
         storage_ok, storage_detail = owner.storage_reachable()
@@ -174,6 +182,8 @@ def health():
                 issues.append("reindex_in_progress")
                 if report.failed:
                     issues.append("reindex_incomplete")
+                if report.blocked:
+                    issues.append("reindex_blocked")
     except Exception:  # noqa: BLE001 — never let this break liveness
         migration_state = None
 
@@ -187,6 +197,12 @@ def health():
             "done": migration_state.done,
             "failed": migration_state.failed,
             "pending": migration_state.pending,
+            # A rebuild that is WAITING on storage and one that is WORKING look
+            # identical from a count of unfinished units, and they need opposite
+            # responses: one wants patience, the other wants a person.
+            "blocked": migration_state.blocked,
+            "blocked_reason": migration_state.blocked_reason or None,
+            "stalled": migration_state.stalled,
             "failures": [
                 {"kind": k, "id": i, "error": e}
                 for k, i, e in migration_state.failures
@@ -198,6 +214,11 @@ def health():
         "watcher_running": watcher_running,
         "storage_reachable": storage_ok,
         "storage_error": storage_detail,
+        # WHY the running engine differs from the configured one. Without this,
+        # a machine that silently fell back to embedded is indistinguishable
+        # from one deliberately configured that way — same `storage_backend`,
+        # same empty-looking index, no explanation anywhere but the log.
+        "storage_degraded_reason": _storage_degradation(),
         "degraded": bool(issues),
         "issues": issues,
         # Which storage engine and collection model are actually in force.
