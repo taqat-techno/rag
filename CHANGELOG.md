@@ -13,6 +13,174 @@ _Nothing yet._
 
 ---
 
+## [3.2.0] — 2026-07-29
+
+Every fix here comes from one incident on one machine, and eight of the nine
+defects share a single ancestor: **the product decided who owned things by
+looking at a port, a name, or a count, instead of at evidence it had recorded
+itself.**
+
+### The engine you are talking to must be the engine you started
+
+`QdrantSupervisor.wait_ready()` polled `/readyz` and accepted any 200. It never
+looked at the child it had spawned. So when two RAG Tools services ran on one
+machine — both targeting the same hardcoded port 21500 — the second service's
+engine failed to bind, its child exited, and the service then polled the *first*
+instance's engine, got 200, matched the pinned version (both ship 1.15.5, so the
+version discriminates nothing) and wrote its collections into a store it did not
+own.
+
+The product already held the rule this broke. `service/identity.py` states it
+for the service layer: *"a port is deliberately not among them — a port number
+alone is never trusted."* It was never applied to the engine. Now it is:
+
+* **the spawned child's liveness is checked first, every poll** — an exited
+  child is a hard failure, reported as a port conflict rather than a timeout,
+  because the operator needs to know a rival engine is running;
+* **each installation generates its own Qdrant API key**, written into the
+  generated server config and presented by the client, so another installation's
+  engine rejects us outright — adoption becomes impossible rather than unlikely,
+  and a *foreign* Qdrant holding the port is refused too;
+* **an occupied port is resolved before anything is spawned**, from an ownership
+  manifest (`qdrant-owner.json`: instance id, pid, executable, storage path,
+  ports, start time) — reattach when our own record vouches for the listener,
+  refuse otherwise. A refusal before the spawn is also what makes "a failed
+  secondary cannot kill the canonical engine" true by construction;
+* **nothing is terminated that the manifest does not vouch for**, and shutdown
+  now names what it stopped. The old line logged `Managed Qdrant stopped` with
+  no pid, port or image, so the one event worth tracing left no evidence.
+
+### Ports are configuration, not a constant
+
+`qdrant_http_port` / `qdrant_grpc_port` / `instance_id` are settable. They were
+reachable only through environment variables nothing set, which is why every
+managed instance on a machine targeted the same port while writing to a
+different storage directory — the ports collided, the data directories did not,
+and the loser wrote into the winner's store.
+
+One canonical managed instance per machine stays the supported model. A
+deliberate secondary is permitted only when it declares itself twice —
+non-default ports **and** an explicit `instance_id`. Dev, CI, sandbox tests and
+recovery tooling need this; either half alone is an accident waiting to be
+adopted.
+
+### Delete only what you can prove you made
+
+`obsolete_collections()` computed `existing - current`: every collection on the
+server this installation's registry did not recognise. On a shared engine that
+set is *the other installation's entire index*, and the caller deletes what it
+returns. The canonical index survived the incident only because validation never
+passed, so the destructive step was never reached — the safety came from an
+unrelated bug.
+
+It is now an **allow-list**: the configured shared collection, the registry's
+project collections (archived included), and the framework registry's corpora.
+Anything else is reported by name and left alone, because a `proj_<uuid>` with
+no registry row is indistinguishable from another installation's live project.
+`rag storage reclaim` uses the same rule.
+
+### A rebuild that cannot write must not keep embedding
+
+The observed loop: an entire project re-embedded, a write to an unreachable
+Qdrant, a failure, and around again — at real CPU cost, with search unavailable,
+converging on nothing. `units_to_do` returned everything that was not `done`
+(including `failed`), `run_pending` runs on every service start, and Task
+Scheduler restarts the service on failure.
+
+* **storage is preflighted before any expensive work** — one round-trip instead
+  of a full scan, chunk and embed that gets discarded;
+* **`blocked` is now a state of its own**, distinct from `failed`, so "try again
+  when storage returns" and "this will never work" stop being the same record.
+  Blocked units consume no attempts — an outage is not the project's fault;
+* **automatic retries are bounded** (3 attempts, exponential backoff) and
+  exhausted units are *named in the log*, never silently capped;
+* **`rag upgrade --resume` restores the budget** — a person who has fixed the
+  cause is not a machine in a loop.
+
+### The installer stops guessing why
+
+`VerifyInstallation` reduced eleven checks to one bit and printed a fixed
+sentence for every non-zero exit: *"a process from the previous version was
+still running… some files were skipped… restart Windows, then run this installer
+again."* Five of those checks fail for **runtime** reasons on a machine whose
+files are byte-perfect — so a storage outage, or a rebuild that was merely still
+running, told the user to reboot and reinstall over a healthy migration.
+
+`rag selfcheck` now exits with a **category** (1 integrity, 2 runtime,
+3 migrating, 4 warning) and gains `--json`. The installer only chooses words:
+
+* **integrity** keeps the file-replacement message — it was never wrong, only
+  wrongly applied to everything else;
+* **migrating** is an *information* dialog saying the install succeeded and the
+  rebuild continues on its own;
+* **runtime** names the likely cause and says plainly that reinstalling will not
+  help.
+
+`rag selfcheck` also gained the remedy for a stopped rebuild, which had no
+branch at all.
+
+### `rag selfcheck` could not see the autostart it was checking
+
+It reported `[SKIP] autostart targets — no autostart registered` on machines
+where `\RAGTools\Service` and `\RAGTools\Tray` were both registered and correct.
+`find_autostart` ran `schtasks /query /tn <task>` with no format flags — output
+that does not contain the command at all — and the parser looked for a line with
+both a backslash and `.exe`. Zero lines matched; the TaskName column carries the
+leaf name with no backslash either.
+
+Worse than the wrong message: a task pointing at the **previous install
+directory** produced the same empty string and the same reassuring skip, so the
+one check whose job is to catch "this machine reverts to the old build at the
+next logon" could not fail. It had never verified a target on any real Windows
+machine.
+
+Fixed on both sides — the query asks for `/fo LIST /v`, the parser reads
+`Task To Run:` (drive-letter colon and localised labels included), and a
+registration whose target cannot be read is now a **finding**, not an
+uncounted skip. The unit fixtures are real `schtasks` output; the previous ones
+fed the parser `CommandResult(0, "", "")`, which is exactly the input that
+produces the bug.
+
+### Client project scope is enforced where searches actually happen
+
+`require_capability` checked the tool *name*; nothing checked the tool's
+*scope*. The only production-shaped `authorize_projects` call lived in
+`retrieval/router.py`, which has no production importer. Meanwhile
+`search_knowledge_base` passed the caller's project straight through, and its
+own docstring promises "pass neither → search ALL indexed content".
+
+A profile scoped to one client's projects could therefore omit the argument and
+read the whole machine. Now every direct-mode retrieval entry point
+(`search_knowledge_base`, `search_project_context`, `find_definition`) resolves
+an authorized scope first:
+
+* the **owner default is unchanged** — no profile, no project argument, still
+  searches everything;
+* a **scoped client with no argument narrows to its own projects** instead of
+  widening to all;
+* a **foreign project is refused**, not silently dropped into an empty scope.
+
+This is the prerequisite for replacing a per-client sidecar service with a
+client profile on the one canonical service.
+
+### Direct-mode MCP no longer answers from a half-built index
+
+`guard_ready` lives in `QdrantOwner.search`, which the proxy path reaches and
+the direct path does not — it builds its own `Searcher`. So during a layout
+rebuild, an MCP client talking to the store directly got the ordinary "no
+matches" shape from an index that had not been built yet: wrong, and completely
+convincing.
+
+### Compatibility
+
+No config schema change, no collection renaming, no re-index. The new keys are
+optional and default to the previous values. A normal single-instance v3.1.0
+machine sees no behavioural change; a machine with a stray second managed
+instance now degrades that instance to embedded and says why, instead of letting
+it write into the canonical store.
+
+---
+
 ## [3.1.0] — 2026-07-28
 
 ### The migration this release performs

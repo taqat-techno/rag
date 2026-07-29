@@ -53,6 +53,27 @@ Local-first RAG system over documentation, with **opt-in** source-code and confi
   Never guess: an unknown mode raises rather than downgrading silently, and a
   missing managed binary falls back to embedded **with the reason surfaced** on
   `/health`.
+- **The managed engine is OWNED, and ownership is proven — never inferred from a
+  port.** `service/engine_ownership.py` is the only place that answers "is this
+  engine mine?", using four proofs: the spawned child is alive, the
+  per-installation API key authenticates, the LISTEN pid is our child, and its
+  image is the binary we launched. A durable manifest
+  (`<data_dir>/qdrant-owner.json`) records instance id, pid, executable, storage
+  path, ports and start time.
+  - **An occupied port is resolved BEFORE anything is spawned** — reattach when
+    the manifest vouches for the listener, otherwise refuse and degrade to
+    embedded with the reason. Refusing pre-spawn is what makes "a failed
+    secondary cannot kill the canonical engine" true by construction.
+  - **Nothing is terminated that the manifest does not vouch for.** Killing on a
+    port, or on an image name, is how one installation kills another's database.
+  - `wait_ready()` proving only that *a port answered* is the v3.1.0 incident:
+    a second service adopted the canonical engine and wrote into it. The rule it
+    broke was already written down in `service/identity.py` — *"a port number
+    alone is never trusted"* — for the service layer, and had never been applied
+    to the engine.
+- **One canonical managed instance per machine.** A deliberate secondary must
+  declare itself twice — non-default `qdrant_http_port`/`qdrant_grpc_port` AND an
+  explicit `instance_id`. Either alone is an accident waiting to be adopted.
 - **`collection_strategy`** selects the layout: `shared` (default) | `per_project`.
   - `shared` — one collection named `markdown_kb`, project isolation by payload
     filter (`project_id` on every point). The v2 model, unchanged.
@@ -177,6 +198,16 @@ python scripts/eval_retrieval.py --questions tests/fixtures/eval_questions.json 
   (Multiple collections are now a supported layout under
   `collection_strategy="per_project"`; `shared` remains the default and behaves
   exactly as before.)
+- Do NOT compute a destructive set as a DENY-list. `obsolete_collections` once
+  returned `existing - current` — every collection on the server this
+  installation's registry did not recognise — and the caller deletes what it
+  returns. On a shared engine that is another installation's entire index.
+  Delete only what you can prove you created; report the rest by name.
+- Do NOT terminate a process because it holds a port or matches an image name.
+  Ask `service/engine_ownership.py`.
+- Do NOT let a retrieval entry point pass a caller-supplied project straight to
+  the searcher. Resolve it through `mcp_authz.scope_for_search` first — the
+  capability check covers the tool NAME, not its SCOPE.
 - Do NOT add a second indexing pipeline for a new layout. `run_full_index` /
   `run_incremental_index` are the only indexers; a layout changes the router's
   answer, not the pipeline. (A parallel per-project indexer existed briefly and
@@ -328,6 +359,10 @@ Set it via the admin panel, the CLI `rag project mode <id> docs|code|general`, o
 A project in `docs` mode returns **no code chunks**; an empty `find_definition` / `search_project_context`
 result is therefore *not* evidence that a symbol is absent. Check `project_status(project=...)` → `mode` first.
 | `RAG_SECRET_ALLOWLIST` | `[]` | Globs to re-include specific secret-bearing files (default: none) |
+| `RAG_QDRANT_HTTP_PORT` | `21500` | Managed-engine HTTP port. Env > config (`qdrant_http_port`) > default. |
+| `RAG_QDRANT_GRPC_PORT` | `21501` | Managed-engine gRPC port. Same precedence. |
+| `RAG_INSTANCE_ID` | auto | Names this installation's engine. Required (with non-default ports) to run a deliberate second managed instance. |
+| `RAG_CLIENT_PROFILE` | unset | Which client profile the MCP process serves. Unset = owner (all tools, all projects). A named-but-absent id fails CLOSED. |
 
 ### Shared dependencies (catalog + per-project links)
 

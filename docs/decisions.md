@@ -476,6 +476,109 @@ alternative was a migration that never ran, which is what shipped in 3.0.0 and
 
 ---
 
+## Decision 19 — Managed-Engine Ownership Is Proven, Never Inferred
+
+**Context.** v3.1.0 shipped a managed native Qdrant. `QdrantSupervisor.wait_ready()`
+health-gated by polling `/readyz` and accepting any 200. It never consulted the
+child it had spawned.
+
+On a machine running two RAG Tools services, both generated a managed config on
+the same hardcoded port 21500. The second engine failed to bind and its child
+exited — and the second SERVICE then polled that port, got 200 from the FIRST
+instance's engine, matched the pinned version (every instance ships 1.15.5, so
+the version discriminates nothing), and wrote its collections into a store it did
+not own. When the true owner later shut its engine down, both services were left
+without a reachable Qdrant.
+
+**Decision.** Ownership of the managed engine is established by evidence this
+installation recorded itself, never by the fact that a port answered.
+
+* `service/engine_ownership.py` is the ONLY module that answers "is this engine
+  mine?". Four proofs, cheapest first: the spawned child is alive; the
+  per-installation API key authenticates; the LISTEN pid is our child; that
+  pid's image is the binary we launched.
+* A durable manifest at `<data_dir>/qdrant-owner.json` records instance id, pid,
+  executable, storage path, ports and start time.
+* An occupied port is resolved BEFORE any spawn: reattach when the manifest
+  vouches for the listener, otherwise refuse and degrade to embedded with the
+  reason surfaced. Refusing pre-spawn is what makes "a failed secondary cannot
+  kill the canonical engine" true by construction — there is no failed child.
+* Nothing is terminated that the manifest does not vouch for.
+* One canonical managed instance per machine. A deliberate secondary declares
+  itself twice — non-default ports AND an explicit `instance_id`.
+
+**Why not a lock file.** The contended resource is the TCP port. A held port is
+self-cleaning in a way a lock file is not, and a bind conflict is the honest name
+for the conflict.
+
+**Why the API key.** It is the only proof that does not depend on being able to
+enumerate processes, and the only one that also defends against a *foreign*
+Qdrant — another application's — holding the port. It converts the question from
+an inference into an authenticated fact.
+
+**Precedent.** The rule was already written down one layer up, in
+`service/identity.py`: *"Fields a client checks before issuing any request. A
+port is deliberately not among them — a port number alone is never trusted."*
+Decision 19 applies that same rule to the engine.
+
+---
+
+## Decision 20 — Destructive Sweeps Use Allow-Lists
+
+**Context.** `relayout.obsolete_collections()` computed `existing - current`:
+every collection on the server that this installation's registry did not
+recognise. `_retire_old_storage()` deletes what it returns, and
+`rag storage reclaim` computed the same difference.
+
+On a shared engine that set is the other installation's entire index. During the
+v3.1.0 incident the canonical index survived only because validation never
+passed, so the destructive step was never reached. The safety came from an
+unrelated bug.
+
+**Decision.** A destructive set is computed from what this installation can
+prove it created — the configured shared collection, the registry's project
+collections (archived included), and the framework registry's corpora.
+
+Anything else is REPORTED by name and left alone. A `proj_<uuid>` with no
+registry row is indistinguishable from another installation's live project, so
+the honest answer is to name it, not to guess.
+
+**Cost accepted.** A collection genuinely orphaned by this installation (project
+removed from the registry) is leaked rather than reclaimed. Leaking disk is
+recoverable; deleting somebody's index is not.
+
+---
+
+## Decision 21 — Installation Integrity and Runtime Readiness Are Different Verdicts
+
+**Context.** The Windows installer ran `rag selfcheck` and printed one fixed
+sentence for every non-zero exit: *"a process from the previous version was still
+running… some files were skipped… restart Windows, then run this installer
+again."* Of the eleven checks `run_selfcheck` performs, five fail for RUNTIME
+reasons on a machine whose files are byte-perfect. A storage outage — or a
+rebuild that was simply still running — told the user to reboot and reinstall
+over a healthy migration.
+
+**Decision.** `rag selfcheck` classifies each failure and exits with the
+category, not a bit: `0` clean, `1` integrity, `2` runtime, `3` migrating,
+`4` warning. `--json` emits the same verdict machine-readably.
+
+The installer only chooses words. Classification lives in the product because
+Pascal Script is the worst available place to decide what a failing check means,
+and the CLI already knew.
+
+* **integrity** keeps the file-replacement message — it was never wrong, only
+  wrongly applied to everything else.
+* **migrating** is an information dialog: installed successfully, rebuild
+  continues on its own.
+* **runtime** names the likely cause and says plainly that reinstalling will not
+  help.
+
+**Invariant preserved.** Incomplete is still not ready. A pending rebuild remains
+a FAILING check; only the remedy — and therefore the category — differs.
+
+---
+
 ## Summary Table
 
 | # | Decision | Default | Locked |
@@ -498,3 +601,6 @@ alternative was a migration that never ran, which is what shipped in 3.0.0 and
 | 16 | API contracts additive-only | `scale.level` enum closed; route fields stable | Yes |
 | 17 | Watcher autostart ownership | Lifecycle-owned (lifespan); desired-state respected | Yes |
 | 18 | Config migration seam | One call, before any owner; writers only; layout never forced | Yes |
+| 19 | Managed-engine ownership | Proven by child + API key + pid + image; manifest-gated | Yes |
+| 20 | Destructive sweeps | Allow-list only; unattributed collections reported, never deleted | Yes |
+| 21 | Selfcheck verdicts | Category exit codes 0/1/2/3/4; installer branches, never classifies | Yes |
