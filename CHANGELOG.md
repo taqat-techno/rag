@@ -105,10 +105,28 @@ objected only to `before > 0 and after == 0`, so any unit the inventory captured
 at zero (every framework corpus, and every project configured but never indexed)
 passed with an empty collection.
 
-A zero must now explain itself. `classify_empty` decides from the **source**, not
-the store: no indexable files is `done` with a recorded reason; a missing project
-path is a `failed` unit, which is the honest answer and keeps it visible and
-retryable. Framework corpora are counted like anything else.
+A zero must now explain itself, and `classify_empty` decides from the **source**
+rather than from the store — the store's emptiness is the thing being explained,
+so it cannot also be the explanation.
+
+The dispositions are deliberately not uniform, because holding the plan open
+holds **every** search off:
+
+* **No indexable files** — `done`, reason recorded. Legitimately empty.
+* **Path missing** — `done`, reason recorded. This is a *configuration* problem,
+  already warned on every boot and shown on the projects page. Calling it a
+  failure would let one moved folder disable retrieval for every other project,
+  permanently once its attempts ran out — the v3.1.0 disproportion in a new
+  costume. If the project held points before the migration, `validate` still
+  refuses and the old index is **kept**.
+* **Files on disk, collection empty** — `failed`, and it does block. Nothing
+  about the configuration explains it, so the conservative answer is the right
+  one, and `rag upgrade --resume` is the documented way back.
+
+Framework corpora are counted like anything else. And a unit the reconciler
+resets gets a fresh attempt budget: `units_to_do` skips anything whose attempts
+have run out, so a reset that kept its spent count would be pending and
+permanently unofferable — a plan that can never finish, with nothing saying why.
 
 ### Something owns unblocking
 
@@ -173,7 +191,7 @@ real encoder and a real store reached 3/3 done, plan `complete`, `/health: ready
 and `/api/search` 200 with a live result. A second boot did not repeat the
 migration; the rollback store survived; the plan store was backed up first.
 
-Full suite: **2248 passed, 15 skipped**.
+Full suite: **2251 passed, 15 skipped**.
 
 ---
 

@@ -802,10 +802,28 @@ def classify_empty(owner, settings, kind: str, unit_id: str) -> tuple[str, str]:
 
     path = Path(getattr(project, "path", "") or "")
     if not path.exists():
-        # A FAILURE, not a success. It is the honest answer, it is retryable
-        # once the path returns, and it keeps the unit visible instead of
-        # burying it in a completed plan.
-        return ("failed", f"project path does not exist: {path}")
+        # DONE, with the reason recorded — and this is a deliberate reversal of
+        # the obvious answer.
+        #
+        # "Failed" is the more honest-sounding word, and it is the wrong one,
+        # because of what it costs. A failed unit holds the plan open, and an
+        # open plan makes `guard_ready` refuse EVERY search on the machine. So a
+        # single project whose folder has been moved or deleted would disable
+        # retrieval for all the others — permanently, once its three attempts
+        # ran out. That is the v3.1.0 disproportion in a new costume: a condition
+        # the product understands perfectly taking the whole product down.
+        #
+        # A missing path is a CONFIGURATION problem, not a migration failure.
+        # The migration genuinely has nothing to migrate here, and the condition
+        # is already surfaced where it belongs — `QdrantOwner.__init__` warns on
+        # every boot and the projects page shows "Not indexed yet". Recording it
+        # as an explained empty lets the other 24 projects become searchable
+        # while the fact stays visible.
+        #
+        # It is still not silent about data: if this project HELD points before
+        # the migration, `validate` sees `before > 0 and after == 0`, refuses,
+        # and the old index is KEPT rather than retired.
+        return (STATUS_DONE, f"project path does not exist: {path}")
 
     try:
         # The INDEXER's own definition of "indexable", not a second one. If this

@@ -676,8 +676,16 @@ def test_a_project_that_is_empty_by_design_completes_with_its_reason(stalled):
     assert all(r == "no indexable files" for r in rows.values()), rows
 
 
-def test_a_missing_project_path_is_a_failure_not_a_completion(tmp_path):
-    """It is the honest answer, it is retryable, and it keeps the unit visible."""
+def test_a_missing_project_path_does_not_disable_search_for_every_other_project(tmp_path):
+    """One moved folder must not take retrieval down for the whole machine.
+
+    "Failed" is the more honest-sounding word and the wrong one: a failed unit
+    holds the plan open, an open plan makes `guard_ready` refuse EVERY search,
+    and once three attempts run out that is permanent. A missing path is a
+    CONFIGURATION problem — already warned on every boot and shown on the
+    projects page — so it completes with its reason recorded and the other
+    projects become searchable.
+    """
     settings = types.SimpleNamespace(
         state_db=str(tmp_path / "state.db"), data_dir=str(tmp_path),
         collection_name="markdown_kb",
@@ -688,8 +696,57 @@ def test_a_missing_project_path_is_a_failure_not_a_completion(tmp_path):
     disposition, reason = relayout.classify_empty(
         owner, settings, relayout.KIND_PROJECT, "gone")
 
-    assert disposition == relayout.STATUS_FAILED
+    assert disposition == relayout.STATUS_DONE
     assert "path does not exist" in reason
+
+
+def test_a_missing_path_that_HELD_points_still_protects_the_old_index(tmp_path):
+    """Completing is not the same as claiming nothing was lost.
+
+    If the project held points before the migration, `validate` must still refuse
+    — so the plan finishes and search works, while the OLD index is kept rather
+    than retired over a project that produced nothing.
+    """
+    settings = types.SimpleNamespace(
+        state_db=str(tmp_path / "state.db"), data_dir=str(tmp_path),
+        collection_name="markdown_kb",
+        enabled_projects=[types.SimpleNamespace(
+            id="gone", path=str(tmp_path / "does-not-exist"))])
+    plan = relayout.begin(
+        settings, Inventory(units=[Unit(relayout.KIND_PROJECT, "gone", 41832)]),
+        from_backend="embedded", to_backend="managed",
+        from_strategy="shared", to_strategy="per_project")
+    owner = RecoveringOwner(settings, counts={"proj_gone": 0}, files=0)
+    owner.run_full_index = lambda project_id=None: {"files_indexed": 0}
+
+    relayout.run_pending(owner, settings, plan_id=plan)
+
+    report = relayout.progress(settings, plan)
+    assert report is not None and report.done == 1, report
+    verified, problems = relayout.validate(owner, settings, plan)
+    assert not verified, "the old index would have been retired"
+    assert any("none after" in p for p in problems), problems
+    assert owner.counts.get("proj_gone") == 0, "a collection was deleted"
+
+
+def test_files_on_disk_but_no_points_still_blocks_the_plan(tmp_path):
+    """The case that SHOULD hold search off: unexplained, and not a config error.
+
+    Files are present and the collection is empty. Nothing about the
+    configuration explains that, so the conservative answer is the right one —
+    and `rag upgrade --resume` is the documented way back.
+    """
+    settings = types.SimpleNamespace(
+        state_db=str(tmp_path / "state.db"), data_dir=str(tmp_path),
+        collection_name="markdown_kb",
+        enabled_projects=[types.SimpleNamespace(id="real", path=str(tmp_path))])
+    owner = RecoveringOwner(settings, counts={"proj_real": 0}, files=7)
+
+    disposition, reason = relayout.classify_empty(
+        owner, settings, relayout.KIND_PROJECT, "real")
+
+    assert disposition == relayout.STATUS_FAILED
+    assert "7 indexable file(s)" in reason
 
 
 def test_a_framework_corpus_is_counted_rather_than_assumed(tmp_path):
