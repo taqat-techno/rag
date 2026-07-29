@@ -20,7 +20,6 @@ Plan: docs/planning/RAG_MODERNIZATION_MASTER_PLAN.md  (Phase 5 -> G5, D5)
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import sys
 from dataclasses import dataclass
@@ -38,6 +37,13 @@ logger = logging.getLogger("ragtools.service")
 #: Loopback ports for the managed engine. Deliberately clear of the service's
 #: own 21420/21422 range so a stray managed instance can never be mistaken for
 #: the API (see the instance-identity finding).
+#:
+#: These are DEFAULTS, not constants. They were effectively constants in v3.1.0
+#: — overridable only by environment variables nothing set — so every managed
+#: instance on a machine targeted the same port while writing to a different
+#: storage directory. The ports collided; the data directories did not; the
+#: loser silently wrote into the winner's store. See
+#: :func:`ragtools.service.engine_ownership.resolve_engine_ports`.
 DEFAULT_HTTP_PORT = 21500
 DEFAULT_GRPC_PORT = 21501
 
@@ -65,6 +71,13 @@ class ManagedPlan:
     grpc_port: int = DEFAULT_GRPC_PORT
     storage_path: Optional[str] = None
     url: Optional[str] = None
+    #: This installation's engine credential and identity. Carried on the plan so
+    #: the caller writes exactly what it verified against.
+    api_key: Optional[str] = None
+    instance_id: Optional[str] = None
+    #: True when this instance explicitly declared itself a deliberate secondary
+    #: (non-default ports AND a configured ``instance_id``).
+    explicit_secondary: bool = False
 
 
 def _candidate_dirs(settings) -> list:
@@ -166,8 +179,14 @@ def plan_managed_startup(settings) -> ManagedPlan:
             fallback_to_embedded=True,
         )
 
-    http_port = int(os.environ.get("RAG_QDRANT_HTTP_PORT", DEFAULT_HTTP_PORT))
-    grpc_port = int(os.environ.get("RAG_QDRANT_GRPC_PORT", DEFAULT_GRPC_PORT))
+    from ragtools.service.engine_ownership import (
+        engine_identity,
+        resolve_engine_ports,
+    )
+
+    http_port, grpc_port, explicit_secondary = resolve_engine_ports(
+        settings, default_http=DEFAULT_HTTP_PORT, default_grpc=DEFAULT_GRPC_PORT)
+    identity = engine_identity(settings)
     storage = str(Path(settings.data_dir) / "qdrant-server")
     return ManagedPlan(
         should_start=True,
@@ -177,6 +196,9 @@ def plan_managed_startup(settings) -> ManagedPlan:
         grpc_port=grpc_port,
         storage_path=storage,
         url=f"http://127.0.0.1:{http_port}",
+        api_key=identity.get("api_key"),
+        instance_id=identity.get("instance_id"),
+        explicit_secondary=explicit_secondary,
     )
 
 
@@ -187,9 +209,18 @@ def start_managed_qdrant(settings, plan: Optional[ManagedPlan] = None):
     mode is not in play or could not start — the caller then uses embedded and
     surfaces the reason.
     """
+    import time
+
     import httpx
     import yaml
 
+    from ragtools.service.engine_ownership import (
+        EngineClaim,
+        NotOurEngine,
+        inspect_port,
+        verify_ownership,
+        write_manifest,
+    )
     from ragtools.storage_managed import QdrantSupervisor, generate_qdrant_config
 
     plan = plan or plan_managed_startup(settings)
@@ -197,36 +228,99 @@ def start_managed_qdrant(settings, plan: Optional[ManagedPlan] = None):
         logger.info("Managed Qdrant not started: %s", plan.reason)
         return None, None
 
-    storage = Path(plan.storage_path)
+    # RESOLVE THE PORT BEFORE SPAWNING ANYTHING.
+    #
+    # This is the ordering that prevents the incident, and it also makes "a
+    # failed secondary cannot kill the canonical engine" true by construction:
+    # a refusal happens here, so there is no failed child to clean up and no
+    # cleanup path to get wrong. Adoption is decided from OUR MANIFEST, never
+    # from the fact that a port answered.
+    verdict = inspect_port(settings, plan.http_port)
+    if verdict.action == "refuse":
+        logger.error(
+            "Managed Qdrant refused: %s. This installation will use embedded "
+            "storage instead of writing into a store it does not own. Run one "
+            "canonical service per machine, or give this instance explicit "
+            "qdrant_http_port/qdrant_grpc_port and instance_id.", verdict.reason)
+        return None, None
+    if verdict.action == "reattach" and verdict.claim is not None:
+        logger.info("Managed Qdrant: %s", verdict.reason)
+        supervisor = QdrantSupervisor(
+            binary_path=plan.binary or verdict.claim.executable,
+            storage_path=verdict.claim.storage_path,
+            http_port=verdict.claim.http_port,
+            grpc_port=verdict.claim.grpc_port,
+            pinned_version=PINNED_QDRANT_VERSION,
+            api_key=plan.api_key,
+            http_get=httpx.get,
+            sleep=time.sleep,
+        )
+        try:
+            supervisor.verify_version()
+            return supervisor, f"http://127.0.0.1:{verdict.claim.http_port}"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not reattach to our own engine (%s); using "
+                           "embedded", exc)
+            return None, None
+
+    storage = Path(plan.storage_path or "")
     storage.mkdir(parents=True, exist_ok=True)
     cfg = generate_qdrant_config(
         storage_path=str(storage),
         http_port=plan.http_port,
         grpc_port=plan.grpc_port,
         snapshots_path=str(storage.parent / "qdrant-snapshots"),
+        api_key=plan.api_key,
     )
     cfg_path = storage.parent / "qdrant-config.yaml"
     cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
     supervisor = QdrantSupervisor(
-        binary_path=plan.binary,
+        binary_path=plan.binary or "",
         storage_path=str(storage),
         http_port=plan.http_port,
         grpc_port=plan.grpc_port,
         config_path=str(cfg_path),
+        api_key=plan.api_key,
         http_get=httpx.get,
-        sleep=__import__("time").sleep,
+        sleep=time.sleep,
     )
     try:
-        supervisor.start()
+        proc = supervisor.start()
         supervisor.wait_ready(timeout=60)
+        claim = EngineClaim(
+            instance_id=plan.instance_id or "unknown",
+            pid=int(getattr(proc, "pid", 0) or 0),
+            executable=str(plan.binary or ""),
+            storage_path=str(storage),
+            http_port=plan.http_port,
+            grpc_port=plan.grpc_port,
+            started_at=time.time(),
+        )
+        verify_ownership(claim, proc=proc)
         version = supervisor.verify_version()
-        logger.info("Managed Qdrant %s ready on %s", version, plan.url)
+        write_manifest(settings, claim)
+        logger.info("Managed Qdrant %s ready on %s (pid=%s instance=%s)",
+                    version, plan.url, claim.pid, claim.instance_id)
         return supervisor, plan.url
+    except NotOurEngine as exc:
+        # Distinguished from a start failure on purpose: "the engine that is
+        # running belongs to someone else" and "our engine failed to start" want
+        # different words, and collapsing them is what produced a silent
+        # adoption in the first place.
+        logger.error("Managed Qdrant ownership check failed: %s. Using embedded "
+                     "storage rather than another installation's store.", exc)
+        _stop_quietly(supervisor)
+        return None, None
     except Exception as exc:  # noqa: BLE001 — must never block service startup
         logger.warning("Managed Qdrant failed to start (%s); using embedded", exc)
-        try:
-            supervisor.stop()
-        except Exception:
-            pass
+        _stop_quietly(supervisor)
         return None, None
+
+
+def _stop_quietly(supervisor) -> None:
+    """Stop the child WE spawned. Never reaches for anything else."""
+    try:
+        supervisor.stop()
+    except Exception:  # noqa: BLE001
+        pass

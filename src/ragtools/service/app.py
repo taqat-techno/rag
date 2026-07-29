@@ -19,6 +19,21 @@ _runtime = None          # RuntimeStore — durable jobs + events
 _managed_qdrant = None   # QdrantSupervisor — the managed engine process, if any
 _job_worker = None       # JobWorker — drains the job queue
 
+#: Why the configured engine is not the one actually running, or "" when it is.
+#:
+#: This existed as a local variable that was assigned, logged once, and dropped.
+#: So a machine configured for `managed` that silently fell back to `embedded`
+#: reported `storage_backend: "embedded"` on /health — indistinguishable from a
+#: machine deliberately configured that way, with an index that looks simply
+#: empty. The fallback is now a MORE likely path (an occupied port is refused
+#: rather than adopted), which makes saying why load-bearing.
+_storage_degraded: str = ""
+
+
+def storage_degradation() -> str:
+    """Why the running engine differs from the configured one ("" if it doesn't)."""
+    return _storage_degraded
+
 
 def get_owner() -> QdrantOwner:
     """Get the QdrantOwner singleton. Raises if not initialized."""
@@ -113,7 +128,7 @@ def get_shutdown_event() -> threading.Event:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: load encoder + open Qdrant. Shutdown: close client."""
-    global _owner, _settings, _managed_qdrant
+    global _owner, _settings, _managed_qdrant, _storage_degraded
 
     if _owner is not None:
         # Already initialized (e.g., by test injection). The job engine still
@@ -154,16 +169,27 @@ async def lifespan(app: FastAPI):
             if supervisor is not None:
                 _managed_qdrant = supervisor
                 object.__setattr__(_settings, "storage_url", url)
+                # The engine credential must reach the client, or every request
+                # to our own authenticated engine is rejected. This is the other
+                # half of the ownership proof: the key makes "is this engine
+                # mine?" an authenticated fact rather than an inference.
+                if getattr(plan, "api_key", None):
+                    object.__setattr__(_settings, "storage_api_key", plan.api_key)
                 logger.info("Storage: managed Qdrant at %s", url)
             else:
                 object.__setattr__(_settings, "storage_backend", "embedded")
-                log_degraded = "managed Qdrant failed to start; using embedded storage"
-                logger.warning(log_degraded)
+                _storage_degraded = (
+                    "configured for managed storage, but the engine could not be "
+                    "started or was not ours; using embedded. See the service log "
+                    "for the specific refusal.")
+                logger.warning("Storage degraded to embedded: %s", _storage_degraded)
         elif plan.fallback_to_embedded:
             object.__setattr__(_settings, "storage_backend", "embedded")
+            _storage_degraded = plan.reason
             logger.warning("Storage degraded to embedded: %s", plan.reason)
-    except Exception:
+    except Exception as exc:
         logger.exception("managed storage startup failed; continuing with embedded")
+        _storage_degraded = f"managed storage startup raised: {exc}"
         try:
             object.__setattr__(_settings, "storage_backend", "embedded")
         except Exception:
@@ -201,9 +227,18 @@ async def lifespan(app: FastAPI):
     log_activity("info", "service", "Service shutting down")
     stop_runtime()
     if _managed_qdrant is not None:
+        # Attributed teardown. The old line logged "Managed Qdrant stopped" with
+        # no pid, port, image or storage path, so the one event an operator most
+        # needs to trace — who stopped the engine, and which one — left no
+        # evidence at all. `release` also refuses to signal anything the
+        # manifest does not vouch for: killing on a port, or on an image name,
+        # is how one installation kills another installation's database.
         try:
-            _managed_qdrant.stop()
-            logger.info("Managed Qdrant stopped")
+            from ragtools.service.engine_ownership import read_manifest, release
+
+            outcome = release(_settings, read_manifest(_settings),
+                              proc=getattr(_managed_qdrant, "proc", None))
+            logger.info("Managed Qdrant shutdown: %s", outcome)
         except Exception:
             logger.exception("managed Qdrant stop failed")
         _managed_qdrant = None

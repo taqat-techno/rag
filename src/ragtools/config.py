@@ -442,6 +442,25 @@ class Settings(BaseSettings):
     #: embedded — a typo must not look like "unsupported platform".
     qdrant_binary: str | None = None
 
+    #: Managed-engine ports. ``None`` means "use the product default"
+    #: (21500/21501), which is what one canonical instance per machine wants.
+    #:
+    #: They exist as configuration because in v3.1.0 they were effectively
+    #: constants — overridable only through environment variables nothing set —
+    #: so two managed instances on one machine targeted the same port while
+    #: writing to different storage directories. The loser adopted the winner's
+    #: store. Dev, CI, sandbox tests and recovery tooling all need to run a
+    #: second engine deliberately; that has to be sayable in configuration
+    #: rather than only in a subprocess environment.
+    qdrant_http_port: int | None = None
+    qdrant_grpc_port: int | None = None
+
+    #: A name for THIS installation's engine. Optional, and only load-bearing
+    #: for the deliberate-secondary escape hatch: a second managed instance is
+    #: permitted when it declares itself twice — non-default ports AND this id.
+    #: Either alone is an accident waiting to be adopted.
+    instance_id: str | None = None
+
     # Embedding
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_dim: int = 384

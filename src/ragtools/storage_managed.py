@@ -59,22 +59,34 @@ def resolve_qdrant_asset(system: str, machine: str) -> Optional[str]:
 
 
 def generate_qdrant_config(
-    *, storage_path: str, http_port: int, grpc_port: int, snapshots_path: Optional[str] = None
+    *, storage_path: str, http_port: int, grpc_port: int,
+    snapshots_path: Optional[str] = None, api_key: Optional[str] = None
 ) -> dict:
     """Generate the managed server config (serialised to JSON by the caller).
 
     Loopback-only, telemetry off, and ``default_segment_number = 2`` so a
     collection-per-project layout does not multiply into hundreds of segments.
+
+    ``api_key`` is the per-installation engine credential. It is what turns "is
+    this engine mine?" from an inference into an authenticated fact: another
+    installation's engine rejects our client outright, so the cross-instance
+    adoption behind the v3.1.0 incident stops being possible rather than merely
+    unlikely. The engine is loopback-only, so this defends against accidental
+    adoption — including by a *foreign* Qdrant that happens to hold the port —
+    rather than against a network attacker.
     """
+    service: dict = {
+        "host": "127.0.0.1",  # NEVER 0.0.0.0 (Qdrant's default)
+        "http_port": http_port,
+        "grpc_port": grpc_port,
+        "enable_cors": False,
+    }
+    if api_key:
+        service["api_key"] = api_key
     return {
         "log_level": "INFO",
         "telemetry_disabled": True,
-        "service": {
-            "host": "127.0.0.1",  # NEVER 0.0.0.0 (Qdrant's default)
-            "http_port": http_port,
-            "grpc_port": grpc_port,
-            "enable_cors": False,
-        },
+        "service": service,
         "storage": {
             "storage_path": storage_path,
             "snapshots_path": snapshots_path or str(Path(storage_path).parent / "snapshots"),
@@ -104,6 +116,7 @@ class QdrantSupervisor:
         grpc_port: int,
         config_path: Optional[str] = None,
         pinned_version: str = PINNED_QDRANT_VERSION,
+        api_key: Optional[str] = None,
         spawn: Callable = subprocess.Popen,
         http_get: Optional[Callable] = None,
         sleep: Optional[Callable] = None,
@@ -115,11 +128,37 @@ class QdrantSupervisor:
         self.grpc_port = grpc_port
         self.config_path = config_path
         self.pinned_version = pinned_version
+        self.api_key = api_key
         self._spawn = spawn
         self._http_get = http_get
         self._sleep = sleep or (lambda s: None)
         self._is_synced_path = is_synced_path
         self._proc = None
+
+    @property
+    def proc(self):
+        """The spawned child, or None. Read by the ownership checks."""
+        return self._proc
+
+    def _get(self, path: str):
+        """One authenticated GET against our own engine.
+
+        The key travels on every request, not only the ones Qdrant currently
+        demands it for: which endpoints are exempt is a property of the engine
+        version, and this call must not start trusting a stranger the day that
+        list changes.
+        """
+        if self._http_get is None:
+            raise ManagedStartError("no http_get configured")
+        url = f"{self.base_url}{path}"
+        if not self.api_key:
+            return self._http_get(url)
+        try:
+            return self._http_get(url, headers={"api-key": self.api_key})
+        except TypeError:
+            # An injected double that takes only a url. Tests use these, and a
+            # signature mismatch must not read as an unreachable engine.
+            return self._http_get(url)
 
     def command(self) -> list:
         """The real spawn command. ``--config-path`` carries the loopback bind,
@@ -144,26 +183,62 @@ class QdrantSupervisor:
         return self._proc
 
     def wait_ready(self, timeout: float = 30.0, interval: float = 0.5):
-        """Poll ``/readyz`` until 200 or timeout. Raises on timeout."""
+        """Poll ``/readyz`` until 200, the child dies, or the timeout expires.
+
+        **The child's liveness is checked first, every iteration.** This is the
+        v3.1.0 defect, and it is the whole of it: a 200 on this port used to be
+        accepted as proof the engine had started, when it only ever proved that
+        *something* had answered. A second instance whose own child had just
+        died of address-in-use polled the canonical engine, got 200, and adopted
+        another installation's store.
+
+        A process that has exited cannot be the thing answering. So an exited
+        child is a hard failure here — and, decisively, it is reported as
+        ``address in use`` rather than as a timeout, because the operator needs
+        to know a rival engine is running, not that theirs was slow.
+        """
         if self._http_get is None:
             raise ManagedStartError("no http_get configured")
         waited = 0.0
         while waited <= timeout:
+            self._assert_child_alive()
             try:
-                r = self._http_get(f"{self.base_url}/readyz")
+                r = self._get("/readyz")
                 if getattr(r, "status_code", 0) == 200:
                     return True
             except Exception:
                 pass
             self._sleep(interval)
             waited += interval
+        self._assert_child_alive()
         raise ManagedStartError(
             f"managed Qdrant did not become ready within {timeout}s"
         )
 
+    def _assert_child_alive(self) -> None:
+        """Refuse the moment our own process is gone."""
+        proc = self._proc
+        if proc is None:
+            return
+        code = proc.poll()
+        if code is None:
+            return
+        raise ManagedStartError(
+            f"the managed Qdrant we started exited during startup (exit code "
+            f"{code}). Anything now answering on port {self.http_port} belongs "
+            f"to another process — most commonly a second RAG Tools instance "
+            f"whose engine already holds this port. Refusing to adopt it."
+        )
+
     def verify_version(self):
-        """GET / and refuse if the engine version != the pinned version."""
-        r = self._http_get(f"{self.base_url}/")
+        """GET / and refuse if the engine version != the pinned version.
+
+        Kept, but no longer load-bearing for ownership: every instance ships the
+        same pinned build, so a version match discriminates nothing between two
+        of *our* engines. It catches a foreign or mismatched engine only. The
+        ownership proof is the child check above plus the API key.
+        """
+        r = self._get("/")
         body = r.json() if hasattr(r, "json") else {}
         version = (body or {}).get("version", "")
         if version != self.pinned_version:
