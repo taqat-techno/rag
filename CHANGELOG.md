@@ -171,6 +171,24 @@ rebuild, an MCP client talking to the store directly got the ordinary "no
 matches" shape from an index that had not been built yet: wrong, and completely
 convincing.
 
+### A shutdown race that crashed the interpreter
+
+Found by this release's own Linux build, which died with `Fatal Python error:
+Segmentation fault` rather than a test failure.
+
+`RuntimeStore.close()` was the only method on the class that did not take
+`self._lock` — twelve others hold it across their `self.conn` calls. So closing
+could free the sqlite3 connection underneath a C-level `execute` running in
+another thread. The watcher is a daemon thread that logs activity continuously,
+and `lifespan` started it but never stopped it, so it wrote into the store
+throughout teardown.
+
+`close()` now takes the lock and marks the store closed — a write arriving
+afterwards is a no-op, because the watcher does not stop just because we decided
+to shut down. And the watcher is stopped before the store it writes to, on
+*both* of `lifespan`'s shutdown paths; only one of them was ever going to be
+remembered, and the forgotten one is the branch every service test takes.
+
 ### Compatibility
 
 No config schema change, no collection renaming, no re-index. The new keys are
