@@ -221,15 +221,30 @@ def _add_retry_columns(conn: sqlite3.Connection) -> None:
     duplicate-column error means another process got there first, or we did on a
     previous run.
     """
-    for ddl in (
-        "ALTER TABLE relayout_unit ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE relayout_unit ADD COLUMN next_attempt REAL",
+    # Asked, not attempted-and-caught. `_connect` runs on every progress read,
+    # every unit mark and every readiness probe, so two failing ALTER
+    # transactions per connection is real churn on a hot-ish path — and
+    # `/health` polls this. One PRAGMA answers it.
+    try:
+        present = {row[1] for row in conn.execute("PRAGMA table_info(relayout_unit)")}
+    except sqlite3.Error:
+        return
+    if not present:
+        return  # table not created yet; the schema script owns that
+
+    for column, ddl in (
+        ("attempts",
+         "ALTER TABLE relayout_unit ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"),
+        ("next_attempt",
+         "ALTER TABLE relayout_unit ADD COLUMN next_attempt REAL"),
     ):
+        if column in present:
+            continue
         try:
             with conn:
                 conn.execute(ddl)
         except sqlite3.OperationalError:
-            pass  # already present
+            pass  # another process won the race
 
 
 # --- capture, which must happen before anything is destroyed --------------

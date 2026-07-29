@@ -164,6 +164,9 @@ class RuntimeStore:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        #: Set under the lock by `close`, so a write that arrives afterwards is
+        #: a no-op rather than a use of a freed connection. See `close`.
+        self._closed = False
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(_SCHEMA)
@@ -185,10 +188,31 @@ class RuntimeStore:
         self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self) -> None:
-        try:
-            self.conn.close()
-        except Exception:
-            pass
+        """Close under the SAME lock every other method takes.
+
+        It did not, and that is a use-after-free rather than a tidiness point.
+        Twelve methods hold ``self._lock`` across their ``self.conn`` calls;
+        this one held nothing, so closing could free the sqlite3 connection
+        underneath a C-level ``execute`` running in another thread.
+
+        Observed on a Linux CI runner as ``Fatal Python error: Segmentation
+        fault``, exit 139: the watcher thread was inside ``_emit`` (it logs
+        activity continuously, and it is a daemon thread that legitimately
+        outlives the request that started it) while the lifespan was tearing
+        the service down.
+
+        ``_closed`` is the other half. The watcher does not stop just because
+        we decided to shut down, so a write arriving after the close must be a
+        no-op — losing a shutdown activity line is the right trade against
+        raising in a thread nobody is waiting on, and a far better one than
+        crashing the interpreter.
+        """
+        with self._lock:
+            self._closed = True
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
     def __enter__(self) -> "RuntimeStore":
         return self
@@ -372,6 +396,12 @@ class RuntimeStore:
     def _emit(self, type_: str, source: str, payload: dict) -> Event:
         with self._lock:
             ts = _now()
+            if self._closed:
+                # The store is gone; hand back a detached event so callers that
+                # read the result still work. This is the path the watcher takes
+                # while the service shuts down underneath it.
+                return Event(id=0, ts=ts, type=type_, source=source,
+                             payload=payload)
             cur = self.conn.execute(
                 "INSERT INTO events (ts, type, source, payload_json) VALUES (?,?,?,?)",
                 (ts, type_, source, json.dumps(payload)),

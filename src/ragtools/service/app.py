@@ -125,6 +125,28 @@ def get_shutdown_event() -> threading.Event:
     return _shutdown_event
 
 
+def stop_background_writers() -> None:
+    """Stop the watcher, THEN the store it writes to. Order is the whole point.
+
+    The watcher is a daemon thread that logs activity continuously, and every
+    `log_activity` reaches the runtime store. Closing the store while it is
+    mid-write freed the sqlite3 connection underneath a C-level `execute` —
+    `Fatal Python error: Segmentation fault`, exit 139, on a Linux CI runner.
+
+    It lives in one function because `lifespan` has TWO shutdown paths and only
+    one of them was ever going to be remembered. The injected-owner branch —
+    the one every service test takes — called `stop_runtime()` alone, which is
+    precisely the path the crash was observed on.
+    """
+    try:
+        from ragtools.service.routes import stop_watcher_for_shutdown
+
+        stop_watcher_for_shutdown()
+    except Exception:
+        logger.exception("watcher stop during shutdown failed (non-fatal)")
+    stop_runtime()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: load encoder + open Qdrant. Shutdown: close client."""
@@ -142,7 +164,7 @@ async def lifespan(app: FastAPI):
         try:
             yield
         finally:
-            stop_runtime()
+            stop_background_writers()
         return
 
     # Bring the configuration to the current schema BEFORE anything reads it.
@@ -225,7 +247,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down service")
     log_activity("info", "service", "Service shutting down")
-    stop_runtime()
+
+    stop_background_writers()
     if _managed_qdrant is not None:
         # Attributed teardown. The old line logged "Managed Qdrant stopped" with
         # no pid, port, image or storage path, so the one event an operator most

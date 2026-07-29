@@ -1726,6 +1726,23 @@ def _stop_watcher_locked() -> dict:
     return {"status": "stopped"}
 
 
+def stop_watcher_for_shutdown() -> dict:
+    """Stop the watcher during service teardown. Acquires the lock itself.
+
+    The lifespan's counterpart to :func:`autostart_watcher`, which had none —
+    the watcher was started by the service lifecycle and never stopped by it,
+    so it went on writing activity into the runtime store while that store was
+    being closed. Separate from the HTTP stop path because this one must never
+    raise: shutdown continues regardless.
+    """
+    with _watcher_lock:
+        try:
+            return _stop_watcher_locked()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("watcher did not stop cleanly: %s", exc)
+            return {"status": "error", "detail": str(exc)}
+
+
 def autostart_watcher() -> dict:
     """Start the watcher from the service lifecycle (FastAPI lifespan) — M3.
 
