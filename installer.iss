@@ -17,7 +17,7 @@
 ; nothing, and the release published WITHOUT its installer while every step
 ; reported success.
 #ifndef MyAppVersion
-  #define MyAppVersion "3.1.0"
+  #define MyAppVersion "3.2.0"
 #endif
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
@@ -416,7 +416,55 @@ begin
   if (ResultCode = -1) or (ResultCode = 258) then
     Exit;   // could not run the check, or it overran; do not invent a verdict
 
-  if ResultCode <> 0 then
+  if ResultCode = 0 then
+    Exit;   // clean
+
+  // ONE MESSAGE PER CAUSE.
+  //
+  // This used to print a single fixed sentence for every non-zero exit —
+  // "a process from the previous version was still running... some files were
+  // skipped... restart Windows, then run this installer again". `selfcheck`
+  // returns eleven checks, and five of them fail for RUNTIME reasons on a
+  // machine whose files are byte-perfect. So a storage outage, or a rebuild
+  // that was merely still running, told the user to reboot and reinstall: a
+  // wrong diagnosis with a wrong and disruptive remedy.
+  //
+  // The classification belongs in the product, not here — Pascal is the worst
+  // available place to decide what a failing check means, and the CLI already
+  // knows. So `rag selfcheck` now exits with a CATEGORY and this only chooses
+  // words. Codes are from `ragtools.selfcheck`: 1 integrity, 2 runtime,
+  // 3 migrating, 4 warning.
+  case ResultCode of
+    3:
+      // Installed correctly; the index is being rebuilt. Nothing to do, and
+      // saying anything alarming here is how a user reinstalls over a healthy
+      // migration and starts it again from zero.
+      SuppressibleMsgBox('RAG Tools {#MyAppVersion} was installed successfully.' + #13#10 + #13#10 +
+             'Your index is being rebuilt for the new storage layout. This runs in '
+             + 'the background and can take a while on a large corpus.' + #13#10 + #13#10 +
+             'Searches will report "migration in progress" until it finishes. '
+             + 'No action is needed.' + #13#10 + #13#10 +
+             'To watch progress:  rag status',
+             mbInformation, MB_OK, IDOK);
+    2:
+      // Installed correctly; something at run time is stuck. Name it, and do
+      // NOT prescribe a reboot — nothing about this is fixed by restarting
+      // Windows or replacing files that are already correct.
+      SuppressibleMsgBox('RAG Tools {#MyAppVersion} was installed successfully, but it is not '
+             + 'running properly yet.' + #13#10 + #13#10 +
+             'The files on this machine are correct. The problem is at run time — '
+             + 'most often the storage engine is unreachable, its port is held by '
+             + 'another RAG Tools instance, or an index rebuild stopped early.' + #13#10 + #13#10 +
+             'Reinstalling will NOT help. To see the exact cause and its remedy, run:'
+             + #13#10 + #13#10 +
+             '    rag selfcheck' + #13#10 + #13#10 +
+             'If a rebuild stopped, resume it with:  rag upgrade --resume',
+             mbError, MB_OK, IDOK);
+    4:
+      ;  // warnings only — logged by selfcheck, not worth a dialog
+  else
+    // 1, and anything unrecognised: treat as an integrity failure, because
+    // that is the case where doing nothing leaves a genuinely broken install.
     SuppressibleMsgBox('RAG Tools {#MyAppVersion} was installed, but verification found that this '
            + 'machine is NOT fully running it.' + #13#10 + #13#10 +
            'This usually means a process from the previous version was still running '
@@ -425,6 +473,7 @@ begin
            + 'configuration and index are not affected.' + #13#10 + #13#10 +
            'For details run:  rag selfcheck',
            mbCriticalError, MB_OK, IDOK);
+  end;
 end;
 
 // Copy the configuration out of the data root before anything deletes it.

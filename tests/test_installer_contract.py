@@ -282,8 +282,21 @@ def test_a_failed_verification_is_reported_as_an_error(script):
     assert bodies, "VerifyInstallation has no definition"
     text = bodies[0]
     assert "mbCriticalError" in text, "a failed verification does not surface as an error"
-    assert re.search(r"ResultCode\s*<>\s*0", text), (
+    # The exit code must decide something. It used to be compared against 0 and
+    # nothing else, which is precisely why a storage outage and a half-copied
+    # installation produced the same message; the code is now a CATEGORY and the
+    # installer branches on it. Either shape satisfies the property this test
+    # exists for — that the verdict is read at all — so both are accepted rather
+    # than pinning today's spelling.
+    assert (re.search(r"ResultCode\s*<>\s*0", text)
+            or re.search(r"case\s+ResultCode\s+of", text)), (
         "the verifier's exit code is never checked"
+    )
+    # And it must still be possible to pass. A verifier whose every outcome is
+    # an error would satisfy the line above while telling everyone their
+    # installation is broken.
+    assert re.search(r"ResultCode\s*=\s*0", text), (
+        "a clean verification has no path that reports success"
     )
 
 

@@ -32,6 +32,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+#: What KIND of problem a failing check represents. The installer displays a
+#: fixed sentence per verdict, so a single pass/fail bit made it blame stale
+#: processes and prescribe a reboot for a storage outage — a wrong diagnosis
+#: with a wrong remedy, on a machine whose files were byte-perfect.
+CATEGORY_INTEGRITY = "integrity"    # the files/registrations are wrong
+CATEGORY_RUNTIME = "runtime"        # installed fine; something at run time is stuck
+CATEGORY_MIGRATING = "migrating"    # installed fine; a rebuild is legitimately running
+CATEGORY_WARNING = "warning"        # worth saying, not worth failing over
+
+#: Exit codes `rag selfcheck` returns, and the installer branches on. Ordered by
+#: severity so a caller that only compares can still behave sensibly.
+EXIT_CLEAN = 0
+EXIT_INTEGRITY = 1
+EXIT_RUNTIME = 2
+EXIT_MIGRATING = 3
+EXIT_WARNING = 4
+
+
 @dataclass(frozen=True)
 class Check:
     name: str
@@ -42,6 +60,8 @@ class Check:
     #: would let a machine where nothing is inspectable report a clean bill of
     #: health, which is the false success this module exists to prevent.
     skipped: bool = False
+    #: Which remedy this check's failure calls for. Only meaningful when failing.
+    category: str = CATEGORY_INTEGRITY
 
     @property
     def status(self) -> str:
@@ -185,10 +205,21 @@ def check_autostart_targets() -> Check:
                 if registration.legacy:
                     wrong.append(f"legacy registration survives: {registration.name}")
                     continue
+                seen += 1
                 target = (registration.target or "").strip('" ')
                 if not target:
+                    # FOUND but UNVERIFIABLE — a finding, not a non-event.
+                    #
+                    # This used to `continue` without counting, so a registration
+                    # whose target could not be read vanished from the tally and
+                    # the check reported "no autostart registered". On Windows
+                    # that was every registration on every machine, because the
+                    # query never asked for the command. The check could neither
+                    # pass nor fail, which is the worst of the three.
+                    wrong.append(
+                        f"{registration.name}: registered, but its target could "
+                        f"not be read — cannot verify what starts at logon")
                     continue
-                seen += 1
                 if str(install).lower() not in target.lower():
                     wrong.append(f"{registration.name} -> {target}")
     except Exception as exc:  # noqa: BLE001
@@ -230,7 +261,7 @@ def check_service_health(expect: str, port: int | None = None) -> Check:
         if _is_packaged():
             return Check("service health version", False,
                          "nothing is listening — a completed installation must "
-                         "leave the service running")
+                         "leave the service running", category=CATEGORY_RUNTIME)
         return Check("service health version", True, "no service responding",
                      skipped=True)
 
@@ -269,7 +300,7 @@ def check_config_schema() -> Check:
         return Check("config schema", True, f"version {found}")
     return Check("config schema", False,
                  f"config is version {found}, this release reads {CONFIG_VERSION} "
-                 f"— run `rag upgrade`")
+                 f"— run `rag upgrade`", category=CATEGORY_RUNTIME)
 
 
 def check_migration_state() -> Check:
@@ -284,7 +315,8 @@ def check_migration_state() -> Check:
     if result is None:
         return Check("migration state", True,
                      "no migration ran in this process", skipped=True)
-    return Check("migration state", not result.degraded, result.describe())
+    return Check("migration state", not result.degraded, result.describe(),
+                 category=CATEGORY_RUNTIME)
 
 
 def check_storage_contract() -> Check:
@@ -307,11 +339,12 @@ def check_storage_contract() -> Check:
     except Exception as exc:  # noqa: BLE001
         # A Settings() that raises IS the finding — the contract validator
         # refuses an unsupported configuration at load.
-        return Check("storage contract", False, f"configuration refused: {exc}")
+        return Check("storage contract", False, f"configuration refused: {exc}",
+                     category=CATEGORY_RUNTIME)
 
     detail = f"{backend} + {strategy}"
     ok = backend in _SUPPORTED_BACKENDS and strategy in _SUPPORTED_STRATEGIES
-    return Check("storage contract", ok, detail)
+    return Check("storage contract", ok, detail, category=CATEGORY_RUNTIME)
 
 
 def check_index_identity() -> Check:
@@ -380,8 +413,23 @@ def check_reindex_state() -> Check:
     if report.failures:
         named = "; ".join(f"{k} {i}: {e}" for k, i, e in report.failures[:3])
         detail += f" — {named}"
+
+    # INCOMPLETE IS NEVER READY — that invariant does not move. An index that
+    # was never rebuilt answers "no matches" for every missing project, in the
+    # ordinary reassuring shape, so this stays a failure in both branches.
+    #
+    # What differs is the REMEDY, and therefore the category. A rebuild that is
+    # merely in flight needs no action; one that has stopped needs a person. The
+    # installer used to receive a single bit for both and told a user whose
+    # index was quietly rebuilding to reboot Windows and reinstall.
+    if not getattr(report, "stalled", False):
+        return Check("reindex state", False,
+                     f"{detail}. The service resumes this on its own; "
+                     f"`rag upgrade --resume` runs it now.",
+                     category=CATEGORY_MIGRATING)
     return Check("reindex state", False,
-                 f"{detail}. Retry with `rag upgrade --resume`")
+                 f"{detail}. Retry with `rag upgrade --resume`",
+                 category=CATEGORY_RUNTIME)
 
 
 def run_selfcheck(expect_version: str, *, port: int | None = None) -> list[Check]:
@@ -419,3 +467,51 @@ def format_report(checks: list[Check]) -> str:
 
 def failures(checks: list[Check]) -> list[Check]:
     return [c for c in checks if not c.ok and not c.skipped]
+
+
+def classify(checks: list[Check]) -> str:
+    """The single worst category present. Integrity outranks everything.
+
+    Ordered by what the operator must DO, not by how alarming it sounds. A
+    machine whose files are wrong needs the installer run again; one whose
+    rebuild is merely in flight needs nothing at all. Reporting the second as
+    the first is the defect this exists to end.
+    """
+    present = {c.category for c in failures(checks)}
+    for category in (CATEGORY_INTEGRITY, CATEGORY_RUNTIME, CATEGORY_MIGRATING,
+                     CATEGORY_WARNING):
+        if category in present:
+            return category
+    return ""
+
+
+def exit_code(checks: list[Check]) -> int:
+    """The process exit code for a set of results — what the installer branches on."""
+    return {
+        "": EXIT_CLEAN,
+        CATEGORY_INTEGRITY: EXIT_INTEGRITY,
+        CATEGORY_RUNTIME: EXIT_RUNTIME,
+        CATEGORY_MIGRATING: EXIT_MIGRATING,
+        CATEGORY_WARNING: EXIT_WARNING,
+    }[classify(checks)]
+
+
+def as_dict(checks: list[Check], *, expected: str) -> dict:
+    """Machine-readable results, for the installer and any other caller.
+
+    The installer cannot import this module — it is Pascal — and classification
+    does not belong in an installer script anyway. So the CLI does the deciding
+    and hands over a verdict, rather than a bit the caller has to interpret.
+    """
+    verdict = classify(checks)
+    return {
+        "expected_version": expected,
+        "category": verdict or "clean",
+        "exit_code": exit_code(checks),
+        "ok": not verdict,
+        "checks": [
+            {"name": c.name, "status": c.status, "detail": c.detail,
+             "category": c.category}
+            for c in checks
+        ],
+    }

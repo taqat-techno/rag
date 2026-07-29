@@ -642,6 +642,9 @@ def selfcheck(
         help="Fail unless the installation is this version. Defaults to this build's."),
     port: int = typer.Option(None, "--port", help="Service port to probe for /health."),
     quiet: bool = typer.Option(False, "--quiet", help="Print only on failure."),
+    as_json: bool = typer.Option(
+        False, "--json",
+        help="Emit machine-readable results, including the failure category."),
 ):
     """Verify the INSTALLATION on this machine, not just this executable.
 
@@ -653,11 +656,29 @@ def selfcheck(
     Exits non-zero if any check fails, so a caller can refuse to report success.
     """
     from ragtools import __version__
-    from ragtools.selfcheck import failures, format_report, run_selfcheck
+    from ragtools.selfcheck import (
+        CATEGORY_INTEGRITY,
+        CATEGORY_MIGRATING,
+        CATEGORY_RUNTIME,
+        as_dict,
+        classify,
+        exit_code,
+        failures,
+        format_report,
+        run_selfcheck,
+    )
 
     expected = expect_version or __version__
     checks = run_selfcheck(expected, port=port)
     broken = failures(checks)
+    verdict = classify(checks)
+    code = exit_code(checks)
+
+    if as_json:
+        import json
+
+        console.print_json(json.dumps(as_dict(checks, expected=expected)))
+        raise typer.Exit(code)
 
     if broken and quiet:
         console.print(f"[red]Installation verification FAILED[/red] (expected {expected})")
@@ -666,8 +687,23 @@ def selfcheck(
     if broken or not quiet:
         console.print(format_report(checks))
 
+    if broken and verdict == CATEGORY_MIGRATING:
+        # Not a failure of the installation, and it must not read as one. The
+        # rebuild is running and finishes on its own; the only wrong action here
+        # is to reinstall or reboot, which is precisely what the single-bit
+        # verdict used to advise.
+        console.print(f"\n[yellow]{expected} is installed and its index is "
+                      f"still being rebuilt.[/yellow]")
+        console.print("  Nothing to do — searches report `migrating` until it "
+                      "completes. Watch it with `rag status`.")
+        raise typer.Exit(code)
+
     if broken:
-        console.print(f"\n[red]This machine is NOT fully running {expected}.[/red]")
+        if verdict == CATEGORY_RUNTIME:
+            console.print(f"\n[yellow]{expected} is installed correctly, but it "
+                          f"is not running properly.[/yellow]")
+        else:
+            console.print(f"\n[red]This machine is NOT fully running {expected}.[/red]")
         # Name the remedy for what ACTUALLY failed. A fixed sentence blaming a
         # stale process is wrong — and actively misleading — when the finding is
         # a configuration still at the previous schema, which is a different
@@ -683,15 +719,30 @@ def selfcheck(
                 "  The storage engine or collection layout is not a supported "
                 "combination. Run `rag storage show`."
             )
-        if names & {"installed version", "windowed executable",
-                    "recorded install version", "running processes",
-                    "autostart targets", "service health version"}:
+        if names & {"reindex state"}:
+            # This had no branch at all, so the one failure whose remedy is a
+            # single documented command printed nothing — while the installer
+            # told the user to reboot.
+            console.print(
+                "  The index rebuild stopped before it finished. Fix the cause "
+                "shown above, then run `rag upgrade --resume` — completed work "
+                "is not repeated."
+            )
+        if names & {"service health version"} and verdict == CATEGORY_RUNTIME:
+            console.print(
+                "  The service is not answering. Start it with "
+                "`rag service start --wait`."
+            )
+        if verdict == CATEGORY_INTEGRITY and names & {
+                "installed version", "windowed executable",
+                "recorded install version", "running processes",
+                "autostart targets"}:
             console.print(
                 "  For the installation itself, the most common cause is a "
                 "process from the previous version still running while files "
                 "were replaced. Restart Windows and re-run the installer."
             )
-        raise typer.Exit(1)
+        raise typer.Exit(code)
 
 
 @app.command()
@@ -1430,6 +1481,10 @@ def upgrade(
         try:
             report = relayout.run_pending(
                 owner, settings, plan_id=plan,
+                # An operator running this has fixed the cause; nobody else
+                # knows that, which is why automatic retries are bounded and
+                # this one is not.
+                reset=True,
                 progress_cb=lambda unit, phase: (
                     console.print(f"  rebuilding {unit.kind} {unit.unit_id}...")
                     if phase == "start" else None),
@@ -1575,9 +1630,24 @@ def storage_reclaim(
 
     owner = QdrantOwner(settings)
     try:
+        # Allow-list, for the reason spelled out in `relayout.obsolete_collections`:
+        # `existing - current` on a shared engine is another installation's whole
+        # index, and this command deletes what it computes.
+        from ragtools.upgrade.relayout import (
+            owned_collections,
+            unattributed_collections,
+        )
+
         current = set(owner.router.all_collections())
         try:
-            existing = {c.name for c in owner._client.get_collections().collections}
+            existing = ({c.name for c in owner._client.get_collections().collections}
+                        & owned_collections(owner))
+            strangers = unattributed_collections(owner)
+            if strangers:
+                console.print(
+                    f"[dim]  leaving {len(strangers)} collection(s) this "
+                    f"installation did not create untouched: "
+                    f"{', '.join(strangers[:5])}[/dim]")
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]Could not list collections:[/red] {exc}")
             raise typer.Exit(1)
