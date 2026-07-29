@@ -61,7 +61,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -1353,6 +1353,15 @@ def _direct_dev_search(
     if cap is not None:
         return cap
 
+    stale = _migration_error(False, query)
+    if stale is not None:
+        return stale
+
+    projects, scope_err = _authorized_scope(project, projects, False, query)
+    if scope_err is not None:
+        return scope_err
+    project = None
+
     client = None
     try:
         # Fail-closed (S1/A2): dev-search bypasses the owner, so enforce scope
@@ -1404,6 +1413,27 @@ def _direct_find_definition(symbol: str, project: str | None, top_k: int) -> str
     cap = _capability_error("find_definition", False, symbol)
     if cap is not None:
         return cap
+
+    stale = _migration_error(False, symbol)
+    if stale is not None:
+        return stale
+
+    allowed, scope_err = _authorized_scope(project, None, False, symbol)
+    if scope_err is not None:
+        return scope_err
+    # `find_definitions` takes ONE project, so a restricted client with several
+    # has to say which. Refusing is the only fail-closed answer available: an
+    # unscoped lookup would search every client's code, and silently picking the
+    # first would answer about a project the caller did not name.
+    if allowed is None:
+        pass                                   # owner: unchanged
+    elif len(allowed) == 1:
+        project = allowed[0]
+    else:
+        return _envelope(
+            f"this client is scoped to {len(allowed)} projects; name one with "
+            f"`project=` — a symbol lookup searches a single project",
+            _errcodes.SCOPE_UNRESOLVED, False, symbol)
 
     client = None
     try:
@@ -1523,6 +1553,57 @@ def _capability_error(tool: str, structured: bool, query: str):
     return msg
 
 
+def _envelope(message: str, code: str, structured: bool, query: str) -> "Any":
+    """The one error shape every direct-mode retrieval path returns."""
+    msg = f"[RAG ERROR] {code}: {message}"
+    if structured:
+        return {"context": msg, "results": [],
+                "meta": {"query": query, "count": 0, "error_code": code}}
+    return msg
+
+
+def _authorized_scope(project, projects, structured: bool, query: str):
+    """``(projects_or_None, error_or_None)`` — the scope this client may read.
+
+    The missing enforcement. ``_capability_error`` checks the tool NAME and
+    nothing checked the SCOPE, so a client restricted to one set of projects
+    could omit the ``project`` argument and read everything indexed on the
+    machine. The owner default is deliberately unchanged: ``None`` still means
+    "search all", because for a single-owner install it always did.
+    """
+    from ragtools.integration.mcp_authz import scope_for_search
+    from ragtools.profiles import ScopeDenied
+
+    try:
+        return scope_for_search(_active_profile(), project, projects), None
+    except ScopeDenied as e:
+        return None, _envelope(str(e), _errcodes.SCOPE_UNRESOLVED, structured, query)
+    except ValueError as e:
+        return None, _envelope(str(e), _errcodes.UNAUTHORIZED, structured, query)
+
+
+def _migration_error(structured: bool, query: str):
+    """Refuse to answer from a half-built index, in DIRECT mode too.
+
+    ``guard_ready`` lives in ``QdrantOwner.search``, which the proxy path reaches
+    and the direct path does not — it builds a ``Searcher`` itself. So while a
+    layout rebuild was pending, an MCP client talking to the store directly got
+    the ordinary "no matches" shape from an index that simply had not been built
+    yet: the one answer that is both wrong and completely convincing.
+    """
+    try:
+        from ragtools.upgrade import relayout
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        relayout.guard_ready(_settings)
+    except relayout.MigrationInProgress as e:
+        return _envelope(str(e), _errcodes.SERVICE_DOWN, structured, query)
+    except Exception:  # noqa: BLE001 — never let readiness reporting break search
+        return None
+    return None
+
+
 def _direct_search(
     query: str,
     project: str | None,
@@ -1548,6 +1629,15 @@ def _direct_search(
     cap_err = _capability_error("search_knowledge_base", structured, query)
     if cap_err is not None:
         return cap_err
+
+    stale = _migration_error(structured, query)
+    if stale is not None:
+        return stale
+
+    projects, scope_err = _authorized_scope(project, projects, structured, query)
+    if scope_err is not None:
+        return scope_err
+    project = None      # the authorized list is now the only scope that counts
 
     client = None
     try:

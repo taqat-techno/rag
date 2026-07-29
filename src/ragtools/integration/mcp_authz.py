@@ -21,7 +21,12 @@ import os
 from typing import Optional
 
 from ragtools.authz import CapabilityDenied
-from ragtools.profiles import CAPABILITY_GROUPS, ClientProfile, is_tool_allowed
+from ragtools.profiles import (
+    CAPABILITY_GROUPS,
+    ClientProfile,
+    authorize_projects,
+    is_tool_allowed,
+)
 
 #: The implicit profile when nothing is configured: the owner. All capability
 #: groups, all projects (``allowed_projects=None``), destructive permitted.
@@ -55,6 +60,48 @@ def resolve_active_profile(*, env: Optional[dict] = None, store=None) -> ClientP
             "to run (a named client never silently becomes the owner)"
         )
     return profile
+
+
+def scope_for_search(
+    profile: ClientProfile,
+    project: Optional[str] = None,
+    projects: Optional[list] = None,
+) -> Optional[list]:
+    """The projects a retrieval call may ACTUALLY read, whatever it asked for.
+
+    The gap this closes: ``require_capability`` checks a tool NAME, and nothing
+    checked the tool's SCOPE. `retrieval/router.py` holds the only production-
+    shaped :func:`~ragtools.profiles.authorize_projects` call and has no
+    production importer — so a client restricted to one client's projects could
+    call ``search_knowledge_base(query)`` with no project argument and read every
+    other client's content, exactly as the tool's own docstring promises
+    ("pass neither → search ALL indexed content").
+
+    Three cases, and the first is why this is not simply ``authorize_projects``:
+
+    * **Owner** (``allowed_projects is None``) — unchanged, including the
+      unscoped "search everything" default. The single-owner install is the
+      overwhelmingly common one and must behave exactly as it did.
+    * **Scoped client, nothing requested** — NARROWS to the client's own set.
+      ``authorize_projects`` refuses this outright, which would be correct for a
+      fresh design and a regression here; defaulting to the client's own
+      projects is both safe and what the caller meant.
+    * **Scoped client, projects requested** — delegated to
+      :func:`~ragtools.profiles.authorize_projects`, which drops foreign
+      projects and raises :class:`~ragtools.profiles.ScopeDenied` when nothing
+      authorized remains.
+    """
+    requested: Optional[list] = None
+    if projects:
+        requested = [p for p in projects if p and str(p).strip()]
+    elif project and str(project).strip():
+        requested = [project]
+
+    if profile.allowed_projects is None:
+        return requested                       # owner: unchanged, None = all
+    if requested is None:
+        return sorted(profile.allowed_projects)
+    return authorize_projects(profile, requested)
 
 
 def require_capability(profile: ClientProfile, tool: str, *, audit=None) -> None:
