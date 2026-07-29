@@ -35,6 +35,9 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev,build,tray]"
 
+      - name: The shipped client and server must be compatible
+        run: python scripts/check_qdrant_compat.py
+
       - name: Run tests
         run: pytest -q
 
@@ -135,6 +138,9 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev,build,tray]"
 
+      - name: The shipped client and server must be compatible
+        run: python scripts/check_qdrant_compat.py
+
       - name: Run tests
         run: pytest -q
 
@@ -214,6 +220,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install -e ".[dev,build,tray]"
+
+      - name: The shipped client and server must be compatible
+        run: python scripts/check_qdrant_compat.py
 
       - name: Run tests
         run: pytest -q

@@ -58,9 +58,9 @@ Local-first RAG system over documentation, with **opt-in** source-code and confi
   engine mine?". Two proofs ALWAYS run — the spawned child is alive, and the
   per-installation API key authenticates — and two are defence in depth (the
   LISTEN pid is our child; its image is the binary we launched). The latter two
-  need `psutil`, which is NOT a declared dependency, so they are absent on a
-  packaged install; the boundary is carried by the first two, which are the ones
-  that close the incident. The port check is deliberately biased
+  need `psutil`, **declared as of 3.3.0** — it was undeclared through 3.2.0 and
+  absent from that bundle, so whether those two proofs existed depended on
+  whether the build venv happened to contain it. The port check is deliberately biased
   toward "free": a false free costs nothing (our child cannot bind, and the
   child-liveness check refuses), while a false occupied degrades to embedded
   with no recovery. A durable manifest
@@ -77,6 +77,21 @@ Local-first RAG system over documentation, with **opt-in** source-code and confi
     broke was already written down in `service/identity.py` — *"a port number
     alone is never trusted"* — for the service layer, and had never been applied
     to the engine.
+- **The engine is OWNED FOR ITS WHOLE LIFE, not only at birth.**
+  `service/engine_lifecycle.py` is the only owner: it spawns, blocks a thread in
+  `proc.wait()`, and on an unexpected exit logs pid + exit code, invalidates the
+  manifest, parks the migration and restarts with bounded backoff (3 attempts,
+  2/15/60 s) before reporting `restart_exhausted`. **Intent is set before it is
+  acted on** — `request_stop()` sets the stopping flag *first*, or shutdown reads
+  as a crash and starts a restart storm. Through 3.2.0 the supervisor handle was
+  assigned once and next read in the shutdown branch; the engine died on two
+  machines and nothing anywhere recorded it.
+- **The engine is never spawned onto an inherited handle.** `Popen(cmd)` with no
+  `stdout=` inherits, and under the windowed launcher (`ragw.exe`, GUI subsystem,
+  no console) CPython creates a pipe, gives the child the write end and closes
+  the read end — so every write the engine makes fails with `ERROR_BROKEN_PIPE`
+  for its whole life. Output goes to `data/logs/qdrant.log` (10 MB × 3, rotated
+  at start) or to `DEVNULL` with the reason on `/health`. Never to inheritance.
 - **One canonical managed instance per machine.** A deliberate secondary must
   declare itself twice — non-default `qdrant_http_port`/`qdrant_grpc_port` AND an
   explicit `instance_id`. Either alone is an accident waiting to be adopted.
@@ -211,6 +226,23 @@ python scripts/eval_retrieval.py --questions tests/fixtures/eval_questions.json 
   Delete only what you can prove you created; report the rest by name.
 - Do NOT terminate a process because it holds a port or matches an image name.
   Ask `service/engine_ownership.py`.
+- Do NOT spawn a child process without explicit `stdout=`/`stderr=`. Inheritance
+  under a GUI-subsystem parent hands it a pipe with no reader, and every write it
+  makes fails silently — that is why the v3.2.0 engine death left no evidence.
+- Do NOT reach a destructive operation without `service/destructive.py`. Four
+  entry points reached `owner.rebuild()` and none of them asked whether storage
+  was reachable, while `/health` was reporting that it was not. Preconditions are
+  checked BEFORE anything mutates, including before the backup.
+- Do NOT return `0` for a count you could not take. `_count_points` swallowing an
+  error and returning `0` is what let a dead engine render as a confidently empty
+  index beside a state DB reporting 145,906 chunks. Unknown is `None`; see also
+  `relayout.POINTS_UNKNOWN`.
+- Do NOT discard the return value of `run_full_index`. It takes the index mutex
+  non-blocking and returns `{"busy": True}` when skipped; recording that unit as
+  `DONE` finalises a migration over an index the project is missing from.
+- Do NOT pin the client and the engine by different mechanisms. `qdrant-client`
+  is bounded against `PINNED_QDRANT_VERSION`, and
+  `scripts/check_qdrant_compat.py` fails the build if the shipped pair drifts.
 - Do NOT let a retrieval entry point pass a caller-supplied project straight to
   the searcher. Resolve it through `mcp_authz.scope_for_search` first — the
   capability check covers the tool NAME, not its SCOPE.

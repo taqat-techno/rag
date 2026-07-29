@@ -203,6 +203,18 @@ class PlatformAdapter(Protocol):
         """
         ...
 
+    def child_process_flags(self) -> dict:
+        """Extra ``Popen`` kwargs for a SUPERVISED child — one we wait on.
+
+        Distinct from :meth:`spawn_detached`, which cuts a process loose. The
+        managed storage engine is the opposite: it stays our child so its exit
+        can be observed. What varies by platform is only whether the OS would
+        give that child a console window of its own.
+
+        Default is "nothing extra", which is right everywhere but Windows.
+        """
+        return {}
+
     def pid_alive(self, pid: int) -> bool:
         """Whether ``pid`` is a live process. Must not raise for a dead pid."""
         ...

@@ -492,9 +492,32 @@ def ui_index(full: bool = Query(False)):
 
 @page_router.post("/ui/rebuild", response_class=HTMLResponse)
 def ui_rebuild():
-    """Rebuild and return results fragment."""
+    """Rebuild and return results fragment.
+
+    Guarded and handled. This route used to call ``owner.rebuild()`` bare: any
+    exception escaped to Starlette and reached the user as
+    ``Request failed (500) — Internal Server Error``, while ``/health`` was
+    simultaneously reporting ``storage_unreachable`` — the service knew, and the
+    button neither said so nor declined.
+
+    The status stays 200 with an error fragment, matching every other handler in
+    this module, because htmx does not swap a 4xx response and a refusal the user
+    cannot see is worse than one they can. The machine-readable 409 lives on
+    ``POST /api/rebuild``.
+    """
+    from ragtools.service import destructive
+
     owner = get_owner()
-    stats = owner.rebuild()
+    try:
+        with destructive.destructive_operation(owner, operation="rebuild"):
+            stats = owner.rebuild()
+    except destructive.OperationRefused as refused:
+        return (f'<div class="flash flash-error">Rebuild not started: '
+                f'{escape(refused.reason)}</div>')
+    except Exception as e:  # noqa: BLE001 — a failed rebuild is not a 500
+        logger.exception("rebuild failed")
+        return (f'<div class="flash flash-error">Rebuild failed: '
+                f'{escape(str(e))}</div>')
     return f"""
     <div class="flash flash-success">
         Rebuild complete: {stats['files_indexed']} files, {stats['chunks_indexed']} chunks,

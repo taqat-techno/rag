@@ -26,6 +26,10 @@ _LOG_FILES: Dict[str, str] = {
     "watchdog": "watchdog.log",      # DELL's external watchdog — may not exist yet
     "supervisor": "service.log",     # supervisor also multiplexes here
     "tray": "tray-dev.log",          # only present in dev runs
+    # The managed engine's own account of itself. Through 3.2.0 this file did
+    # not exist: the engine inherited a broken pipe and every line it wrote
+    # failed, which is why two crashes could not be diagnosed at all.
+    "qdrant": "qdrant.log",
 }
 
 

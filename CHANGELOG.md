@@ -13,6 +13,188 @@ _Nothing yet._
 
 ---
 
+## [3.3.0] — 2026-07-29
+
+v3.2.0 fixed how the managed engine is *adopted*. It did not give the engine an
+owner. A class named `QdrantSupervisor` supervised nothing after startup: its
+handle was assigned once at `app.py:192` and next read at `app.py:252` — the
+shutdown branch. In between, the engine could die, and did.
+
+**Twice, on two machines, under opposite workloads.** One died four minutes into
+a 25-collection migration. The other died after seven and a quarter hours of
+essentially idle polling — found live on the development machine during the
+investigation into the first. Both times the service carried on answering
+`/health` while every storage operation failed. Nothing logged the exit, nothing
+restarted the engine, and nothing told the user.
+
+Load was not the trigger. What both machines shared was a windowed launcher and
+an engine that had been given nowhere to write.
+
+### The engine had nowhere to write — and it was worse than nowhere
+
+`QdrantSupervisor.start()` called `subprocess.Popen(cmd)` with no `stdout=`, so
+the child inherited the parent's handles. Under `ragw.exe` — a GUI-subsystem
+build with no console — the parent *has* no standard handles, so CPython creates
+an anonymous pipe, hands the child the write end, and closes the read end
+immediately (`subprocess.Popen._get_handles`).
+
+The engine therefore held a write handle to a pipe with **no reader**. Measured,
+not assumed: a child in that position gets `ERROR_BROKEN_PIPE` — *"The process
+tried to write to a nonexistent pipe."* Not a discarded write. A **failing**
+write, on every log line, for the entire life of the process.
+
+That is why no post-mortem was possible, and it is why this release ships the
+logging before the restart loop: a bounded restart around an unexplained crash
+would only have converted a silent death into a silent recovery.
+
+- Engine `stdout`/`stderr` now go to `data/logs/qdrant.log` (10 MB × 3, rotated
+  at start — the writer is a child holding the handle, so rotating mid-run is how
+  a log silently stops).
+- A log that cannot be opened degrades to `DEVNULL` and is reported on `/health`
+  as `engine_log_unavailable`. It **never** falls back to inheritance.
+- `qdrant.exe` is a CONSOLE-subsystem image; it is now spawned with
+  `CREATE_NO_WINDOW`, the same stray-console fix already applied to the launcher
+  — and explicitly **not** `DETACHED_PROCESS`, which would silently break the
+  `proc.wait()` the whole supervision fix rests on.
+- That console decision goes through a new `PlatformAdapter.child_process_flags()`
+  rather than a `sys.platform` test in the storage module. The first draft asked
+  `sys.platform` directly and this repository's own AST sweep refused it, which
+  is exactly what that test is for.
+
+Verified against the real shipped binary, not a spawn double: `qdrant.exe`
+1.15.5 (build `48203e41`) started through the new supervisor writes 1,823 bytes
+of banner, version and INFO lines into `qdrant.log`.
+
+### The death silenced the log instead of announcing it
+
+The reported "ten-minute gap" before the failure was not a gap around the death —
+it was the death. `storage_reachable()` catches every exception and returns
+`(False, detail)` without logging, and `httpx` only logs on a *response*. When
+the engine stopped answering, every routine log producer stopped producing.
+Confirmed on the second machine, whose `service.log` simply ends at a `200 OK`.
+
+### `EngineLifecycle` — one owner, whole life
+
+New `service/engine_lifecycle.py` owns the child from spawn to exit:
+
+- **Death is observed, not inferred.** A waiter thread blocks in `proc.wait()`,
+  so the exit code arrives the instant it exists. Polling a socket tells you the
+  engine is unreachable; waiting on the child tells you it is *gone*.
+- **Intent is recorded before it is acted on.** `request_stop()` sets the
+  stopping flag *first*, then signals. Reverse that ordering and shutting the
+  service down starts a restart storm.
+- **The manifest is invalidated the moment the child is seen to exit**, closing
+  the window in which a dead pid is still vouched for.
+- **Restarts are bounded and the bound is loud** — 3 attempts, 2/15/60 s backoff,
+  then `restart_exhausted` as a reported state.
+- A running migration is **parked durably** on death and **resumed** on recovery.
+- States (`starting`/`ready`/`unhealthy`/`crashed`/`restarting`/
+  `restart_exhausted`/`stopping`/`stopped`) surface on `/health` under `engine`.
+
+### A skipped migration unit was recorded as rebuilt
+
+`run_full_index` takes the index mutex **non-blocking** and returns
+`{"busy": True}` when another run holds it — a watcher tick is enough.
+`relayout.run_pending` discarded that return value and marked the unit `DONE`
+having indexed it zero times.
+
+Harmless while `validate` gated completion. **Not** harmless after v3.2.0
+separated `units_all_done` from `validate`: the plan now finalises, search comes
+back on, and the missing project answers "no matches" in the ordinary reassuring
+shape — the exact outcome `relayout`'s own docstring exists to prevent.
+
+### Four doors to a destructive operation, no guard on any of them
+
+The rebuild that produced the 500 began by taking a backup and dropping
+collections while `/health` was *already* reporting `storage_unreachable`.
+
+New `service/destructive.py` is one gate consulted by all four entry points
+(`/ui/rebuild`, `POST /api/rebuild`, `rag rebuild`, the job worker). It refuses
+when storage is unreachable, a migration is active, an index is running, or
+another destructive operation holds the lock — and it refuses **before anything
+mutates**, including before the backup.
+
+- `POST /api/rebuild` → **409 Conflict** with a structured body, never 500.
+- `/ui/rebuild` → an error fragment (htmx does not swap a 4xx, and a refusal the
+  user cannot see is worse than one they can).
+- CLI → categorised exit code; MCP/job → structured error.
+
+### Rebuild ordering, and an exclusion that was never there
+
+- `rebuild()` now holds `_index_mutex`, not just `self._lock`. Those are
+  *different* primitives, and `run_full_index` holds `self._lock` only per
+  30-file window — so a rebuild could drop every collection and delete the state
+  DB underneath a running migration, which would then recreate the state DB and
+  write into freshly emptied collections.
+- The state DB is deleted **only after every collection is proven to exist**.
+  "`recreate_collection` did not raise" is a weaker claim than "the collection is
+  there", and the backup covers the state DB — it does not cover vectors.
+- A `rebuild-intent.json` marker makes an interrupted rebuild visible
+  (`rebuild_interrupted` on `/health`) instead of leaving an unexplained empty
+  index.
+
+### `/api/status` took 62 seconds and reported a confident lie
+
+Measured against a dead engine with 25 collections: **62.11 s**, all of it
+holding the owner lock, because `_count_points` makes two failing round-trips per
+collection. One dashboard poll stalled every search, index and rebuild for a
+minute — and the dashboard polls this.
+
+It also reported `points_count: 0` with `stale: false`, beside a state DB saying
+145,906 chunks. Status now short-circuits on a cached reachability check and
+reports `points_count: null` — unknown and zero lead to opposite conclusions and
+must not render identically.
+
+### The remedy the product advertised could not run
+
+`/health` returned `"retry": "rag upgrade --resume"` unconditionally. On a
+managed installation that command fails in **both** states: it refuses while the
+service is up ("the service owns the store"), and with the service down the
+engine is down too, so `ManagedBackend(storage_url=None)` raises —
+`storage_url` is set in-process at startup and never persisted.
+
+- New `POST /api/migration/resume` (202); the service owns the engine, so the
+  service does the resume.
+- `rag upgrade --resume` **forwards** to it instead of dead-ending.
+- The retry string is now computed for the installation it is printed on.
+- `rag rebuild`'s offline branch refuses on a managed install rather than
+  deleting `qdrant_path` — which on those machines is the *pre-migration index
+  kept for rollback*, while the live engine's collections go untouched.
+
+### The maintenance table had thirteen passing tests and had never run
+
+`MaintenanceScheduler` and `build_default_tasks` were referenced from nowhere in
+`src/`. Full coverage, zero executions. And `_storage_probe` called
+`storage_reachable()` and discarded the boolean — since that method never raises,
+the task recorded success while the store was dead. Both fixed: the scheduler is
+started by the service, and the probe raises.
+
+### The version pair is now a gate, not a coincidence
+
+v3.2.0 shipped `qdrant-client 1.18.0` against `qdrant 1.15.5` — three minors
+apart, warning on every startup. Nobody mistyped anything: the two halves were
+pinned by *different mechanisms*. The server is a source constant; the client was
+`>=1.12.0` with no upper bound, resolved fresh at build time. The developer
+machine that never re-resolved sat on 1.17.1 and saw nothing.
+
+- `qdrant-client>=1.14.0,<1.17.0` — bounded against the engine we ship.
+- `psutil>=5.9.0` **declared**. Two of the four ownership proofs silently do not
+  exist without it, and it was absent from the v3.2.0 bundle — so whether a
+  security boundary held depended on whether an undeclared package happened to be
+  in the build venv.
+- `scripts/check_qdrant_compat.py` fails the build, on all three platforms,
+  before packaging — and rejects an unbounded requirement on principle, not only
+  a bad resolution.
+
+### Also
+
+- Indexing now stops at the next progress boundary when storage goes away
+  (`StorageWentAway`), instead of scanning, chunking and embedding a project
+  whose every write will be refused.
+- `rebuild()` stamps index identity, which `_run_full_index_inner` never did.
+
+---
+
 ## [3.2.0] — 2026-07-29
 
 Every fix here comes from one incident on one machine, and eight of the nine

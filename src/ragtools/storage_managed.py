@@ -19,20 +19,110 @@ Plan: docs/planning/RAG_V3_LOCAL_DEV_IMPLEMENTATION_PLAN.md  (S4 -> G4)
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
 from ragtools.devenv import default_synced_detector
 
+logger = logging.getLogger("ragtools.service")
+
 #: The exact Qdrant version ragtools manages. Pinned because snapshots restore
 #: only within a minor and downgrade is irreversible — the installer ships this
 #: build and upgrades are deliberate, chained, and backed up first.
 PINNED_QDRANT_VERSION = "1.15.5"
 
+#: Engine log rotation. Matches the service log policy so one operator habit
+#: covers both files.
+ENGINE_LOG_NAME = "qdrant.log"
+ENGINE_LOG_MAX_BYTES = 10 * 1024 * 1024
+ENGINE_LOG_BACKUPS = 3
+
 
 class ManagedStartError(RuntimeError):
     """The managed Qdrant server could not be started or verified safely."""
+
+
+def engine_log_path(data_dir) -> Path:
+    """Where the engine's own output goes. Beside ``service.log``."""
+    return Path(data_dir) / "logs" / ENGINE_LOG_NAME
+
+
+def rotate_engine_log(path: Path, *, max_bytes: int = ENGINE_LOG_MAX_BYTES,
+                      backups: int = ENGINE_LOG_BACKUPS) -> None:
+    """Roll the engine log if it is oversized. Called before the child opens it.
+
+    Rotation happens at START, not on a size trigger, because the writer is a
+    child process holding the handle — renaming a file out from under it is how
+    you get a log that silently stops. One roll per engine start is enough: the
+    engine is long-lived, and a run that outgrows 10 MB has already told us what
+    we needed.
+    """
+    try:
+        if not path.is_file() or path.stat().st_size < max_bytes:
+            return
+        for n in range(backups - 1, 0, -1):
+            older, newer = path.with_suffix(f".log.{n}"), path.with_suffix(f".log.{n + 1}")
+            if older.is_file():
+                older.replace(newer)
+        path.replace(path.with_suffix(".log.1"))
+    except OSError as exc:
+        logger.warning("could not rotate the engine log at %s: %s", path, exc)
+
+
+def open_engine_log(data_dir):
+    """``(handle, path)`` for the engine's output, or ``(None, None)``.
+
+    A REAL OS handle, because that is the only kind a child process can inherit
+    — the same reasoning `_streams.py` applies to the null device. Returning
+    ``None`` is not a failure to paper over: :meth:`QdrantSupervisor.start`
+    falls back to ``DEVNULL``, never to inheritance.
+    """
+    path = engine_log_path(data_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rotate_engine_log(path)
+        return open(path, "ab", buffering=0), path
+    except OSError as exc:
+        logger.warning("could not open the engine log at %s: %s — the engine's "
+                       "output will be discarded this run", path, exc)
+        return None, None
+
+
+def _spawn_kwargs(stream) -> dict:
+    """Keyword arguments that keep the child off an inherited handle.
+
+    THE DEFECT THIS EXISTS TO PREVENT. `Popen(cmd)` with no `stdout=` inherits
+    the parent's handles. Under the windowed launcher (`ragw.exe`, a
+    GUI-subsystem build with no console) the parent HAS no standard handles, so
+    CPython creates an anonymous pipe, hands the child the write end, and closes
+    the read end immediately — `subprocess.Popen._get_handles`. The child then
+    holds a write handle to a pipe with no reader, and every write it makes
+    fails with ERROR_BROKEN_PIPE for the entire life of the process. Measured,
+    not assumed: a child in that position reports "The process tried to write to
+    a nonexistent pipe."
+
+    So the engine is given somewhere real to write, or `DEVNULL`, and never the
+    thing it was given before.
+    """
+    kwargs: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": stream if stream is not None else subprocess.DEVNULL,
+        "stderr": subprocess.STDOUT if stream is not None else subprocess.DEVNULL,
+    }
+    # Console-window suppression is a PLATFORM question, and this project keeps
+    # every platform branch behind one seam — `ragtools.platform`. Asking
+    # `sys.platform` here would put dispatch back in a module that has no
+    # business knowing which OS it is on, which a structural test correctly
+    # refuses. See `PlatformAdapter.child_process_flags`.
+    try:
+        from ragtools.platform import adapter
+
+        kwargs.update(adapter().child_process_flags())
+    except Exception:  # noqa: BLE001 — an unsupported platform still gets a sink
+        pass
+    return kwargs
 
 
 #: Map (system, machine) -> Qdrant release-asset stem. Absent key => no build.
@@ -117,6 +207,7 @@ class QdrantSupervisor:
         config_path: Optional[str] = None,
         pinned_version: str = PINNED_QDRANT_VERSION,
         api_key: Optional[str] = None,
+        data_dir: Optional[str] = None,
         spawn: Callable = subprocess.Popen,
         http_get: Optional[Callable] = None,
         sleep: Optional[Callable] = None,
@@ -129,11 +220,18 @@ class QdrantSupervisor:
         self.config_path = config_path
         self.pinned_version = pinned_version
         self.api_key = api_key
+        self.data_dir = data_dir
         self._spawn = spawn
         self._http_get = http_get
         self._sleep = sleep or (lambda s: None)
         self._is_synced_path = is_synced_path
         self._proc = None
+        #: Where the engine's output went this run, and why if it went nowhere.
+        #: Surfaced on /health: a logging failure must not block the engine, but
+        #: it must not be invisible either.
+        self.log_path: Optional[str] = None
+        self.log_error: str = ""
+        self._log_handle = None
 
     @property
     def proc(self):
@@ -173,14 +271,45 @@ class QdrantSupervisor:
         return f"http://127.0.0.1:{self.http_port}"
 
     def start(self):
-        """Pre-flight the storage path, then spawn the process."""
+        """Pre-flight the storage path, then spawn the process onto a real sink.
+
+        The spawn is never bare. ``stdout``/``stderr`` go to ``qdrant.log`` when
+        one can be opened and to ``DEVNULL`` when one cannot — see
+        :func:`_spawn_kwargs` for why inheritance is the one option that is
+        never taken.
+        """
         if self._is_synced_path(Path(self.storage_path)):
             raise ManagedStartError(
                 f"refusing to start managed Qdrant: storage_path {self.storage_path} "
                 "is on a synced / FUSE path (documented silent data loss)."
             )
-        self._proc = self._spawn(self.command())
+
+        stream = None
+        if self.data_dir:
+            stream, path = open_engine_log(self.data_dir)
+            if stream is None:
+                self.log_error = ("the engine log could not be opened; this "
+                                  "run's engine output is discarded")
+            else:
+                self._log_handle = stream
+                self.log_path = str(path)
+
+        try:
+            self._proc = self._spawn(self.command(), **_spawn_kwargs(stream))
+        except TypeError:
+            # An injected double that accepts only the command. Tests use these,
+            # and a signature mismatch must not stop the engine from starting.
+            self._proc = self._spawn(self.command())
         return self._proc
+
+    def _close_log(self) -> None:
+        """Drop our copy of the log handle. The child keeps its own."""
+        handle, self._log_handle = self._log_handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def wait_ready(self, timeout: float = 30.0, interval: float = 0.5):
         """Poll ``/readyz`` until 200, the child dies, or the timeout expires.
@@ -251,6 +380,7 @@ class QdrantSupervisor:
     def stop(self, timeout: float = 10.0):
         """Graceful terminate; idempotent."""
         if self._proc is None:
+            self._close_log()
             return
         try:
             self._proc.terminate()
@@ -259,3 +389,25 @@ class QdrantSupervisor:
             pass
         finally:
             self._proc = None
+            self._close_log()
+
+    def describe(self) -> dict:
+        """The lifecycle record an operator needs to trace one engine.
+
+        Every field here answers a question that was unanswerable during the
+        v3.2.0 incident: which process, which binary, which store, which ports,
+        and where its own account of itself went.
+        """
+        proc = self._proc
+        return {
+            "pid": getattr(proc, "pid", None),
+            "executable": self.binary_path,
+            "argv": self.command(),
+            "http_port": self.http_port,
+            "grpc_port": self.grpc_port,
+            "storage_path": self.storage_path,
+            "config_path": self.config_path,
+            "pinned_version": self.pinned_version,
+            "log_path": self.log_path,
+            "log_error": self.log_error,
+        }

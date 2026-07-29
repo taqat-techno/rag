@@ -282,6 +282,10 @@ def start_managed_qdrant(settings, plan: Optional[ManagedPlan] = None):
         grpc_port=plan.grpc_port,
         config_path=str(cfg_path),
         api_key=plan.api_key,
+        # Without this the engine has nowhere to write, and under the windowed
+        # launcher "nowhere" is a pipe with no reader — every log line it emits
+        # fails, which is why the v3.2.0 crash left no evidence at all.
+        data_dir=str(settings.data_dir),
         http_get=httpx.get,
         sleep=time.sleep,
     )
@@ -300,8 +304,19 @@ def start_managed_qdrant(settings, plan: Optional[ManagedPlan] = None):
         verify_ownership(claim, proc=proc)
         version = supervisor.verify_version()
         write_manifest(settings, claim)
-        logger.info("Managed Qdrant %s ready on %s (pid=%s instance=%s)",
-                    version, plan.url, claim.pid, claim.instance_id)
+        # The lifecycle record. Every field here answers a question that was
+        # unanswerable while the v3.2.0 engine was dying: which process, which
+        # binary, which store, and where its own account of itself went.
+        # `getattr`, not attribute access: an injected double is a legitimate
+        # supervisor here, and a diagnostic line must never be the reason the
+        # engine "fails to start".
+        log_path = getattr(supervisor, "log_path", None)
+        log_error = getattr(supervisor, "log_error", "") or "no engine log"
+        logger.info("Managed Qdrant %s ready on %s (pid=%s instance=%s exe=%s "
+                    "storage=%s log=%s)",
+                    version, plan.url, claim.pid, claim.instance_id,
+                    claim.executable, claim.storage_path,
+                    log_path or f"UNAVAILABLE ({log_error})")
         return supervisor, plan.url
     except NotOurEngine as exc:
         # Distinguished from a start failure on purpose: "the engine that is

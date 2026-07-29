@@ -156,6 +156,18 @@ class WindowsAdapter:
         kwargs.setdefault("close_fds", True)
         return subprocess.Popen(list(argv), **kwargs).pid
 
+    def child_process_flags(self) -> dict:
+        """``CREATE_NO_WINDOW`` — but NOT ``DETACHED_PROCESS``.
+
+        The managed engine is a CONSOLE-subsystem image (``qdrant.exe``).
+        Launched from a process that has no console of its own, Windows would
+        otherwise give it one — the same stray-window class already fixed for
+        the launcher. Detaching it, on the other hand, is exactly wrong here:
+        this child must stay ours so a thread can wait on it and read its exit
+        code, which is the whole of the v3.3.0 supervision fix.
+        """
+        return {"creationflags": 0x08000000}      # CREATE_NO_WINDOW
+
     #: Windows ships one; see WINDOWED_EXE_NAME.
     windowed_executable_name = WINDOWED_EXE_NAME
 

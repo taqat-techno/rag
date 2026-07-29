@@ -528,7 +528,9 @@ def tail_logs(source: str = "service", limit: int = 50) -> dict:
 
     Args:
         source: One of ``service``, ``watcher``, ``launcher``, ``watchdog``,
-                ``supervisor``, ``tray``. Other values are rejected.
+                ``supervisor``, ``tray``, ``qdrant``. Other values are rejected.
+                ``qdrant`` is the managed engine's own output — the place to look
+                when storage died and you need to know why.
         limit:  Max lines (capped at 500 to keep responses small).
     """
     if _ops_state is not None and _ops_state.mode == "proxy":
@@ -1262,6 +1264,16 @@ def list_indexed_paths(project: str | None = None, limit: int = 200) -> dict:
                    code=_errcodes.BACKEND_ERROR)
 
 
+def _points_display(value) -> str:
+    """``None`` means "could not count", which is not "empty".
+
+    The service now reports ``points_count: null`` when the store is
+    unreachable, because rendering a confident ``0`` beside a state DB claiming
+    145,906 chunks is how a working index reads as data loss.
+    """
+    return "unknown (storage unreachable)" if value is None else str(value)
+
+
 def _fallback_state() -> McpState:
     """Build an ephemeral McpState when _ops_state wasn't initialised.
 
@@ -1494,7 +1506,7 @@ def _proxy_index_status() -> str:
                 f"  Collection: {data.get('collection_name', 'unknown')}\n"
                 f"  Total files: {data.get('total_files', 0)}\n"
                 f"  Total chunks: {data.get('total_chunks', 0)}\n"
-                f"  Points: {data.get('points_count', 0)}\n"
+                f"  Points: {_points_display(data.get('points_count'))}\n"
                 f"  Projects: {', '.join(projects) if projects else '-'}\n"
                 f"  Embedding model: {_settings.embedding_model}\n"
                 f"  Score threshold: {_settings.score_threshold}\n"

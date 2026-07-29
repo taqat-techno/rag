@@ -86,6 +86,16 @@ class IndexRequest(BaseModel):
 
 # --- Health ---
 
+def _migration_remedy(settings) -> str:
+    """The retry instruction that works on this installation. See app.py."""
+    try:
+        from ragtools.service.app import migration_remedy
+
+        return migration_remedy(settings)
+    except Exception:  # noqa: BLE001
+        return "restart the service — it resumes the rebuild automatically"
+
+
 @router.get("/health")
 def health():
     """Readiness probe. Returns 200 when encoder loaded + Qdrant open.
@@ -145,6 +155,42 @@ def health():
         storage_ok, storage_detail = True, ""
     if not storage_ok:
         issues.append("storage_unreachable")
+
+    # The managed engine's own lifecycle, from cached state. "The engine crashed
+    # and we are on restart attempt 2 of 3" and "the engine is fine but a query
+    # timed out" are different facts with different remedies, and v3.2.0 could
+    # express neither — the engine could die and nothing anywhere would say so.
+    engine = None
+    try:
+        from ragtools.service.app import engine_status
+        from ragtools.service.engine_lifecycle import (
+            CRASHED,
+            RESTART_EXHAUSTED,
+            RESTARTING,
+        )
+
+        engine = engine_status()
+        if engine is not None:
+            if engine["state"] == CRASHED:
+                issues.append("engine_crashed")
+            elif engine["state"] == RESTARTING:
+                issues.append("engine_restarting")
+            elif engine["state"] == RESTART_EXHAUSTED:
+                issues.append("engine_restart_exhausted")
+            if engine.get("log_error"):
+                issues.append("engine_log_unavailable")
+    except Exception:  # noqa: BLE001 — reporting must never break liveness
+        engine = None
+
+    # A rebuild that started and never finished. Without this an interrupted
+    # rebuild leaves an empty index and no explanation, which reads as data loss.
+    try:
+        from ragtools.service.destructive import pending_intent
+
+        if pending_intent(owner.settings) is not None:
+            issues.append("rebuild_interrupted")
+    except Exception:  # noqa: BLE001
+        pass
 
     # A configuration that could not be brought to the current schema is a real
     # degradation: the product is running on fallback defaults rather than on
@@ -207,13 +253,21 @@ def health():
                 {"kind": k, "id": i, "error": e}
                 for k, i, e in migration_state.failures
             ],
-            "retry": "rag upgrade --resume",
+            # The remedy that works on THIS installation. This was hard-coded to
+            # `rag upgrade --resume`, which cannot run on a managed machine in
+            # either state — it refuses while the service is up, and raises while
+            # it is down because the engine is down with it.
+            "retry": _migration_remedy(owner.settings),
         }),
         "collection": owner.settings.collection_name,
         "version": __version__,
         "watcher_running": watcher_running,
         "storage_reachable": storage_ok,
         "storage_error": storage_detail,
+        # The managed engine's lifecycle. `None` means "no managed engine in
+        # this configuration" — a different fact from "the engine is down", and
+        # it must not render as one.
+        "engine": engine,
         # WHY the running engine differs from the configured one. Without this,
         # a machine that silently fell back to embedded is indistinguishable
         # from one deliberately configured that way — same `storage_backend`,
@@ -589,9 +643,25 @@ def events_stream(
 
 @router.post("/api/rebuild")
 def rebuild():
-    """Drop all data and rebuild index from scratch."""
+    """Drop all data and rebuild index from scratch.
+
+    Refuses with **409 Conflict** — never 500 — when the store is unreachable, a
+    migration owns the index, an indexing run is active, or another destructive
+    operation holds the lock. The request is well-formed; the server is
+    temporarily unable to honour it, and that is a conflict, not an error.
+    """
+    from ragtools.service import destructive
+
     owner = get_owner()
-    stats = owner.rebuild()
+    try:
+        with destructive.destructive_operation(owner, operation="rebuild"):
+            stats = owner.rebuild()
+    except destructive.OperationRefused as refused:
+        raise HTTPException(status_code=409, detail={
+            "error": "rebuild_refused",
+            "code": refused.code,
+            "message": refused.reason,
+        })
     try:
         from ragtools.service.notify import notify_rebuild_complete
         notify_rebuild_complete(
@@ -602,6 +672,49 @@ def rebuild():
     except Exception as e:
         logger.debug("rebuild-complete toast failed (non-fatal): %s", e)
     return {"stats": stats}
+
+
+@router.post("/api/migration/resume")
+def migration_resume():
+    """Resume a parked layout migration. The remedy, where it can actually run.
+
+    On a managed installation the service is the only process that can do this:
+    it owns the engine, and ``rag upgrade --resume`` refuses while the service is
+    up and cannot build a client while it is down. So the CLI forwards here
+    instead of failing in both directions.
+
+    Returns 202 — the rebuild runs on its own thread and can take hours; an HTTP
+    request must not be the thing holding it.
+    """
+    from ragtools.upgrade import relayout
+
+    owner = get_owner()
+    plan = relayout.active_plan(owner.settings)
+    if plan is None:
+        return {"status": "no_migration",
+                "message": "no migration is pending on this installation"}
+
+    ok, detail = owner.storage_reachable()
+    if not ok:
+        raise HTTPException(status_code=409, detail={
+            "error": "storage_unreachable",
+            "message": f"the vector store is not reachable ({detail}); the "
+                       f"rebuild would be parked again immediately",
+        })
+
+    from fastapi.responses import JSONResponse
+
+    from ragtools.service.app import resume_migration
+
+    # reset=True: an operator asking for this has fixed the cause, and only they
+    # know that. Automatic retries stay bounded precisely so this one need not be.
+    started = resume_migration(reset=True)
+    report = relayout.progress(owner.settings, plan)
+    return JSONResponse(status_code=202, content={
+        "status": "resuming" if started else "not_started",
+        "plan": plan,
+        "state": report.describe() if report else "",
+    })
 
 
 # --- Status ---

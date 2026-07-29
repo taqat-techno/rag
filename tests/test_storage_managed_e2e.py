@@ -112,3 +112,71 @@ def test_managed_qdrant_real_lifecycle_and_roundtrip(tmp_path):
         client.close()
     finally:
         sup.stop()
+
+
+def test_the_real_engine_actually_writes_to_its_log(tmp_path):
+    """The fix for the defect that made two crashes undiagnosable, proven against
+    the real binary rather than a spawn double.
+
+    Through v3.2.0 the engine was spawned with no ``stdout=``, so it inherited
+    the parent's handles — and under the windowed launcher those do not exist,
+    so CPython handed it a pipe with no reader and every line it wrote failed
+    with ERROR_BROKEN_PIPE. Nothing the engine said about its own death survived.
+
+    A unit test can show that a *file object* was passed. Only this can show that
+    a real Qdrant, started the way the product starts it, puts real bytes in the
+    file.
+    """
+    import time
+
+    import httpx
+
+    from ragtools.storage_managed import (
+        QdrantSupervisor,
+        engine_log_path,
+        generate_qdrant_config,
+    )
+
+    assert BIN and os.path.exists(BIN), "RAG_E2E_QDRANT_BIN must point at qdrant.exe"
+
+    data_dir = tmp_path / "data"
+    storage = data_dir / "qdrant-server"
+    storage.mkdir(parents=True)
+    port, grpc = HTTP_PORT + 2, GRPC_PORT + 2
+    config_path = _write_config(
+        generate_qdrant_config(storage_path=str(storage), http_port=port,
+                               grpc_port=grpc,
+                               snapshots_path=str(data_dir / "snapshots")),
+        tmp_path / "qdrant-log.yaml")
+
+    sup = QdrantSupervisor(
+        binary_path=BIN, storage_path=str(storage),
+        http_port=port, grpc_port=grpc, config_path=config_path,
+        data_dir=str(data_dir), http_get=httpx.get, sleep=time.sleep)
+
+    try:
+        sup.start()
+        assert sup.wait_ready(timeout=45, interval=0.5) is True
+
+        log = engine_log_path(data_dir)
+        assert sup.log_path == str(log)
+        assert not sup.log_error, f"the engine log was unavailable: {sup.log_error}"
+
+        # Give the engine a moment to flush its startup banner.
+        for _ in range(50):
+            if log.is_file() and log.stat().st_size > 0:
+                break
+            time.sleep(0.1)
+
+        assert log.is_file(), f"no engine log was created at {log}"
+        size = log.stat().st_size
+        assert size > 0, (
+            "the engine log exists but is EMPTY — the engine's output is still "
+            "going somewhere other than the file we gave it")
+
+        text = log.read_text(encoding="utf-8", errors="replace").lower()
+        assert "qdrant" in text or "access web ui" in text or "http" in text, (
+            f"the log holds {size} bytes but nothing recognisable as Qdrant "
+            f"output:\n{text[:400]}")
+    finally:
+        sup.stop()

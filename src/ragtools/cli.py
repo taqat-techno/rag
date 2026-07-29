@@ -263,7 +263,11 @@ def status():
             table.add_column("Value")
             table.add_row("Total files", str(data.get("total_files", 0)))
             table.add_row("Total chunks", str(data.get("total_chunks", 0)))
-            table.add_row("Points", str(data.get("points_count", 0)))
+            # `None` means the store could not be counted, which is a different
+            # fact from "empty" and must not print as `None`.
+            _points = data.get("points_count")
+            table.add_row("Points", "unknown (storage unreachable)"
+                          if _points is None else str(_points))
             table.add_row("Projects", ", ".join(data.get("projects", [])) or "none")
             table.add_row("Last indexed", data.get("last_indexed") or "never")
             console.print(table)
@@ -517,13 +521,38 @@ def rebuild():
         try:
             console.print(f"\n[bold]Rebuilding index via service[/bold]")
             r = httpx.post(f"{_service_url(settings)}/api/rebuild", timeout=300.0)
+            # A refusal is not a failure to report as one. The service returns
+            # 409 with the specific blocking condition; passing that through is
+            # the difference between "try again later" and "something broke".
+            if r.status_code == 409:
+                detail = r.json().get("detail") or {}
+                console.print(f"[yellow]Rebuild refused:[/yellow] "
+                              f"{detail.get('message', 'the service declined')}")
+                raise typer.Exit(2)
             r.raise_for_status()
             stats = r.json()["stats"]
             _print_index_stats(stats, full=True, elapsed=0)
+        except typer.Exit:
+            raise
         except Exception as e:
             console.print(f"[red]Rebuild via service failed:[/red] {e}")
             raise typer.Exit(1)
     else:
+        # THE OFFLINE BRANCH IS EMBEDDED-ONLY, AND SAYING SO MATTERS.
+        # `settings.qdrant_path` is the EMBEDDED store. On a managed or external
+        # installation that directory is the pre-migration index kept for
+        # rollback — deleting it here would destroy the one copy of the data the
+        # migration deliberately preserved, while leaving the live engine's
+        # collections completely untouched.
+        backend = (getattr(settings, "storage_backend", "embedded") or "embedded").lower()
+        if backend != "embedded":
+            console.print(
+                f"[yellow]Rebuild needs the service on this installation.[/yellow]\n"
+                f"  storage_backend is '{backend}', so the index lives in a server "
+                f"this command cannot start.\n"
+                f"  Start the service (`rag service start`) and run this again.")
+            raise typer.Exit(2)
+
         qdrant_path = Path(settings.qdrant_path)
         state_path = Path(settings.state_db)
 
@@ -1463,10 +1492,49 @@ def upgrade(
         # nothing left to do.
         settings = Settings()
         if _probe_service(settings):
-            console.print("[yellow]The service owns the store[/yellow] — it "
-                          "resumes the rebuild itself on start. Stop it first to "
-                          "run the rebuild here.")
-            raise typer.Exit(1)
+            # FORWARD, DO NOT REFUSE.
+            #
+            # This used to stop here and tell the user to shut the service down.
+            # On a managed installation that advice is a dead end: stopping the
+            # service stops the engine with it, and the CLI then cannot build a
+            # client at all — `storage_url` is set in-process at service startup
+            # and never persisted, so `ManagedBackend` raises. The command the
+            # product advertises on /health failed in both states. The service
+            # owns the store, so the service does the resume.
+            import httpx
+            try:
+                r = httpx.post(f"{_service_url(settings)}/api/migration/resume",
+                               timeout=30.0)
+                if r.status_code == 409:
+                    detail = r.json().get("detail") or {}
+                    console.print(f"[yellow]Cannot resume yet:[/yellow] "
+                                  f"{detail.get('message', 'storage is unavailable')}")
+                    raise typer.Exit(2)
+                r.raise_for_status()
+                body = r.json()
+                if body.get("status") == "no_migration":
+                    console.print("[green]No migration is pending.[/green]")
+                    return
+                console.print(f"[green]Resuming via the service[/green] — "
+                              f"{body.get('state') or 'rebuild started'}")
+                console.print("  Progress: `rag status`, /health, or the admin "
+                              "panel. Completed work is not repeated.")
+                return
+            except typer.Exit:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"[red]Could not ask the service to resume:[/red] {exc}")
+                raise typer.Exit(1)
+
+        backend = (getattr(settings, "storage_backend", "embedded") or "embedded").lower()
+        if backend != "embedded":
+            console.print(
+                f"[yellow]The service is not running.[/yellow]\n"
+                f"  storage_backend is '{backend}', so the engine this rebuild "
+                f"writes into is started by the service.\n"
+                f"  Start it (`rag service start`) — it resumes the rebuild "
+                f"automatically.")
+            raise typer.Exit(2)
 
         plan = relayout.active_plan(settings)
         if plan is None:

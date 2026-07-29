@@ -199,6 +199,15 @@ def compute_index_freshness(last_indexed, stale_after_hours: float = 24, now=Non
 
 
 
+class StorageWentAway(RuntimeError):
+    """The storage engine disappeared while an indexing run was in flight.
+
+    Distinct from an ordinary write failure on purpose: it means "stop, the
+    destination is gone" rather than "this file failed". Raised at a progress
+    boundary, so at most one committed window is lost.
+    """
+
+
 class QdrantOwner:
     """Holds Qdrant client + Encoder, protected by RLock.
 
@@ -245,6 +254,8 @@ class QdrantOwner:
         #: Written only under the mutex, read without it — a waiter must be able
         #: to ask "is the holder alive" precisely because it cannot take the lock.
         self._index_run: dict | None = None
+        #: "Is storage gone?" — set by the service lifespan; see set_storage_gate.
+        self._storage_gate = None
         self._registry = None
         self._frameworks = None
         self._capabilities = None
@@ -307,12 +318,29 @@ class QdrantOwner:
                            "last_tick": time.time(),
                            "done": 0, "total": 0, "phase": "starting"}
 
+    def set_storage_gate(self, gate) -> None:
+        """Register "is storage gone?" — checked at every progress boundary.
+
+        A callable returning a reason string when storage is unusable, or "".
+        Registered by the service lifespan so the owner stays free of engine
+        policy.
+        """
+        self._storage_gate = gate
+
     def _beat(self, done, total, phase) -> None:
         """Record that the running index is alive and where it has got to.
 
         Called from the single progress funnel of both indexers, so it cannot
         drift out of sync with the work: anything that reports progress to a
         caller reports liveness here by the same call.
+
+        **It is also where a run notices storage has gone away.** That makes this
+        the cancellation boundary the class already documents — progress is
+        reported between files and between committed windows, so stopping here
+        loses at most one window. Without it, an engine that died mid-migration
+        was rediscovered one exception at a time while the indexer went on
+        scanning, chunking and embedding a project whose every write would be
+        refused. That is the CPU the v3.2.0 incident burned for ten minutes.
         """
         run = self._index_run
         if run is None:  # a run that beats outside its own context; ignore
@@ -321,6 +349,15 @@ class QdrantOwner:
         run["done"] = done or 0
         run["total"] = total or 0
         run["phase"] = phase
+
+        gate = self._storage_gate
+        if gate is not None:
+            try:
+                reason = gate()
+            except Exception:  # noqa: BLE001 — a gate we cannot ask is not a stop
+                reason = ""
+            if reason:
+                raise StorageWentAway(reason)
 
     @contextmanager
     def _exclusive_index(self, what: str):
@@ -1443,38 +1480,93 @@ class QdrantOwner:
         return stats
 
     def rebuild(self) -> dict:
-        """Drop all data and rebuild from scratch. Thread-safe."""
-        with self._lock:
-            state_path = Path(self._settings.state_db)
+        """Drop all data and rebuild from scratch.
 
-            # Snapshot the state DB before we drop it. Best-effort — failures
-            # here must not block the rebuild itself (disk full, etc.).
-            try:
-                from ragtools.backup import backup_state_db, prune_backups
-                backup_state_db(self._settings, trigger="rebuild")
-                prune_backups(self._settings)
-            except Exception as e:
-                logger.warning("Pre-rebuild backup failed (non-fatal): %s", e)
+        **Excludes indexing, not merely other rebuilds.** This used to take
+        ``self._lock`` alone, while ``run_full_index`` takes ``_index_mutex`` and
+        holds ``self._lock`` only per 30-file window. Two different primitives
+        meant a rebuild could interleave at a window boundary and drop every
+        collection and delete the state DB *underneath a running migration*,
+        which then recreated the state DB and wrote into freshly emptied
+        collections. Exactly that was attempted during the v3.2.0 incident; it
+        failed only because the engine was already dead.
 
+        **The state DB is deleted last, and only once every collection is proven
+        to exist.** The backup covers the state DB — it does not cover vectors —
+        so an ordering that drops collections and then fails leaves a machine
+        with no index and no way back.
+        """
+        from ragtools.service import destructive
+
+        with self._exclusive_index("Rebuild") as acquired:
+            if acquired is None:
+                raise destructive.OperationRefused(
+                    "an indexing run is in progress; rebuild would drop the "
+                    "collections it is writing into", code="index_busy")
+            with self._lock:
+                return self._rebuild_locked()
+
+    def _rebuild_locked(self) -> dict:
+        from ragtools.service import destructive
+        from ragtools.service.activity import log_activity
+
+        state_path = Path(self._settings.state_db)
+        targets = list(self._router.all_collections())
+
+        # PRECONDITION BEFORE ANY MUTATION — including before the backup, which
+        # used to be the first thing that happened. A rebuild that cannot write
+        # must not start by taking a backup and dropping collections.
+        ok, detail = self.storage_reachable()
+        if not ok:
+            raise destructive.OperationRefused(
+                f"the vector store is not reachable ({detail}); refusing to drop "
+                f"an index that could not be rebuilt", code="storage_unreachable")
+
+        # Snapshot the state DB before we drop it. Best-effort — failures
+        # here must not block the rebuild itself (disk full, etc.).
+        try:
+            from ragtools.backup import backup_state_db, prune_backups
+            backup_state_db(self._settings, trigger="rebuild")
+            prune_backups(self._settings)
+        except Exception as e:
+            logger.warning("Pre-rebuild backup failed (non-fatal): %s", e)
+
+        destructive.record_intent(self._settings, {
+            "operation": "rebuild", "collections": targets,
+            "state_db": str(state_path),
+        })
+        try:
             # Force-drop and recreate EVERY collection (clean slate). In
             # per-project mode a rebuild that only cleared the shared collection
             # would leave every project's vectors in place and silently double
             # them on the re-index that follows.
-            for name in self._router.all_collections():
+            for name in targets:
                 recreate_collection(self._client, name, self._encoder.dimension)
-            self._ensured_collections = set(self._router.all_collections())
+            self._ensured_collections = set(targets)
 
-            # Delete state DB
+            # THE IRREVERSIBLE STEP IS GATED ON PROOF, NOT ON THE ABSENCE OF AN
+            # EXCEPTION. "recreate_collection did not raise" is a weaker claim
+            # than "the collection is there", and the state DB is the only
+            # record of what was indexed — once it is gone, a half-recreated
+            # store cannot even be diagnosed.
+            existing = {c.name for c in self._client.get_collections().collections}
+            missing = [n for n in targets if n not in existing]
+            if missing:
+                raise RuntimeError(
+                    f"refusing to delete the index state: {len(missing)} "
+                    f"collection(s) were not recreated ({', '.join(missing[:5])})")
+
             if state_path.exists():
                 state_path.unlink()
 
-            # Full index
-            from ragtools.service.activity import log_activity
             log_activity("info", "indexer", "Rebuild started — all data dropped")
             stats = self._run_full_index_inner()
             self._invalidate_map_cache()
+            self._stamp_index_identity()
             logger.info("Rebuild complete: %s", stats)
             return stats
+        finally:
+            destructive.clear_intent(self._settings)
 
     def _run_full_index_inner(self, project_id: str | None = None) -> dict:
         """Full index without acquiring lock (called from within locked context)."""
@@ -1518,6 +1610,34 @@ class QdrantOwner:
         snapshot marked ``stale`` + ``indexing`` instead of blocking. Callers
         render live-ish numbers with a spinner rather than freezing.
         """
+        # A DEAD ENGINE IS ANSWERED FROM CACHE, NOT BY ASKING IT 50 TIMES.
+        #
+        # `_collection_points` counts every collection, and `_count_points` makes
+        # TWO failing round-trips each before returning 0. Measured against a
+        # dead engine with 25 collections: 62 seconds — the whole of it holding
+        # `self._lock`, which is the same lock search and indexing need. One
+        # dashboard poll stalled the entire owner for a minute, and the dashboard
+        # polls this.
+        #
+        # The counts are also WRONG in that state, not merely slow: every one
+        # comes back 0, so the page reports a confidently empty, non-stale index
+        # beside a state DB saying 145,906 chunks. "Unknown" and "zero" lead to
+        # opposite conclusions and must not render identically.
+        reachable, detail = self.storage_reachable()
+        if not reachable:
+            snapshot = dict(self._status_snapshot or _EMPTY_STATUS)
+            snapshot.update({
+                "stale": True,
+                "storage_reachable": False,
+                "storage_error": detail,
+                # None, never 0 — the same distinction `POINTS_UNKNOWN` makes in
+                # the migration, applied where the number is actually shown.
+                "points_count": None,
+                "collections": [{**c, "points": None}
+                                for c in (snapshot.get("collections") or [])],
+            })
+            return snapshot
+
         acquired = self._lock.acquire(timeout=lock_timeout)
         if not acquired:
             snapshot = dict(self._status_snapshot or _EMPTY_STATUS)
@@ -1527,7 +1647,8 @@ class QdrantOwner:
         try:
             status = self._compute_status()
             self._status_snapshot = status
-            return dict(status, stale=False)
+            return dict(status, stale=False, storage_reachable=True,
+                        storage_error="")
         finally:
             self._lock.release()
 

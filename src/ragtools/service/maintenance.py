@@ -189,7 +189,13 @@ def build_default_tasks(owner, *, runtime=None) -> list[Task]:
         owner.get_status()
 
     def _storage_probe():
-        owner.storage_reachable()
+        # RAISE, don't just refresh. This called `storage_reachable()` and threw
+        # the answer away — and since that method never raises, the task recorded
+        # `last_ok = True` while the store was dead. A probe that cannot report a
+        # failure is not a probe; it warmed a cache.
+        ok, detail = owner.storage_reachable()
+        if not ok:
+            raise RuntimeError(f"the vector store is not reachable: {detail}")
 
     def _refresh_frameworks():
         # Framework corpora are not watcher-refreshed: they are keyed by build

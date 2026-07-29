@@ -579,6 +579,111 @@ a FAILING check; only the remedy — and therefore the category — differs.
 
 ---
 
+## Decision 22 — The Engine Has One Owner, For Its Whole Life
+
+**Context.** v3.2.0 shipped a class called `QdrantSupervisor` that supervised
+nothing after startup. Its handle was assigned once (`app.py:192`) and next read
+in the shutdown branch (`app.py:252`). The only two `.poll()` call sites in the
+entire engine stack were startup gates. So when the managed engine exited — four
+minutes into a migration on one machine, seven idle hours into a session on
+another — the service kept answering `/health` while every storage operation
+failed, indefinitely, with nothing anywhere recording the exit.
+
+**Decision.** `service/engine_lifecycle.py` owns the child process end to end,
+and it is the *only* owner. The outer service supervisor restarts the **service**;
+this restarts the **engine**; neither reaches into the other's job.
+
+* **Death is observed, not inferred.** A waiter thread blocks in `proc.wait()`.
+  Polling a socket answers "is it reachable"; waiting on the child answers "is it
+  gone", and with which code.
+* **Intent precedes action.** `request_stop()` sets the stopping flag *before* it
+  signals. A deliberate stop and a crash are indistinguishable from an exit code,
+  so the ordering is the only thing that separates them — and reversing it turns
+  every shutdown into a restart storm.
+* **Bounded, loud restarts.** 3 attempts, 2/15/60 s backoff, then
+  `restart_exhausted` as a reported state. An unexplained crash must not become an
+  unexplained restart loop.
+* **The manifest is invalidated at the moment of observed death**, not at
+  shutdown, closing the window in which a dead pid is still vouched for.
+
+**Ordering rule.** Instrumentation ships before supervision. A restart loop built
+around a crash nobody can explain only converts a silent death into a silent
+recovery — so Decision 23 is a prerequisite, not a companion.
+
+---
+
+## Decision 23 — A Child Process Is Never Given an Inherited Handle
+
+**Context.** `subprocess.Popen(cmd)` with no `stdout=` inherits the parent's
+handles. Under `ragw.exe` — a GUI-subsystem build with no console — the parent
+has none, so CPython's `_get_handles` creates an anonymous pipe, hands the child
+the write end, and closes the read end immediately. The child then holds a write
+handle to a pipe with **no reader**.
+
+This was measured, not reasoned about: such a child receives `ERROR_BROKEN_PIPE`
+— *"The process tried to write to a nonexistent pipe."* Writes fail immediately;
+they do not buffer or block. So the engine's every log line failed, for its whole
+life, and the cause of two crashes became undiagnosable by construction.
+
+**Decision.** Every spawned child gets an explicit sink. For the engine that is
+`data/logs/qdrant.log` (10 MB × 3, rotated **at start**, because the writer is a
+child holding the handle and renaming a file underneath it is how a log silently
+stops). A log that cannot be opened degrades to `DEVNULL` and is reported on
+`/health`. It never degrades to inheritance.
+
+**Two flags, and the second one matters as much as the first.** A supervised
+child gets `CREATE_NO_WINDOW` (the engine is a CONSOLE-subsystem image and would
+otherwise be handed a console) and must **never** get `DETACHED_PROCESS` —
+detaching it would silently break the `proc.wait()` Decision 22 depends on. That
+choice lives in `PlatformAdapter.child_process_flags()`, not behind a
+`sys.platform` test in the storage module: this project keeps every platform
+branch in `ragtools.platform`, and its own AST sweep enforces that.
+
+---
+
+## Decision 24 — Destructive Operations Prove Their Preconditions First
+
+**Context.** Four independent entry points reached `owner.rebuild()` —
+`/ui/rebuild`, `POST /api/rebuild`, `rag rebuild`, and the job worker — and not
+one asked whether the operation could succeed. The service already knew: `/health`
+was reporting `storage_unreachable` at that moment. The rebuild took a backup,
+started dropping collections, and surfaced a refused connection as HTTP 500.
+
+**Decision.** `service/destructive.py` is one gate consulted by all four, because
+four copies of a check is how three of them stay correct. It refuses when storage
+is unreachable, a migration is active, an index is running, or another destructive
+operation holds the lock — **before anything mutates**, including before the
+backup, which was previously the first thing to happen.
+
+A refusal is a *conflict*, not an error: the request is well-formed and the server
+is temporarily unable to honour it. `POST /api/rebuild` returns **409**; the CLI
+returns a categorised exit code; the UI returns an error fragment (htmx does not
+swap a 4xx, and a refusal the user cannot see is worse than one they can).
+
+**Ordering invariant.** `index_state.db` is deleted only after every target
+collection is *proven* to exist. "`recreate_collection` did not raise" is a weaker
+claim than "the collection is there", and the backup covers the state DB — it does
+not cover vectors.
+
+---
+
+## Decision 25 — Both Halves of a Compatibility Pair Move Together
+
+**Context.** v3.2.0 shipped `qdrant-client 1.18.0` against `qdrant 1.15.5` —
+three minors apart, outside the client's own support window, warning on every
+startup. Nobody chose that. The server was pinned by a source constant; the
+client by an unbounded `>=1.12.0` resolved fresh at build time. A warm developer
+machine sat on 1.17.1 and never saw it.
+
+**Decision.** The client requirement is bounded against `PINNED_QDRANT_VERSION`,
+and `scripts/check_qdrant_compat.py` runs on all three platforms before packaging.
+It rejects an **unbounded requirement on principle**, not merely a bad resolution —
+a build that is green by luck is not green. `psutil` is likewise declared rather
+than opportunistically imported, so an ownership proof cannot exist or not exist
+depending on the build venv.
+
+---
+
 ## Summary Table
 
 | # | Decision | Default | Locked |
@@ -604,3 +709,7 @@ a FAILING check; only the remedy — and therefore the category — differs.
 | 19 | Managed-engine ownership | Proven by child + API key + pid + image; manifest-gated | Yes |
 | 20 | Destructive sweeps | Allow-list only; unattributed collections reported, never deleted | Yes |
 | 21 | Selfcheck verdicts | Category exit codes 0/1/2/3/4; installer branches, never classifies | Yes |
+| 22 | Engine lifecycle ownership | One owner, whole life; waiter thread; intent-first stop; bounded restart | Yes |
+| 23 | Child process stdio | Explicit sink or DEVNULL — never inheritance | Yes |
+| 24 | Destructive preconditions | One shared guard, checked before any mutation; 409 not 500 | Yes |
+| 25 | Client/server pin | Bounded together; build gate on all platforms | Yes |

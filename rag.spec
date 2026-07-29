@@ -58,6 +58,13 @@ hiddenimports = (
         "qdrant_client.local",
         "qdrant_client.local.qdrant_local",
         "portalocker",
+        # Named explicitly, not left to analysis. Five modules import psutil
+        # inside `try:` blocks, and two of the four managed-engine ownership
+        # proofs — "the listener is our pid", "its image is our binary" —
+        # silently do not exist without it. It was missing from the v3.2.0
+        # bundle, so whether that boundary held depended on what happened to be
+        # in the build venv. A security property must not be decided by luck.
+        "psutil",
         # FastAPI + server extras
         "httptools",
         "websockets",

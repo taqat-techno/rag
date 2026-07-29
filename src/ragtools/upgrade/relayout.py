@@ -744,7 +744,26 @@ def run_pending(owner, settings, *, plan_id: Optional[int] = None,
                 pass
         try:
             if unit.kind == KIND_PROJECT:
-                owner.run_full_index(project_id=unit.unit_id)
+                stats = owner.run_full_index(project_id=unit.unit_id)
+                # A SKIPPED RUN IS NOT A COMPLETED ONE.
+                #
+                # `run_full_index` takes the index mutex NON-blocking and, when
+                # another run holds it, returns `{"busy": True}` without raising
+                # — a watcher tick is enough to cause that. This return value
+                # used to be discarded, so the unit was recorded DONE having
+                # been indexed zero times. Once `units_all_done` was separated
+                # from `validate`, that stopped merely stalling the plan and
+                # started FINISHING it: the migration completes, search comes
+                # back on, and the missing project answers "no matches" in the
+                # ordinary reassuring shape — the exact outcome this module
+                # exists to prevent.
+                if isinstance(stats, dict) and stats.get("busy"):
+                    logger.warning(
+                        "relayout: %s %s was SKIPPED (another indexing run holds "
+                        "the mutex); leaving it unfinished for the next pass "
+                        "rather than recording it as rebuilt",
+                        unit.kind, unit.unit_id)
+                    continue
                 after = _points_for_project(owner, unit.unit_id)
             else:
                 owner.sync_frameworks(refresh=True)

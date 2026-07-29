@@ -184,10 +184,16 @@ def make_handlers(get_owner) -> dict:
         return stats
 
     def rebuild_handler(job, ctx):
+        from ragtools.service import destructive
+
         owner = get_owner()
         ctx.progress(done=0, total=1, phase="rebuild")
         before = _count_points(owner)
-        stats = owner.rebuild()
+        # Same gate as every other door. A queued rebuild that runs hours later
+        # must re-check its preconditions at the moment it runs, not at the
+        # moment it was enqueued — storage state is not a property of the queue.
+        with destructive.destructive_operation(owner, operation="rebuild"):
+            stats = owner.rebuild()
         after = _count_points(owner)
         if isinstance(stats.get("projects"), set):
             stats["projects"] = sorted(stats["projects"])

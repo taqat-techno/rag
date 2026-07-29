@@ -4,11 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ragtools"
-version = "3.2.0"
+version = "3.3.0"
 description = "Local Markdown RAG system for Claude CLI"
 requires-python = ">=3.10"
 dependencies = [
-    "qdrant-client>=1.12.0",
+    # Bounded against the SERVER we ship. `PINNED_QDRANT_VERSION` in
+    # storage_managed.py pins the engine at 1.15.5, and the client's own rule is
+    # that majors must match and the minor gap must not exceed 1 — so 1.14-1.16
+    # is the supported window and anything outside it is a shipped mismatch.
+    #
+    # This was `>=1.12.0` with no upper bound, which is the same defect the `mcp`
+    # entry below documents: the two halves of a compatibility-critical pair were
+    # pinned by different mechanisms — one a source constant, one an unbounded
+    # range resolved fresh at build time — and nothing compared them. v3.2.0
+    # therefore shipped client 1.18.0 against server 1.15.5, three minors apart,
+    # emitting an incompatibility warning on every single startup, while the
+    # developer machine that never re-resolved stayed on 1.17.1 and saw nothing.
+    # `scripts/check_qdrant_compat.py` now fails the build before packaging.
+    "qdrant-client>=1.14.0,<1.17.0",
+    # Declared, not hoped for. Five modules import it opportunistically, and two
+    # of the four managed-engine ownership proofs — "the listener is our pid" and
+    # "its image is our binary" — silently do not exist without it. It was absent
+    # from the v3.2.0 bundle, so whether a security boundary held depended on
+    # whether an undeclared package happened to be in the build venv.
+    "psutil>=5.9.0",
     "sentence-transformers>=3.0.0",
     "scikit-learn>=1.3.0",  # PCA for the Knowledge Map (was undeclared/transitive — S15 §26.2)
     # `typer[all]` no longer provides that extra (warns on every install);

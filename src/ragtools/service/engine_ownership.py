@@ -205,10 +205,19 @@ def manifest_path(settings) -> Path:
 
 
 def write_manifest(settings, claim: EngineClaim) -> None:
+    """Record the claim ATOMICALLY. A torn manifest vouches for nothing.
+
+    `read_manifest` treats an unparseable file as "no proof", which is the safe
+    answer — but it is also a real claim thrown away, and the project already
+    ships `atomicio` for exactly this. A plain `write_text` interrupted by a
+    crash or a power loss is how an engine this installation genuinely owns
+    becomes unattributable to it.
+    """
     path = manifest_path(settings)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(claim.to_json(), encoding="utf-8")
+        from ragtools.atomicio import atomic_write_bytes
+
+        atomic_write_bytes(path, claim.to_json().encode("utf-8"))
     except OSError as exc:
         logger.warning("could not write the engine manifest at %s: %s", path, exc)
 
