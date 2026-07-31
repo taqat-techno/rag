@@ -337,6 +337,12 @@ class QdrantOwner:
         self._frameworks = None
         self._capabilities = None
         self._router = self._build_router(settings)
+        #: Changes the watcher saw while an index was being replaced. Durable,
+        #: so a service killed mid-rebuild still replays them at next boot.
+        #: Opened LAZILY — see `_pending_store`.
+        self._pending = None
+        self._pending_unavailable: str | None = None
+        self._pending_lock = threading.Lock()
         # Is the registry we just opened the one this index was built against?
         # Asked BEFORE anything writes: a registry that cannot be vouched for
         # must not mint identities or swap pointers, and the answer is also what
@@ -1727,6 +1733,228 @@ class QdrantOwner:
         self._emit_scale_warning_after_index(log_activity)
         return stats
 
+    # ------------------------------------------------------------------
+    # Changes observed while an index was being replaced
+    #
+    # A rebuild holds the index mutex for its whole duration, so every watcher
+    # tick during one is answered `busy`. That answer used to be discarded on
+    # the assumption that the next tick would pick the change up — but nothing
+    # schedules a next tick, and the rebuild rewrites the project's state rows
+    # from its own scan, so the edited file ends up recorded against the hash
+    # the rebuild read. The store kept pre-edit content with no pending work
+    # anywhere to correct it.
+    #
+    # Capture is cheap and happens only on the `busy`/error paths. Replay is
+    # the ORDINARY incremental indexer scoped to one project — no second
+    # pipeline — run AFTER that project's collection swap, so it writes into
+    # what the project is actually serving.
+    # ------------------------------------------------------------------
+
+    def _pending_path(self) -> Path:
+        return Path(self._settings.data_dir) / "pending_changes.db"
+
+    def _pending_store(self, *, create: bool = False):
+        """The durable change ledger, opened on first real need.
+
+        Lazily, and that is not an optimisation. Nothing is queued unless an
+        index run is already in progress, which for most installs is never — so
+        eagerly opening it would put a SQLite handle (and a file, and its WAL)
+        on every owner ever constructed for a mechanism that stays idle.
+
+        ``create=False`` is the read path: no file means nothing was ever
+        captured, which is an answer, not a reason to create one.
+        """
+        from ragtools.service.pending_changes import PendingChanges
+
+        with self._pending_lock:
+            if self._pending is not None:
+                return self._pending
+            if self._pending_unavailable is not None:
+                return None
+            path = self._pending_path()
+            if not create and not path.exists():
+                return None
+            try:
+                self._pending = PendingChanges(
+                    str(path), limit=self._settings.pending_change_limit)
+            except Exception as exc:  # noqa: BLE001 — never block indexing on it
+                self._pending_unavailable = str(exc)
+                logger.error(
+                    "Could not open the pending-change ledger (%s); changes made "
+                    "while an index is being replaced cannot be captured", exc)
+                return None
+            return self._pending
+
+    def capture_pending_changes(self, project_id: str, changes) -> dict:
+        """Durably record changes that could not be indexed right now.
+
+        ``changes`` is an iterable of ``(kind, absolute_path)`` where ``kind``
+        is ``"upsert"`` or ``"delete"`` — the watcher's vocabulary, not
+        watchfiles', so this layer stays free of the watcher's dependency.
+
+        A path whose project-relative identity cannot be resolved does not get
+        dropped: the project is flagged for a full re-scan instead. Degrade,
+        never discard.
+        """
+        from ragtools.service.pending_changes import KIND_DELETE, KIND_UPSERT
+
+        pending = self._pending_store(create=True)
+        if pending is None:
+            return {"status": "unavailable", "queued": 0, "project": project_id,
+                    "reason": self._pending_unavailable}
+
+        entries = []
+        for kind, raw_path in changes:
+            try:
+                rel = self._resolve_relative_path(project_id, Path(raw_path))
+            except Exception as exc:  # noqa: BLE001
+                pending.mark_rescan(
+                    project_id,
+                    f"a change to {raw_path!r} could not be attributed to a file "
+                    f"within the project ({exc}); the project needs a full re-scan")
+                return {"status": "marked", "queued": 0, "project": project_id}
+            entries.append(
+                (KIND_DELETE if kind == KIND_DELETE else KIND_UPSERT, rel, str(raw_path))
+            )
+        result = pending.record_many(project_id, entries)
+        if result.get("status") == "overflowed":
+            from ragtools.service.activity import log_activity
+            log_activity("warning", "watcher",
+                         f"Too many changes queued for '{project_id}' during a "
+                         f"rebuild — it will be fully re-scanned instead")
+        return result
+
+    def pending_changes_report(self) -> dict:
+        """What is still waiting to be replayed, and what failed trying.
+
+        A ledger that could not be OPENED reports ``pending_files: None``: a
+        count we could not take is not zero. A ledger that was never NEEDED
+        reports zero, because that is the true answer.
+        """
+        pending = self._pending_store()
+        if pending is None:
+            if self._pending_unavailable is not None:
+                return {"available": False, "reason": self._pending_unavailable,
+                        "pending_files": None, "projects": {},
+                        "rescan_required": {}, "failures": {}}
+            return {"available": True, "pending_files": 0, "projects": {},
+                    "rescan_required": {}, "failures": {},
+                    "limit": self._settings.pending_change_limit}
+        return {"available": True, **pending.report()}
+
+    def _projects_awaiting_replay(self) -> list:
+        """Projects still holding captured work. Empty if nothing was captured."""
+        pending = self._pending_store()
+        if pending is None:
+            return []
+        try:
+            return pending.projects_with_work()
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not list projects awaiting replay")
+            return []
+
+    def _replay_pending(self, project_id: str, *,
+                        stamp_identity: bool = True) -> dict | None:
+        """Replay one project's captured changes. The mutex must ALREADY be held.
+
+        Returns ``None`` when the project had nothing outstanding — the common
+        case, and free. Never raises: a rebuild that worked must not be
+        reported as failed because the replay after it did not, and the failure
+        is recorded rather than swallowed (the rows stay, so the next boot
+        retries them).
+
+        ``stamp_identity`` belongs to the caller that just swapped this
+        project's collection. A caller that did NOT swap must leave the stamp
+        alone: the recorded mapping is still the true one, and re-stamping it
+        for a project whose rebuild failed would assert something the run did
+        not establish.
+        """
+        from ragtools.service.activity import log_activity
+
+        pending = self._pending_store()
+        if pending is None:
+            return None
+        try:
+            claim = pending.claim(project_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Could not read pending changes for %s", project_id)
+            return {"project": project_id, "ok": False, "error": str(exc),
+                    "files": 0, "indexed": None, "deleted": None}
+        if claim is None:
+            return None
+
+        logger.info("Replaying changes captured during the rebuild — %s",
+                    claim.describe())
+        # The swap and `_replace_state_rows` have both happened, so the state
+        # rows now describe the collection the project serves. Say so before
+        # the replay reads them: otherwise the per-project identity guard sees
+        # the pre-swap stamp, distrusts every hash, and the replay re-embeds
+        # the whole project the rebuild has just finished embedding.
+        if stamp_identity:
+            self._stamp_index_identity([project_id])
+        try:
+            stats = self._run_incremental_index_locked(project_id=project_id)
+        except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+            pending.record_failure(project_id, str(exc))
+            logger.exception("Replaying changes for %s failed", project_id)
+            log_activity(
+                "error", "indexer",
+                f"Changes made to '{project_id}' while its index was being "
+                f"replaced could not be replayed ({exc}); they are still queued "
+                f"and will be retried when the service next starts")
+            return {"project": project_id, "ok": False, "error": str(exc),
+                    "files": len(claim.files), "indexed": None, "deleted": None,
+                    "rescan": claim.is_rescan}
+
+        # `_run_incremental_index_locked` is the pipeline itself, not a wrapper,
+        # so it cannot answer `busy` — but if it ever did, consuming the claim
+        # would discard the work it declined to do.
+        if stats.get("busy"):
+            pending.record_failure(
+                project_id, "the replay was skipped because an index run was in progress")
+            return {"project": project_id, "ok": False, "files": len(claim.files),
+                    "error": "busy", "indexed": None, "deleted": None}
+
+        removed = pending.consume(claim)
+        result = {"project": project_id, "ok": True, "files": len(claim.files),
+                  "consumed": removed, "indexed": stats.get("indexed", 0),
+                  "deleted": stats.get("deleted", 0), "rescan": claim.is_rescan}
+        if result["indexed"] or result["deleted"]:
+            log_activity(
+                "success", "indexer",
+                f"Replayed changes made to '{project_id}' during the rebuild: "
+                f"{result['indexed']} indexed, {result['deleted']} deleted")
+        return result
+
+    def replay_pending_changes(self, project_id: str | None = None) -> dict:
+        """Replay everything outstanding. Takes the index mutex itself.
+
+        The recovery entry point: called at service start so a rebuild that was
+        interrupted — by a crash, a restart, or the window being closed — does
+        not leave the changes it swallowed stranded on disk for ever.
+        """
+        available = self._pending_unavailable is None
+        targets = ([project_id] if project_id else self._projects_awaiting_replay())
+        if not targets:
+            return {"replayed": [], "busy": False, "available": available}
+
+        with self._exclusive_index("Replay of pending changes") as acquired:
+            if acquired is None:
+                # Not a failure and not a loss: the rows are durable, and the
+                # run that holds the mutex either replays them itself or leaves
+                # them for the next attempt.
+                return {"replayed": [], "busy": True, "available": available}
+            results = []
+            for pid in targets:
+                # This caller did NOT swap anything, so it must not re-stamp a
+                # project's identity. If the guard then distrusts the project's
+                # hashes the replay re-indexes all of it — the expensive answer,
+                # and the safe direction.
+                outcome = self._replay_pending(pid, stamp_identity=False)
+                if outcome is not None:
+                    results.append(outcome)
+        return {"replayed": results, "busy": False, "available": available}
+
     def rebuild(self) -> dict:
         """Drop all data and rebuild from scratch.
 
@@ -1821,7 +2049,7 @@ class QdrantOwner:
 
         stats = {"files_indexed": 0, "chunks_indexed": 0, "deleted": 0,
                  "projects": [], "failed_projects": [], "empty_projects": {},
-                 "status": "completed"}
+                 "replayed": [], "replay_failures": [], "status": "completed"}
         rebuilt: list[str] = []
         failed: list[str] = []
         for project in projects:
@@ -1837,6 +2065,9 @@ class QdrantOwner:
                     "error", "indexer",
                     f"Rebuild failed for project '{project.id}': {exc} — its "
                     f"previous index was left in place")
+                # The project kept its previous index, so whatever the watcher
+                # captured still applies to it. Leave the queue alone; the next
+                # successful run replays it.
                 continue
             stats["files_indexed"] += result["files_indexed"]
             stats["chunks_indexed"] += result["chunks_indexed"]
@@ -1844,6 +2075,37 @@ class QdrantOwner:
             if result.get("empty_reason"):
                 stats["empty_projects"][project.id] = result["empty_reason"]
             rebuilt.append(project.id)
+
+            # AFTER this project's swap, and only this project's. Replaying
+            # before it would write into the collection that is about to be
+            # superseded; replaying every project at the end would leave a
+            # partial rebuild — some projects swapped, some not — with the
+            # already-swapped ones still stale.
+            replay = self._replay_pending(project.id)
+            if replay is not None:
+                stats["replayed"].append(replay)
+                if not replay.get("ok"):
+                    stats["replay_failures"].append(project.id)
+
+        # A change to a project whose replay has ALREADY run — it arrived later
+        # in the rebuild, while a different project was being replaced — has no
+        # second post-swap moment to be picked up at, and the watcher will not
+        # wake again until the filesystem moves. Sweep once more before the
+        # mutex is released, so "current afterwards" does not depend on the
+        # user happening to edit something else.
+        #
+        # ONE pass over a snapshot: work arriving during the sweep is left for
+        # the next tick or the next boot, which terminates. Only a project this
+        # run actually swapped may re-stamp its identity.
+        already = {r["project"] for r in stats["replayed"]}
+        for pid in self._projects_awaiting_replay():
+            if pid in already:
+                continue
+            outcome = self._replay_pending(pid, stamp_identity=pid in rebuilt)
+            if outcome is not None:
+                stats["replayed"].append(outcome)
+                if not outcome.get("ok"):
+                    stats["replay_failures"].append(pid)
 
         stats["projects"] = sorted(rebuilt)
         stats["failed_projects"] = failed
@@ -1872,6 +2134,19 @@ class QdrantOwner:
             log_activity("success", "indexer",
                          f"Rebuild: {stats['files_indexed']} files, "
                          f"{stats['chunks_indexed']} chunks")
+
+        # Reported whether or not the rebuild itself succeeded. A replay that
+        # failed means those projects are serving content the user has already
+        # changed, which is precisely the condition this whole mechanism exists
+        # to make visible rather than silent.
+        if stats["replay_failures"]:
+            logger.error("Changes captured during the rebuild could not be "
+                         "replayed for: %s", ", ".join(stats["replay_failures"]))
+            log_activity(
+                "error", "indexer",
+                f"Rebuild finished, but changes made during it could not be "
+                f"replayed for {', '.join(stats['replay_failures'])} — they are "
+                f"still queued and will be retried at the next start")
         return stats
 
     @staticmethod
@@ -2879,7 +3154,7 @@ class QdrantOwner:
         the .db file locked, so skipping them leaves files that cannot be
         deleted or replaced on restart.
         """
-        for registry in (self._registry, self._frameworks):
+        for registry in (self._registry, self._frameworks, self._pending):
             if registry is not None:
                 try:
                     registry.close()
@@ -2887,6 +3162,11 @@ class QdrantOwner:
                     pass
         self._registry = None
         self._frameworks = None
+        self._pending = None
+        # Not merely cleared: `_pending_store` opens on demand, so a stray call
+        # after close would silently hand out a fresh handle on a file the
+        # caller believes this owner has let go of.
+        self._pending_unavailable = "the owner has been closed"
         try:
             del self._client
         except Exception:

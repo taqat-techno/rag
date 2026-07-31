@@ -495,6 +495,12 @@ class Settings(BaseSettings):
     # State
     state_db: str = Field(default_factory=_default_state_db)
 
+    # Ceiling on distinct files queued per project while that project's index is
+    # being replaced (rebuild / re-layout). Past it the queue degrades to a
+    # recorded "this project needs a full re-scan" marker — see
+    # ``service/pending_changes.py``. Never a silent drop.
+    pending_change_limit: int = 2000
+
     # Ignore rules (global — apply to all projects)
     ignore_patterns: list[str] = Field(default_factory=list)
     use_ragignore_files: bool = True
