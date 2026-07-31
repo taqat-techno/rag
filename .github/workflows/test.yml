@@ -8,6 +8,14 @@ on:
 
 jobs:
   test:
+    # Finite by policy — see the header of release-validation.yml. A job with no
+    # timeout can sit unstarted forever, and because GitHub seals a run's job
+    # logs until the run completes, one such job withholds the logs of every
+    # other job in the run, including the ones that actually failed.
+    #
+    # The same suite as release-validation's `suite` (observed 11-25 min) plus
+    # coverage instrumentation and a cached model download.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

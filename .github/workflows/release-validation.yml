@@ -9,6 +9,10 @@
 # `validate_release.py` treats a check with no evidence as MANUAL, and MANUAL
 # blocks the verdict. A green workflow with unrun rows would be the same
 # manufactured pass the gate exists to prevent.
+#
+# The three first-class platforms are Windows, Linux, and macOS ARM64. macOS
+# Intel x86_64 is best-effort — no Intel artifact is built or published — and is
+# validated in its own non-blocking job; see `suite-macos-intel` below.
 
 name: release-validation
 
@@ -24,16 +28,32 @@ on:
       - ".github/workflows/release-validation.yml"
 
 jobs:
+  # EVERY job in this file carries a finite `timeout-minutes`. That is not
+  # paperwork, it is the fix for a specific incident.
+  #
+  # On the v3.5.0 run (30653097391) `suite (macos-13)` was queued at 17:55:30Z
+  # and never started — no runner was ever allocated to it. At the time exactly
+  # ONE job here had a timeout (`real-upgrade`), so nothing bounded that wait
+  # and the run could not conclude. GitHub seals a run's job logs until the run
+  # completes, so one unstartable job sealed the logs of a genuinely FAILED one
+  # (`packaged v3.3.0 -> this build`) for hours; the run had to be cancelled by
+  # hand to release the evidence.
+  #
+  # So: a job without a timeout does not merely risk wasting a runner. It can
+  # withhold the diagnosis of an unrelated failure. The values below come from
+  # durations observed on that run with roughly 2x headroom — long enough that a
+  # slow but healthy leg is never killed, short enough that a stalled one cannot
+  # hold the evidence hostage.
   suite:
     name: suite (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45          # observed 11-25 min
     strategy:
       fail-fast: false
       matrix:
-        # macos-14 is arm64; macos-13 is x86_64. Both are shipped targets, so
-        # both are validated — an adapter that only works on Apple Silicon is
-        # not a macOS adapter.
-        os: [ubuntu-latest, macos-14, macos-13, windows-latest]
+        # RELEASE-BLOCKING platforms only. macOS Intel is validated too, but
+        # best-effort and in its own job — see `suite-macos-intel` for why.
+        os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,9 +64,64 @@ jobs:
       - name: Full suite
         run: python -m pytest -q
 
+  suite-macos-intel:
+    # macOS PLATFORM POLICY — stated here because this file used to state the
+    # opposite:
+    #
+    #   * macOS arm64 (Apple Silicon) — FIRST-CLASS and RELEASE-BLOCKING.
+    #     `release.yml` builds macOS on `macos-14` and publishes
+    #     `RAGTools-<version>-macOS-arm64.zip`.
+    #   * macOS Intel x86_64 — BEST-EFFORT. No Intel artifact is built or
+    #     published by ANY release: `release.yml` has exactly one macOS job and
+    #     it uploads exactly one asset, the arm64 zip.
+    #
+    # The comment this replaces sat on the `suite` matrix and claimed macos-14
+    # and macos-13 were both "shipped targets". They are not, and the false
+    # claim was load-bearing in the worst direction: it let a leg with no
+    # artifact behind it block a release, which is how an unallocatable
+    # `macos-13` runner came to hold the whole v3.5.0 validation run open.
+    #
+    # Best-effort is not unwatched. This leg still runs and still reports an
+    # explicit result — pass, fail, or unsupported (a retired runner label fails
+    # the job immediately, which is the honest answer). It simply cannot fail
+    # the workflow, and its short timeout means it cannot stall it either. The
+    # day a real Intel artifact is built and published, move it back into the
+    # blocking matrix above — not before.
+    name: suite (macos-13, Intel — best-effort)
+    runs-on: macos-13
+    continue-on-error: true
+    timeout-minutes: 30          # deliberately below the blocking legs' 45
+    outputs:
+      # The gate reads THIS, not `needs.suite-macos-intel.result`. A job with
+      # `continue-on-error: true` reports success to `needs` even when it
+      # failed, so the result field cannot tell pass from fail here — and a
+      # best-effort leg that always renders as "PASS" is worse than no leg at
+      # all. An absent verdict means the job never got far enough to record one.
+      verdict: ${{ steps.verdict.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with dev extras
+        run: python -m pip install -e ".[dev]"
+      - name: Full suite
+        id: pytest
+        run: python -m pytest -q
+      - name: Record an explicit verdict for the gate
+        if: always()
+        id: verdict
+        run: |
+          if [ "${{ steps.pytest.outcome }}" = "success" ]; then
+            echo "verdict=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "verdict=fail" >> "$GITHUB_OUTPUT"
+          fi
+
   linux-adapter:
     name: Linux adapter against real systemd
     runs-on: ubuntu-latest
+    timeout-minutes: 15          # observed 2-5 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -62,6 +137,7 @@ jobs:
   macos-adapter:
     name: macOS adapter against real launchd
     runs-on: macos-14
+    timeout-minutes: 20          # observed 2-5 min; macOS runners provision slowest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -116,6 +192,7 @@ jobs:
   clean-install:
     name: clean install of the built wheel (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25          # observed 5-10 min
     strategy:
       fail-fast: false
       matrix:
@@ -162,6 +239,7 @@ jobs:
   windows-autostart:
     name: autostart lifecycle against real Task Scheduler
     runs-on: windows-latest
+    timeout-minutes: 20          # observed 2-5 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -183,6 +261,7 @@ jobs:
   storage-backends:
     name: storage backends (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25          # observed 5-10 min
     strategy:
       fail-fast: false
       matrix:
@@ -204,6 +283,7 @@ jobs:
   posix-upgrade:
     name: packaged upgrade (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 35          # builds a --no-model bundle, like bundle-contract (~10 min)
     strategy:
       fail-fast: false
       matrix:
@@ -229,6 +309,7 @@ jobs:
   bundle-contract:
     name: built bundle contract (windows)
     runs-on: windows-latest
+    timeout-minutes: 30          # observed ~10 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -251,7 +332,7 @@ jobs:
   real-upgrade:
     name: packaged v${{ matrix.from }} -> this build, on a real machine
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 90          # observed ~48 min; the only job that already had one
     strategy:
       fail-fast: false
       matrix:
@@ -351,6 +432,7 @@ jobs:
   upgrade-rehearsal:
     name: upgrade rehearsal (synthesised layout)
     runs-on: windows-latest
+    timeout-minutes: 20          # one script against a synthesised layout
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -365,22 +447,80 @@ jobs:
 
   gate:
     name: release gate
-    needs: [suite, linux-adapter, macos-adapter, clean-install, windows-autostart,
-            bundle-contract, real-upgrade, upgrade-rehearsal, storage-backends,
-            posix-upgrade]
+    needs: [suite, suite-macos-intel, linux-adapter, macos-adapter, clean-install,
+            windows-autostart, bundle-contract, real-upgrade, upgrade-rehearsal,
+            storage-backends, posix-upgrade]
+    # Not the default (`needs` all succeeded): a gate that only runs when
+    # everything already passed can never report a failure, and reporting the
+    # failure is the whole job. Not `always()` either — a run someone cancelled
+    # in order to reach its logs must not then be held open by this job.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10          # echoes and one comparison loop
     steps:
       - uses: actions/checkout@v4
-      - name: Report what is still unrun
-        # The gate is not "did CI go green" — it is "did every required row
-        # execute". Rows needing a reboot, a destructive uninstall or a signing
-        # identity are still outstanding, and this says so out loud rather than
-        # letting a green tick imply otherwise.
+
+      - name: Summarise every leg, and fail if a release-blocking one did not pass
+        # Until now this job `echo`ed and asserted NOTHING. It went green while
+        # jobs it named in `needs` had failed, because a job whose own steps all
+        # succeed succeeds — so "did every required leg pass" was not a question
+        # the release gate could answer. That is how a gate becomes decoration.
+        shell: bash
+        env:
+          # RELEASE-BLOCKING. Anything other than `success` fails this gate.
+          BLOCKING: |
+            suite ${{ needs.suite.result }}
+            linux-adapter ${{ needs.linux-adapter.result }}
+            macos-adapter ${{ needs.macos-adapter.result }}
+            clean-install ${{ needs.clean-install.result }}
+            windows-autostart ${{ needs.windows-autostart.result }}
+            storage-backends ${{ needs.storage-backends.result }}
+            posix-upgrade ${{ needs.posix-upgrade.result }}
+            bundle-contract ${{ needs.bundle-contract.result }}
+            real-upgrade ${{ needs.real-upgrade.result }}
+            upgrade-rehearsal ${{ needs.upgrade-rehearsal.result }}
+          # BEST-EFFORT. Reported out loud, never decisive.
+          INTEL_VERDICT: ${{ needs.suite-macos-intel.outputs.verdict }}
         run: |
-          echo "Automated rows validated by this workflow."
-          echo "STILL OUTSTANDING and NOT covered here:"
+          set -uo pipefail
+          blocked=0
+
+          echo "RELEASE-BLOCKING legs"
+          while read -r job result; do
+            [ -n "${job:-}" ] || continue
+            if [ "$result" = "success" ]; then
+              printf '  PASS         %-22s (%s)\n' "$job" "$result"
+            else
+              printf '  NOT PASSED   %-22s (%s)\n' "$job" "$result"
+              blocked=$((blocked + 1))
+            fi
+          done <<< "$BLOCKING"
+
+          echo ""
+          echo "BEST-EFFORT legs - informational, cannot block a release"
+          case "${INTEL_VERDICT:-}" in
+            pass) intel="PASS" ;;
+            fail) intel="FAIL" ;;
+            # No verdict recorded: the runner was never allocated, the label has
+            # been retired, or the leg hit its timeout. All three are "we do not
+            # know", and none of them is a pass.
+            *)    intel="UNSUPPORTED" ;;
+          esac
+          printf '  %-12s %-22s (%s)\n' "$intel" "suite-macos-intel" \
+            "macOS Intel x86_64: best-effort, no Intel artifact is built or published"
+
+          echo ""
+          echo "STILL OUTSTANDING and NOT covered by this workflow at all:"
           echo "  - autostart on a NON-ADMIN account (runners are administrators,"
           echo "    which is what hid the /sc onlogon defect in the first place)"
           echo "  - the OS actually firing an at-logon trigger at logon"
           echo "  - signed and notarized artifacts (needs signing identities)"
           echo "Release requires these to be executed and recorded separately."
+
+          echo ""
+          if [ "$blocked" -ne 0 ]; then
+            echo "RELEASE GATE: FAILED - $blocked release-blocking leg(s) did not pass."
+            exit 1
+          fi
+          echo "RELEASE GATE: every release-blocking leg passed."
+          echo "That is necessary, not sufficient - see the outstanding rows above."
