@@ -212,7 +212,13 @@ def search(
             console.print(f"\n[bold]Results for:[/bold] '{query}'\n")
             for i, result in enumerate(data["results"], 1):
                 heading_str = " > ".join(result["headings"]) if result["headings"] else "N/A"
-                console.print(f"[{i}] ({result['score']:.3f}) {result['project_id']}/{result['file_path']} | {heading_str}")
+                # Say when a hit came from a vendored dependency rather than the
+                # project's own code — the CLI showed the two identically, so
+                # the one surface a user reads most said the least.
+                tag = ""
+                if result.get("scope") == "framework":
+                    tag = f" [framework: {result.get('scope_source') or 'shared dependency'}]"
+                console.print(f"[{i}] ({result['score']:.3f}) {result['project_id']}/{result['file_path']}{tag} | {heading_str}")
                 text = result["text"]
                 console.print(f"    {text[:200]}{'...' if len(text) > 200 else ''}")
                 console.print()
@@ -223,16 +229,28 @@ def search(
             raise typer.Exit(1)
     else:
         # Direct mode
+        router = None
         try:
+            from ragtools.collection_router import build_router
             from ragtools.embedding.encoder import Encoder
             from ragtools.retrieval.formatter import format_context_brief
             from ragtools.retrieval.searcher import Searcher
 
             client = settings.get_qdrant_client()
             encoder = Encoder(settings.embedding_model)
-            searcher = Searcher(client=client, encoder=encoder, settings=settings)
+            # Routed, exactly as the service routes. An unrouted offline search
+            # under per_project reads the legacy collection name, which names
+            # nothing — so `rag search` reported "no results" for the same
+            # query the service answers.
+            router, _reg, _fw = build_router(settings)
+            searcher = Searcher(client=client, encoder=encoder, settings=settings,
+                                router=router)
 
-            results = searcher.search(query=query, project_id=project, top_k=top_k)
+            results = searcher.search(
+                query=query, project_id=project, top_k=top_k,
+                collections=router.read_collections(project_id=project),
+                collection_scoped=router.is_per_project,
+            )
             if not results:
                 console.print(f"[yellow]No results found for:[/yellow] '{query}'")
                 raise typer.Exit(0)
@@ -245,6 +263,10 @@ def search(
         except Exception as e:
             console.print(f"[red]Search failed:[/red] {e}")
             raise typer.Exit(1)
+        finally:
+            # SQLite handles; on Windows a leaked one locks registry.db.
+            if router is not None:
+                router.close()
 
 
 @app.command()

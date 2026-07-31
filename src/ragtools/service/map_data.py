@@ -20,6 +20,7 @@ import numpy as np
 from qdrant_client import QdrantClient
 
 from ragtools.config import Settings
+from ragtools.identity import is_framework_collection_name
 
 logger = logging.getLogger("ragtools.service.map")
 
@@ -216,7 +217,9 @@ def compute_map_points(
                              "reason": f"vector fetch failed: {type(exc).__name__}"})
             logger.warning("Map: vector fetch failed for %s: %s", name, exc)
             continue
-        is_framework = name.startswith("fw_")
+        # One predicate answers "what kind of collection is this" (R08); this
+        # was the third independent spelling of it.
+        is_framework = is_framework_collection_name(name)
         for fp, vecs in fetched.items():
             if not vecs:
                 continue
