@@ -96,6 +96,21 @@ def _migration_remedy(settings) -> str:
         return "restart the service — it resumes the rebuild automatically"
 
 
+def _collection_display() -> str:
+    """What to SHOW as the knowledge base's identity — never a name to query.
+
+    ``settings.collection_name`` names no collection under ``per_project``: the
+    installed v3.4 machine held 15 ``proj_<uuid>`` collections and none called
+    ``markdown_kb``, yet ``/health`` and ``/api/config`` both reported that name
+    as the index's identity. The router is the only thing that knows what is
+    actually there.
+    """
+    try:
+        return get_owner().router.display_name()
+    except Exception:  # noqa: BLE001 — a label must never fail an endpoint
+        return ""
+
+
 @router.get("/health")
 def health():
     """Readiness probe. Returns 200 when encoder loaded + Qdrant open.
@@ -259,7 +274,10 @@ def health():
             # it is down because the engine is down with it.
             "retry": _migration_remedy(owner.settings),
         }),
-        "collection": owner.settings.collection_name,
+        # The KEY is pinned (Decision 16, and `process._is_ragtools_health`
+        # uses its presence as the anti-impersonation marker); only the VALUE
+        # moved off the legacy setting onto what the router actually routes.
+        "collection": _collection_display(),
         "version": __version__,
         "watcher_running": watcher_running,
         "storage_reachable": storage_ok,
@@ -662,16 +680,22 @@ def rebuild():
             "code": refused.code,
             "message": refused.reason,
         })
+    # A run with failures is not a success, and must not read as one anywhere:
+    # not in the toast, and not in a body whose only clue is buried in `stats`.
+    failed = list(stats.get("failed_projects") or [])
     try:
         from ragtools.service.notify import notify_rebuild_complete
         notify_rebuild_complete(
             get_settings(),
             files=stats.get("files_indexed", 0),
             chunks=stats.get("chunks_indexed", 0),
+            failed_projects=failed,
         )
     except Exception as e:
         logger.debug("rebuild-complete toast failed (non-fatal): %s", e)
-    return {"stats": stats}
+    return {"stats": stats,
+            "status": stats.get("status", "completed"),
+            "failed_projects": failed}
 
 
 @router.post("/api/migration/resume")
@@ -1625,7 +1649,11 @@ def config():
         "chunk_overlap": settings.chunk_overlap,
         "top_k": settings.top_k,
         "score_threshold": settings.score_threshold,
-        "collection_name": settings.collection_name,
+        # The ROUTED identity, not the legacy setting — this endpoint is what
+        # the admin panel's config card and the MCP `get_config` tool render,
+        # and under `per_project` `settings.collection_name` names nothing that
+        # exists. `collection_strategy` below says which layout produced it.
+        "collection_name": _collection_display(),
         "ignore_patterns": settings.ignore_patterns,
         "use_ragignore_files": settings.use_ragignore_files,
         "service_port": settings.service_port,

@@ -391,9 +391,27 @@ def notify_rebuild_complete(
     files: int,
     chunks: int,
     notifier: Optional[DesktopNotifier] = None,
+    failed_projects=(),
 ) -> bool:
-    """Called when `Rebuild Knowledge Base` finishes."""
+    """Called when `Rebuild Knowledge Base` finishes.
+
+    ``failed_projects`` is what stops a partial run announcing itself as a
+    complete one. A rebuild now proceeds project by project, so some can fail
+    while the rest succeed — and "Knowledge base rebuilt" over a run that left
+    projects on their previous index is the same lie ``/health`` told for twelve
+    hours after the v3.4 incident.
+    """
     n = notifier or get_shared_notifier(settings)
+    failed = list(failed_projects or ())
+    if failed:
+        return n.notify(
+            kind="rebuild_complete",
+            title="Knowledge base rebuild incomplete",
+            message=(f"{len(failed)} project(s) failed and kept their previous "
+                     f"index ({', '.join(failed)}). Rebuilt: "
+                     f"{_format_count(files)} files, {_format_count(chunks)} chunks."),
+            deep_link=_admin_url(settings),
+        )
     return n.notify(
         kind="rebuild_complete",
         title="Knowledge base rebuilt",

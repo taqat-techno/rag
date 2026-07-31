@@ -54,7 +54,16 @@ def test_health(test_client):
 
 
 def test_health_includes_version_and_watcher(test_client):
-    """Phase A — additive contract on /health 200 (Decision 16)."""
+    """Phase A — additive contract on /health 200 (Decision 16).
+
+    ``collection`` is now the ROUTER's label, not ``settings.collection_name``:
+    under ``per_project`` no collection carries the configured name, so /health
+    was reporting a nonexistent collection as the knowledge base's identity.
+    This fixture is ``shared``, where the configured name IS the collection, so
+    the value is unchanged — that equivalence is the compatibility being pinned.
+    The KEY itself is load-bearing beyond display: ``_is_ragtools_health`` uses
+    its presence as the anti-impersonation marker.
+    """
     r = test_client.get("/health")
     assert r.status_code == 200
     body = r.json()

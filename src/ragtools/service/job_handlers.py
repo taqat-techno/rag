@@ -210,8 +210,12 @@ def make_handlers(get_owner) -> dict:
         if isinstance(stats.get("projects"), set):
             stats["projects"] = sorted(stats["projects"])
         # A rebuild is verified when we can see the collection repopulated to the
-        # count the run itself reported.
-        ctx.verified = (after is not None and after >= int(stats.get("chunks_indexed", 0) or 0))
+        # count the run itself reported — and when every project it was asked to
+        # rebuild actually was one. A run that skipped a failed project still
+        # satisfies the count, because that project kept its previous points.
+        ctx.verified = (after is not None
+                        and after >= int(stats.get("chunks_indexed", 0) or 0)
+                        and not stats.get("failed_projects"))
         return {**stats, "points_before": before, "points_after": after}
 
     def purge_handler(job, ctx):

@@ -471,6 +471,30 @@ def index_status() -> str:
     return _direct_index_status()
 
 
+def _collection_display(settings) -> str:
+    """What to SHOW an agent as the knowledge base's identity.
+
+    Never a name to query. ``settings.collection_name`` names no collection
+    under ``per_project`` — the installed v3.4 machine held 15 ``proj_<uuid>``
+    collections and no ``markdown_kb`` — so ``get_config`` and ``index_status``
+    were reporting a nonexistent collection as the index.
+
+    Direct mode has no service to ask, so it builds a router and CLOSES it: the
+    registries hold SQLite handles and a leaked one keeps ``registry.db`` locked
+    on Windows.
+    """
+    try:
+        from ragtools.collection_router import build_router
+
+        router, _reg, _fw = build_router(settings)
+        try:
+            return router.display_name()
+        finally:
+            router.close()
+    except Exception:  # noqa: BLE001 — a label must never fail a tool call
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # OPTIONAL tools — registered per settings.mcp_tools
 # Each has a WHEN / DO NOT USE first-line docstring to guide agent selection.
@@ -585,7 +609,7 @@ def get_config() -> dict:
             "chunk_overlap": s.chunk_overlap,
             "top_k": s.top_k,
             "score_threshold": s.score_threshold,
-            "collection_name": s.collection_name,
+            "collection_name": _collection_display(s),
             "service_host": s.service_host,
             "service_port": s.service_port,
             "log_level": s.log_level,
@@ -1791,8 +1815,18 @@ def _direct_index_status() -> str:
     try:
         client = _get_direct_client()
         from ragtools.collection_router import build_router
+        # The router holds SQLite handles; a leaked one keeps registry.db locked
+        # on Windows, so it is closed on every path out of this block.
         router, _reg, _fw = build_router(_settings)
-        names = router.all_collections()
+        try:
+            names = router.all_collections()
+            # The same label the service reports on /api/status, so proxy mode
+            # and direct mode name the knowledge base identically. It replaces
+            # a fall back to `_settings.collection_name`, which under
+            # `per_project` named a collection Qdrant does not have.
+            collection_name = router.display_name()
+        finally:
+            router.close()
         # Aggregate across every routed collection — reading only the shared
         # one reports 0 chunks on a per-project install.
         count = 0
@@ -1801,8 +1835,6 @@ def _direct_index_status() -> str:
                 count += int(client.get_collection(name).points_count or 0)
             except Exception:  # noqa: BLE001 — a not-yet-created collection is 0
                 continue
-        collection_name = ", ".join(names) if len(names) > 1 else (
-            names[0] if names else _settings.collection_name)
 
         if count == 0:
             return (

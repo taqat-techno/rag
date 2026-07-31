@@ -48,6 +48,20 @@ _LEVEL_BADGE = {
 }
 
 
+def _collection_display() -> str:
+    """What to SHOW as the knowledge base's identity — never a name to query.
+
+    The diagnostics identity card and the config card both printed
+    ``settings.collection_name``. Under ``per_project`` no collection carries
+    that name (15 ``proj_<uuid>`` collections on the installed v3.4 machine),
+    so both cards named something Qdrant does not have. Ask the router.
+    """
+    try:
+        return get_owner().router.display_name()
+    except Exception:  # noqa: BLE001 — a label must never fail a page render
+        return ""
+
+
 def _load_index_stats(settings) -> dict:
     """Load file/chunk counts per project from the index state DB."""
     from ragtools.indexing.state import IndexState
@@ -129,7 +143,11 @@ def diagnostics_page(request: Request):
             "version": __version__,
             "api_version": API_VERSION,
             "profile": os.environ.get("RAG_PROFILE", "installed"),
-            "collection": settings.collection_name,
+            # The identity card claims this row is what tells two services on
+            # one machine apart. Under `per_project` the configured name is not
+            # a collection at all — the Collections card immediately below
+            # would list 15 `proj_<uuid>` names and none of them this one.
+            "collection": _collection_display(),
             "data_dir": str(settings.data_dir),
             "storage_mode": storage.get("backend", "embedded"),
             "storage": storage,
@@ -584,10 +602,23 @@ def ui_rebuild():
         logger.exception("rebuild failed")
         return (f'<div class="flash flash-error">Rebuild failed: '
                 f'{escape(str(e))}</div>')
+    # A run with failures is NOT a green success. `Rebuild complete` rendered
+    # success unconditionally — it said so for 0 files and 0 chunks while a
+    # project had just been left with an empty collection.
+    failed = stats.get("failed_projects") or []
+    body = (f"Rebuild complete: {stats['files_indexed']} files, "
+            f"{stats['chunks_indexed']} chunks, "
+            f"projects: {', '.join(stats['projects']) or 'none'}")
+    if failed:
+        return (f'<div class="flash flash-error">Rebuild incomplete: '
+                f'{len(failed)} project(s) failed and kept their previous index '
+                f'({escape(", ".join(failed))}). Rebuilt: '
+                f'{escape(", ".join(stats["projects"]) or "none")} — '
+                f'{stats["files_indexed"]} files, {stats["chunks_indexed"]} '
+                f'chunks.</div>')
     return f"""
     <div class="flash flash-success">
-        Rebuild complete: {stats['files_indexed']} files, {stats['chunks_indexed']} chunks,
-        projects: {', '.join(stats['projects']) or 'none'}
+        {body}
     </div>
     """
 
@@ -614,7 +645,9 @@ def ui_config():
         "Storage": {
             "Qdrant path": settings.qdrant_path,
             "State DB": settings.state_db,
-            "Collection": settings.collection_name,
+            # Not `settings.collection_name`: on a per-project install this card
+            # named the knowledge base after a collection Qdrant does not have.
+            "Collection": _collection_display(),
         },
     }
 

@@ -355,8 +355,42 @@ def doctor(
     if data_path.exists():
         try:
             client = settings.get_qdrant_client()
-            info = client.get_collection(settings.collection_name)
-            points_count = info.points_count
+            # ASK THE ROUTER, NOT `settings.collection_name`. Under
+            # `per_project` no collection carries that name, so this check
+            # called a healthy 15-collection install "Collection NOT FOUND" —
+            # the one row a user runs `rag doctor` to trust.
+            from ragtools.collection_router import build_router
+            from ragtools.service.owner import (
+                compute_scale_warning,
+                governing_collection,
+            )
+
+            # The router holds SQLite handles; a leaked one keeps registry.db
+            # locked on Windows, so it is closed before anything is reported.
+            router, _reg, _fw = build_router(settings)
+            try:
+                per_collection = []
+                for name in router.all_collections():
+                    try:
+                        # `count(exact=True)`, not `points_count`: the latter is
+                        # an optimizer estimate that can be None on a fresh
+                        # collection, which reads as "empty" rather than
+                        # "unknown". UNKNOWN IS NOT ZERO.
+                        points = int(client.count(collection_name=name,
+                                                  exact=True).count)
+                    except Exception:  # noqa: BLE001 — record it as unreadable
+                        points = None
+                    per_collection.append({"name": name, "points": points})
+                label = router.display_name()
+            finally:
+                router.close()
+
+            readable = [c for c in per_collection if c["points"] is not None]
+            unreadable = [c["name"] for c in per_collection if c["points"] is None]
+            # A partial sum presented as the total is the same failure as a zero
+            # presented as empty — a number the caller cannot tell is wrong.
+            points_count = sum(c["points"] for c in readable) if not unreadable else None
+
             # Surface Qdrant local-mode scale warnings (field-report incident).
             #
             # `capabilities` is not optional here. Without it this always
@@ -364,32 +398,52 @@ def doctor(
             # about a 20,000-point ceiling on a managed or external server where
             # no such ceiling exists — advising the user to fix something they
             # had already fixed.
-            from ragtools.service.owner import compute_scale_warning
             try:
                 from ragtools.storage import resolve_backend
                 caps = resolve_backend(settings).capabilities()
             except Exception:  # noqa: BLE001 — unknown engine: assume the weakest
                 caps = None
-            scale = compute_scale_warning(points_count, capabilities=caps)
-            if scale["level"] == "over":
+            # The ceiling is per collection, not per index: summing every
+            # collection and comparing the total would report "over" forever on
+            # exactly the layout that fixes the problem.
+            worst_points, worst_name, collection_count = governing_collection(readable)
+            scale = compute_scale_warning(
+                worst_points, capabilities=caps,
+                collection=worst_name, collection_count=collection_count)
+
+            total = f"{points_count:,}" if points_count is not None else "unknown"
+            if not readable:
+                status_label = "NOT FOUND"
+                detail = f"{label}: no collection could be read"
+            elif scale["level"] == "over":
                 status_label = "WARNING"
                 detail = (
-                    f"{points_count:,} points — OVER local-mode limit "
+                    f"{label}, {total} points — {worst_points:,} in "
+                    f"'{worst_name}' is OVER the local-mode limit "
                     f"({scale['hard_limit']:,}). Prune or migrate Qdrant."
                 )
             elif scale["level"] == "approaching":
                 status_label = "OK"
                 detail = (
-                    f"{points_count:,} points — approaching local-mode limit "
-                    f"({scale['hard_limit']:,}). Review ignore_patterns."
+                    f"{label}, {total} points — '{worst_name}' is approaching "
+                    f"the local-mode limit ({scale['hard_limit']:,}). "
+                    f"Review ignore_patterns."
                 )
             else:
                 status_label = "OK"
-                detail = f"{points_count} points"
-            data["index"] = {"points_count": points_count, "scale": scale}
+                detail = f"{label}, {total} points"
+            if unreadable:
+                status_label = "WARNING"
+                detail += f" ({len(unreadable)} unreadable: {', '.join(unreadable)})"
+            data["index"] = {
+                "points_count": points_count,
+                "collection_strategy": settings.collection_strategy,
+                "collections": per_collection,
+                "scale": scale,
+            }
             checks.append(("Collection", status_label, detail))
-        except Exception:
-            checks.append(("Collection", "NOT FOUND", f"'{settings.collection_name}' missing"))
+        except Exception as e:
+            checks.append(("Collection", "NOT FOUND", f"no routed collection could be read: {e}"))
 
     ignore_rules = _get_ignore_rules(settings)
     patterns = ignore_rules.get_all_patterns()
@@ -1633,9 +1687,24 @@ def _confirm_relayout(settings, what: str, yes: bool) -> None:
 
     points = 0
     try:
+        from ragtools.collection_router import build_router
+
         client = settings.get_qdrant_client()
-        points = int(client.count(collection_name=settings.collection_name,
-                                  exact=True).count)
+        # SUM ACROSS THE ROUTED COLLECTIONS. Counting only
+        # `settings.collection_name` returned 0 on a per-project install — no
+        # collection has that name — so `estimate_required_bytes` below sized an
+        # EMPTY corpus and the disk preflight waved through a machine with no
+        # room for the re-index it is about to start.
+        router, _reg, _fw = build_router(settings)
+        try:
+            for name in router.all_collections():
+                try:
+                    points += int(client.count(collection_name=name,
+                                               exact=True).count)
+                except Exception:  # noqa: BLE001 — not yet created: really 0
+                    continue
+        finally:
+            router.close()
     except Exception:  # noqa: BLE001 — a fresh install has nothing to count
         points = 0
 

@@ -20,7 +20,6 @@ from ragtools.ignore import IgnoreRules
 from ragtools.chunking.dispatch import chunk_file
 from ragtools.indexing.indexer import (
     ensure_collection,
-    recreate_collection,
     delete_file_points,
     delete_files_points,
     chunks_to_points,
@@ -1569,6 +1568,36 @@ class QdrantOwner:
                 return self._rebuild_locked()
 
     def _rebuild_locked(self) -> dict:
+        """Rebuild every enabled project — one at a time, replacement first.
+
+        v3.4 dropped EVERY collection and deleted the state DB *before* it
+        indexed anything, then walked every ``(project, file)`` pair in one loop
+        with no ``try``/``except``. On the installed machine it reached project
+        14 of 15, hit a transient ``WinError 10048`` from the client, and the
+        whole run ended: project 15 was left holding the empty collection it had
+        already been given, project 14 kept 1,442 of ~35,000 files, and because
+        ``clear_intent`` sat in a ``finally`` the only durable evidence was
+        erased — ``/health`` reported ``degraded: false, issues: []`` for the
+        next twelve hours.
+
+        So the unit of work is ONE PROJECT, and the order for each of them is
+        **build → verify → swap → drop**:
+
+        * the replacement is indexed into a NEW collection (``<base>_g<n+1>``)
+          while the live one goes on serving;
+        * it is adopted only once it has been COUNTED — ``None`` (could not ask)
+          and ``0`` after chunks were written are both failures, not successes;
+        * the swap is one atomic registry UPDATE
+          (:meth:`ragtools.registry.ProjectRegistry.set_active_collection`);
+        * the superseded collection is dropped LAST, and failing to drop it
+          leaves an orphan to reclaim later rather than failing a rebuild that
+          worked.
+
+        A project that fails is logged, recorded in ``failed_projects`` and left
+        EXACTLY as it was; the loop moves on. The state DB is never deleted —
+        each project's rows are replaced only after its own swap — so a run that
+        failed can still be diagnosed from what it says.
+        """
         from ragtools.service import destructive
         from ragtools.service.activity import log_activity
 
@@ -1584,7 +1613,7 @@ class QdrantOwner:
                 f"the vector store is not reachable ({detail}); refusing to drop "
                 f"an index that could not be rebuilt", code="storage_unreachable")
 
-        # Snapshot the state DB before we drop it. Best-effort — failures
+        # Snapshot the state DB before we touch it. Best-effort — failures
         # here must not block the rebuild itself (disk full, etc.).
         try:
             from ragtools.backup import backup_state_db, prune_backups
@@ -1593,72 +1622,296 @@ class QdrantOwner:
         except Exception as e:
             logger.warning("Pre-rebuild backup failed (non-fatal): %s", e)
 
-        destructive.record_intent(self._settings, {
-            "operation": "rebuild", "collections": targets,
-            "state_db": str(state_path),
-        })
-        try:
-            # Force-drop and recreate EVERY collection (clean slate). In
-            # per-project mode a rebuild that only cleared the shared collection
-            # would leave every project's vectors in place and silently double
-            # them on the re-index that follows.
-            for name in targets:
-                recreate_collection(self._client, name, self._encoder.dimension)
-            self._ensured_collections = set(targets)
+        projects = list(self._settings.enabled_projects)
+        intent = {"operation": "rebuild", "collections": targets,
+                  "state_db": str(state_path),
+                  "projects": [p.id for p in projects]}
+        destructive.record_intent(self._settings, intent)
 
-            # THE IRREVERSIBLE STEP IS GATED ON PROOF, NOT ON THE ABSENCE OF AN
-            # EXCEPTION. "recreate_collection did not raise" is a weaker claim
-            # than "the collection is there", and the state DB is the only
-            # record of what was indexed — once it is gone, a half-recreated
-            # store cannot even be diagnosed.
-            existing = {c.name for c in self._client.get_collections().collections}
-            missing = [n for n in targets if n not in existing]
-            if missing:
-                raise RuntimeError(
-                    f"refusing to delete the index state: {len(missing)} "
-                    f"collection(s) were not recreated ({', '.join(missing[:5])})")
+        log_activity("info", "indexer",
+                     f"Rebuild started — {len(projects)} project(s), each one "
+                     f"built and verified before anything of its own is dropped")
 
-            if state_path.exists():
-                state_path.unlink()
+        stats = {"files_indexed": 0, "chunks_indexed": 0, "deleted": 0,
+                 "projects": [], "failed_projects": [], "empty_projects": {},
+                 "status": "completed"}
+        rebuilt: list[str] = []
+        failed: list[str] = []
+        for project in projects:
+            try:
+                result = self._rebuild_project(project.id)
+            except Exception as exc:  # noqa: BLE001 — ONE project, not the run
+                # The v3.4 loop had no handler here at all, which is why the
+                # first error ended the run and every project after it in scan
+                # order kept the empty collection it had already been handed.
+                failed.append(project.id)
+                logger.exception("Rebuild failed for project %s", project.id)
+                log_activity(
+                    "error", "indexer",
+                    f"Rebuild failed for project '{project.id}': {exc} — its "
+                    f"previous index was left in place")
+                continue
+            stats["files_indexed"] += result["files_indexed"]
+            stats["chunks_indexed"] += result["chunks_indexed"]
+            stats["deleted"] += result.get("deleted", 0)
+            if result.get("empty_reason"):
+                stats["empty_projects"][project.id] = result["empty_reason"]
+            rebuilt.append(project.id)
 
-            log_activity("info", "indexer", "Rebuild started — all data dropped")
-            stats = self._run_full_index_inner()
-            self._invalidate_map_cache()
-            self._stamp_index_identity()
-            logger.info("Rebuild complete: %s", stats)
-            return stats
-        finally:
+        stats["projects"] = sorted(rebuilt)
+        stats["failed_projects"] = failed
+        stats["status"] = "completed_with_failures" if failed else "completed"
+
+        self._invalidate_map_cache()
+        self._stamp_index_identity()
+
+        if failed:
+            # NOT in a `finally`, and NOT cleared. A hard kill left the marker
+            # behind; an exception — the common case, and the one that actually
+            # happened — used to wipe it, so /health reported a clean bill of
+            # health over a half-rebuilt index.
+            destructive.record_intent(self._settings, {
+                **intent, "status": stats["status"],
+                "failed_projects": failed, "projects_rebuilt": stats["projects"],
+            })
+            logger.error("Rebuild finished with failures: %s", ", ".join(failed))
+            log_activity(
+                "error", "indexer",
+                f"Rebuild incomplete: {len(failed)} of {len(projects)} project(s) "
+                f"failed ({', '.join(failed)}); their previous index is unchanged")
+        else:
             destructive.clear_intent(self._settings)
+            logger.info("Rebuild complete: %s", stats)
+            log_activity("success", "indexer",
+                         f"Rebuild: {stats['files_indexed']} files, "
+                         f"{stats['chunks_indexed']} chunks")
+        return stats
 
-    def _run_full_index_inner(self, project_id: str | None = None) -> dict:
-        """Full index without acquiring lock (called from within locked context)."""
-        state = IndexState(self._settings.state_db)
+    @staticmethod
+    def _staging_collection(record) -> str:
+        """The name the NEXT generation of ``record``'s collection is built under.
+
+        The suffix is stripped before it is re-applied so names cannot accrete
+        one per rebuild (``proj_ab_g1_g2_g3``). A project collection is
+        ``proj_<32 hex>`` (:func:`ragtools.identity.project_collection_name`),
+        and hex has no ``g``, so a trailing ``_g<digits>`` is unambiguously a
+        generation and never part of the identity.
+        """
+        base = record.collection_name
+        head, sep, tail = base.rpartition("_g")
+        if sep and tail.isdigit():
+            base = head
+        return f"{base}_g{int(record.generation) + 1}"
+
+    def _rebuild_project(self, project_id: str) -> dict:
+        """Rebuild ONE project, or raise. Never leaves it half-replaced.
+
+        The per-project layout gets the full build → verify → swap. The shared
+        layout cannot have one — every project writes to the same collection, so
+        there is nothing to swap — and gets the established indexing pipeline
+        scoped to a single project instead.
+        """
+        if not self._router.is_per_project or self._registry is None:
+            return self._rebuild_project_in_place(project_id)
+
+        record = self._registry.get(project_id)
+        if record is None:
+            raise RuntimeError(
+                f"project {project_id!r} has no registry entry, so there is no "
+                f"collection to rebuild it into")
+
+        staging = self._staging_collection(record)
+        previous = record.collection_name
+        ensure_collection(self._client, staging, self._encoder.dimension)
+        self._ensured_collections.add(staging)
+
+        swapped = False
+        try:
+            rows, files_indexed, chunks_indexed = self._index_into(project_id, staging)
+            self._verify_rebuilt(project_id, self._count_points(staging),
+                                 staging, chunks_indexed)
+            empty_reason = (self._explain_empty(project_id)
+                            if chunks_indexed == 0 else "")
+
+            # THE SWAP. One UPDATE, after verification — and nothing before this
+            # line touched what the project was serving.
+            self._registry.set_active_collection(
+                record.uuid, staging, generation=int(record.generation) + 1)
+            swapped = True
+
+            self._replace_state_rows(project_id, rows)
+
+            # Only now. A collection we could not drop is an orphan to reclaim
+            # (`rag storage reclaim`), not a reason to fail a rebuild that worked.
+            if previous != staging:
+                try:
+                    self._client.delete_collection(previous)
+                    self._ensured_collections.discard(previous)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Rebuild: could not drop the superseded collection %s "
+                        "(%s); it is an orphan to reclaim, not a failure",
+                        previous, exc)
+            return {"files_indexed": files_indexed,
+                    "chunks_indexed": chunks_indexed,
+                    "empty_reason": empty_reason}
+        except Exception:
+            # Best-effort, and ONLY while the project still points elsewhere:
+            # after the swap `staging` IS the live collection, and deleting it
+            # would be the exact data loss this method exists to prevent.
+            if not swapped:
+                try:
+                    self._client.delete_collection(staging)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._ensured_collections.discard(staging)
+            raise
+
+    def _rebuild_project_in_place(self, project_id: str) -> dict:
+        """Shared layout: rebuild one project inside the one shared collection.
+
+        There is no swap to make here — every project writes to
+        ``settings.collection_name`` — so this is the ordinary full-index
+        pipeline scoped to a single project. Deliberately so: a second indexing
+        pipeline is what the architecture forbids, and the streaming indexer
+        already deletes a file's previous points immediately before writing its
+        new ones, one window at a time. Nothing is dropped up front, and a
+        failure costs this project rather than the install.
+        """
+        collection = self._write_collection(project_id)
+        stats = {"files_indexed": 0, "chunks_indexed": 0, "deleted": 0,
+                 "projects": set()}
 
         files = self._scan_files(project_id)
-        stats = {"files_indexed": 0, "chunks_indexed": 0, "projects": set()}
+        total = len(files)
 
-        for pid, file_path in files:
+        def _tick(done, count, phase):
+            self._beat(done, count, phase)
+
+        _tick(0, total, "scan")
+        current_paths = {self._resolve_relative_path(pid, fp) for pid, fp in files}
+        self._purge_missing(current_paths, project_id, stats)
+
+        def _work():
+            for n, (pid, file_path) in enumerate(files, start=1):
+                _tick(n, total, "chunk")
+                relative_path = self._resolve_relative_path(pid, file_path)
+                yield pid, relative_path, IndexState.hash_file(file_path), file_path
+
+        emptied = self._stream_index(_work(), total, _tick, stats, "files_indexed")
+        self._drop_stale_vectors(emptied, stats, "deleted")
+
+        self._verify_rebuilt(project_id,
+                             self._count_project_points(collection, project_id),
+                             collection, stats["chunks_indexed"])
+        empty_reason = (self._explain_empty(project_id)
+                        if stats["chunks_indexed"] == 0 else "")
+        return {"files_indexed": stats["files_indexed"],
+                "chunks_indexed": stats["chunks_indexed"],
+                "deleted": stats["deleted"], "empty_reason": empty_reason}
+
+    def _index_into(self, project_id: str, collection: str):
+        """Index one project's files into ``collection``.
+
+        Returns ``(rows, files_indexed, chunks_indexed)``. ``rows`` are the state
+        records the run WOULD write, held in memory rather than committed: until
+        the swap happens the state DB must go on describing the index the project
+        is actually serving.
+        """
+        files = self._scan_files(project_id)
+        total = len(files)
+        rows: list[tuple[str, str, str, int]] = []
+        chunks_indexed = 0
+        for n, (pid, file_path) in enumerate(files, start=1):
+            # Per file. A rebuild is the longest thing this process does, and one
+            # that reports nothing is indistinguishable from a hung one. `_beat`
+            # is also where the run notices storage has gone away.
+            self._beat(n, total, "rebuild")
             relative_path = self._resolve_relative_path(pid, file_path)
             file_hash = IndexState.hash_file(file_path)
             count = index_file(
                 client=self._client,
                 encoder=self._encoder,
-                collection_name=self._write_collection(pid),
+                collection_name=collection,
                 project_id=pid,
                 file_path=file_path,
                 relative_path=relative_path,
                 chunk_size=self._settings.chunk_size,
                 chunk_overlap=self._settings.chunk_overlap,
             )
-            state.update(relative_path, pid, file_hash, count)
-            stats["files_indexed"] += 1
-            stats["chunks_indexed"] += count
-            stats["projects"].add(pid)
+            rows.append((relative_path, pid, file_hash, count))
+            chunks_indexed += count
+        return rows, len(rows), chunks_indexed
 
-        state.close()
-        stats["projects"] = sorted(stats["projects"])
-        logger.info("Full index: %d files, %d chunks", stats["files_indexed"], stats["chunks_indexed"])
-        return stats
+    @staticmethod
+    def _verify_rebuilt(project_id: str, count: int | None, collection: str,
+                        chunks_indexed: int) -> None:
+        """Refuse to adopt a replacement that has not been PROVEN to hold data.
+
+        UNKNOWN IS NOT ZERO and ZERO IS NOT SUCCESS. ``_count_points`` returns
+        ``None`` when it could not ask, and a rebuild nobody can verify is not
+        one that worked — adopting it is how a dead engine came to render as a
+        confidently empty index.
+        """
+        if count is None:
+            raise RuntimeError(
+                f"{collection} could not be counted, so the rebuild of "
+                f"{project_id!r} cannot be verified; refusing to adopt it")
+        if chunks_indexed > 0 and count == 0:
+            raise RuntimeError(
+                f"{chunks_indexed} chunk(s) were written for {project_id!r} and "
+                f"{collection} reports 0 points")
+
+    def _explain_empty(self, project_id: str) -> str:
+        """Why a project rebuilt to nothing — and whether that is legitimate.
+
+        A project with no eligible files is empty BY DESIGN and must still be
+        swapped; one that is empty because something went wrong must not be. The
+        vocabulary is :func:`ragtools.upgrade.relayout.classify_empty`'s on
+        purpose: the migration already draws exactly this distinction, and a
+        second answer to the same question is how the two drift apart.
+        """
+        from ragtools.upgrade import relayout
+
+        disposition, reason = relayout.classify_empty(
+            self, self._settings, relayout.KIND_PROJECT, project_id)
+        if disposition != relayout.STATUS_DONE:
+            raise RuntimeError(f"{project_id!r} rebuilt to zero points: {reason}")
+        return reason
+
+    def _replace_state_rows(self, project_id: str, rows) -> None:
+        """Swap ONE project's state rows; every other project's are untouched.
+
+        A rebuild does not delete the state DB. It is the only record of what was
+        ever indexed, and a run that fails needs it more than one that succeeds.
+        """
+        state = IndexState(self._settings.state_db)
+        try:
+            for row in state.get_all_for_project(project_id):
+                state.remove(row["file_path"])
+            for relative_path, pid, file_hash, count in rows:
+                state.update(relative_path, pid, file_hash, count)
+            state.commit()
+        finally:
+            state.close()
+
+    def _count_project_points(self, collection: str, project_id: str) -> int | None:
+        """Points ONE project holds inside a collection, or ``None`` if unknown.
+
+        The shared layout has no per-project collection to count, and counting
+        the whole thing would let one project's rebuild be "verified" by another
+        project's vectors.
+        """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        try:
+            return int(self._client.count(
+                collection_name=collection,
+                count_filter=Filter(must=[FieldCondition(
+                    key="project_id", match=MatchValue(value=project_id))]),
+                exact=True).count)
+        except Exception:  # noqa: BLE001 — unknown is None, never 0
+            return None
 
     def get_status(self, lock_timeout: float = 0.75) -> dict:
         """Collection and index status. Thread-safe and **non-blocking**.
@@ -1819,7 +2072,13 @@ class QdrantOwner:
                                                 freshness.get("level", "")),
             "migration": migration,
             "index_activity": self.index_activity(),
-            "collection_name": self._settings.collection_name,
+            # What the index IS, from the router. `settings.collection_name`
+            # names no collection under `per_project`, and this field is what
+            # the MCP `index_status` tool prints back to the agent as
+            # "Collection:" — so an agent was being told the knowledge base was
+            # a collection that did not exist. `collections` below is the real
+            # inventory; this is the one-line label for it.
+            "collection_name": self._router.display_name(),
             "collection_strategy": self._router.strategy,
             "collections": collections,
             "storage": self.storage_info(),

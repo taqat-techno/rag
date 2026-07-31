@@ -200,22 +200,32 @@ def test_the_api_route_returns_409_not_500():
 # --- rebuild ordering -----------------------------------------------------
 
 
-def test_the_state_db_is_deleted_only_after_collections_are_PROVEN_present():
-    """The invariant, read out of the source.
+def test_the_rebuild_destroys_nothing_it_has_not_already_replaced():
+    """The v3.4 ordering rule, superseded by an absence (v3.5 WP-06).
 
-    `recreate_collection did not raise` is a weaker claim than `the collection
-    is there`, and the state DB is the only record of what was indexed. Delete
-    it after a half-recreated store and the machine cannot even be diagnosed.
+    v3.4 recreated every collection and deleted the state DB up front, and the
+    most that could be asked of it was that the delete came after the
+    collections had been PROVEN present. The safe rebuild does neither: each
+    project is built into a new collection, verified, swapped in with one
+    atomic registry UPDATE, and only then is its predecessor dropped — so the
+    state DB survives the run and no live collection is ever recreated.
+
+    Both literals below are present in the v3.4 body, so this test fails
+    against the version it was written for.
     """
     source = (SRC / "service" / "owner.py").read_text(encoding="utf-8")
     idx = source.index("def _rebuild_locked")
-    body = source[idx:source.index("def _run_full_index_inner")]
+    body = source[idx:source.index("\n    def get_status")]
 
-    verify_at = body.index("get_collections()")
-    unlink_at = body.index("state_path.unlink()")
-    assert verify_at < unlink_at, (
-        "the state DB is unlinked before the collections are proven to exist")
-    assert "missing" in body
+    assert "state_path.unlink()" not in body, (
+        "the rebuild still deletes the state DB — the only record of what was "
+        "ever indexed, and the thing a failed run needs most")
+    assert "recreate_collection" not in body, (
+        "the rebuild still drops a live collection before its replacement "
+        "exists, let alone passes verification")
+    assert "set_active_collection" in body, (
+        "the rebuild does not swap through the registry, so there is no atomic "
+        "handover from the old collection to the verified new one")
 
 
 def test_rebuild_excludes_indexing_not_merely_other_rebuilds():

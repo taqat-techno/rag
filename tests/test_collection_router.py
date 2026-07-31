@@ -179,6 +179,41 @@ def test_unknown_strategy_is_refused(settings, registry):
         CollectionRouter(settings, registry=registry)
 
 
+# --- the display label -------------------------------------------------
+#
+# Every reporting surface (/health, /api/status, /api/config, the diagnostics
+# and config cards, MCP get_config + index_status) printed
+# `settings.collection_name`. On the installed v3.4 machine that named nothing:
+# 15 `proj_<uuid>` collections and no `markdown_kb`.
+
+
+def test_shared_labels_the_index_with_the_collection_it_really_uses(settings):
+    """Under ``shared`` the configured name IS the collection — unchanged."""
+    assert CollectionRouter(settings).display_name() == settings.collection_name
+
+
+def test_per_project_never_labels_the_index_with_the_legacy_name(
+    settings, registry
+):
+    """The regression: naming a collection Qdrant does not have.
+
+    The label must describe the collections that exist, and must not be a name
+    any caller could hand back to Qdrant.
+    """
+    r = _per_project(settings, registry)
+    label = r.display_name()
+    assert settings.collection_name not in label
+    assert "2 collections" in label
+    assert "per_project" in label
+
+
+def test_the_label_survives_a_broken_registry(settings, registry):
+    """It rides on /health; a registry fault must not break the liveness probe."""
+    r = _per_project(settings, registry)
+    registry.close()  # every subsequent registry call now raises
+    assert r.display_name() == "per_project"
+
+
 # --- the leak test -----------------------------------------------------
 
 

@@ -163,6 +163,32 @@ class CollectionRouter:
         ensure_collection(client, name, dimension)
         return name
 
+    def display_name(self) -> str:
+        """One short string naming what this installation's index actually is.
+
+        ``/health``, the tray, the diagnostics header, ``/api/config`` and the
+        MCP ``get_config`` tool each need a single value, and every one of them
+        printed ``settings.collection_name``. Under ``per_project`` that names
+        nothing: the installed v3.4 machine held 15 ``proj_<uuid>`` collections
+        and no ``markdown_kb``, so the service reported a collection that does
+        not exist as the knowledge base's identity. Say what is there instead.
+        The per-installation discriminator two services on one machine are told
+        apart by is ``service_id`` / ``data_dir`` on ``/identity``, not a
+        collection name.
+
+        COSMETIC ONLY. A caller that needs a collection to QUERY asks
+        :meth:`read_collections` / :meth:`all_collections`; in per-project mode
+        this returns prose and must never reach Qdrant.
+        """
+        if self._strategy == STRATEGY_SHARED:
+            return self._settings.collection_name
+        try:
+            count = len(self.all_collections())
+        except Exception:  # noqa: BLE001 — a registry fault must not break the
+            # liveness probe that carries this label.
+            return STRATEGY_PER_PROJECT
+        return f"{count} collection{'' if count == 1 else 's'} ({STRATEGY_PER_PROJECT})"
+
     def describe(self) -> list[dict]:
         """Collection inventory for /api/status, diagnostics and MCP."""
         if self._strategy == STRATEGY_SHARED:
