@@ -110,6 +110,15 @@ Type: filesandordirs; Name: "{app}\*.dist-info"
 Type: filesandordirs; Name: "{app}\*.egg-info"
 
 [Files]
+; The quiescence protocol, extracted to {tmp} and run from PrepareToInstall —
+; BEFORE [InstallDelete] and [Files], which is the whole point. `dontcopy` so it
+; never lands in the installation: it is Setup's tool, not the product's.
+;
+; PowerShell rather than a bundled executable because PowerShell is present on
+; every Windows, and this has to run before anything is installed. It stays
+; extracted for the whole Setup session, so ssDone re-invokes it in `-Mode
+; Restore` to re-enable exactly the scheduled tasks it disabled.
+Source: "installer\quiesce.ps1"; Flags: dontcopy
 ; Main application (PyInstaller one-dir output)
 Source: "dist\rag\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Silent launcher script
@@ -205,6 +214,11 @@ Type: filesandordirs; Name: "{app}\model_cache"
 Type: filesandordirs; Name: "{app}"
 
 [Code]
+var
+  // Set by PrepareToInstall, read at ssDone. Empty means "there was no previous
+  // installation", which is a different thing from "the copy failed".
+  RollbackDir: string;
+
 // Check if {app} is already in PATH
 function NeedsAddPath(Param: string): boolean;
 var
@@ -337,44 +351,293 @@ begin
          '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+// ==========================================================================
+// UPGRADE QUIESCENCE — refuse BEFORE the first destructive write
+// ==========================================================================
+//
+// `[InstallDelete]` removes `{app}\_internal` wholesale and THAT is the first
+// destructive write of the whole installation. If anything still holds
+// `_internal\python312.dll`, that delete raises Inno's file-in-use
+// Abort/Retry/Ignore box, `/SUPPRESSMSGBOXES` answers it with the DEFAULT —
+// Abort — and Setup exits 5 having half-deleted the payload. Reproduced on a
+// GitHub-hosted windows-latest runner, job 91273392455, genuine packaged v3.3.0
+// over the candidate:
+//
+//     >>> installing the candidate over it ... exit=5
+//     --- Inno log ... (last 120 of 1 lines) ---   <- Setup died before its log
+//       [FAIL] rag.exe reports the new version — [PYI-2072] Failed to load
+//              Python DLL '...\Programs\RAGTools\_internal\python312.dll'
+//       [FAIL] uninstall registry entry updated — registry reads 3.3.0
+//       [FAIL] the service answers after the upgrade — nothing within 300s
+//
+// The defect was never the kill. It was that Setup began deleting before it had
+// proven the files were replaceable, and HAD NO WAY TO REFUSE:
+// `CurStepChanged(ssInstall)` cannot abort cleanly, so every problem it can see
+// becomes a problem discovered mid-write.
+//
+// `PrepareToInstall()` can. It runs BEFORE `[InstallDelete]` and `[Files]`, and
+// a non-empty return makes Setup fail with exit code **7** — "Preparing to
+// Install determined Setup cannot proceed" — without modifying a single file.
+// That finally gives this product two distinguishable outcomes where it had
+// one:
+//
+//     exit 7   refused safely; your old installation is intact and runnable
+//     exit 5   aborted mid-write; your installation is now mixed
+//
+// ONE PROTOCOL, NOT TWO. Everything the pre-install phase used to do at
+// ssInstall — the bounded graceful stop, the scheduled-task control, the kill —
+// now lives in `installer\quiesce.ps1`, which additionally:
+//
+//   * DISABLES the owned tasks rather than merely `/end`-ing them (an ended
+//     task leaves its trigger armed, so the scheduler can start a replacement
+//     between the kill and the copy — that is the restart race);
+//   * finds holders by LOADED MODULE as well as by image name (a process with
+//     an unrelated name that mapped `_internal\python312.dll` holds the lock
+//     exactly as hard, and is invisible to `Get-Process -Name rag,ragw,qdrant`);
+//   * PROVES every `.exe`, `.dll` and `.pyd` under `{app}` can be opened
+//     exclusively, because process enumeration can come back clean while a
+//     handle survives — and today the first thing to discover that is
+//     `[InstallDelete]`, mid-write.
+//
+// The decision policy is mirrored and unit-tested in
+// `src\ragtools\upgrade\quiescence.py`; the two are held in step structurally by
+// `tests\test_installer_quiescence_contract.py`.
+
+function QuiesceLogDirectory(): string;
+begin
+  Result := ExpandConstant('{localappdata}\RAGTools\logs');
+end;
+
+// Run the protocol. `Mode` is 'Quiesce' (pre-install) or 'Restore' (ssDone,
+// re-enable exactly the tasks Quiesce disabled).
+//
+// NOT wrapped in `ExecBounded`, deliberately. `ExecBounded` builds a PowerShell
+// `-Command "..."` string, so every argument it forwards would have to survive
+// being nested inside those double quotes — and a path such as
+// `C:\Program Files\RAGTools` cannot, without escaping that this project has
+// already lost cycles to (`test_the_kill_needs_no_nested_double_quotes` exists
+// for exactly that reason). `-File` with plainly quoted arguments has no such
+// hazard.
+//
+// The bound moved INTO the script instead, where it is stronger: `quiesce.ps1`
+// takes `-TimeoutSeconds`, checks a deadline between phases, and starts every
+// child process — including the PREVIOUS release's `rag.exe`, whose behaviour
+// when its own service is wedged is not knowable from here — through its own
+// `Invoke-Bounded` helper with an explicit `WaitForExit` and a `Kill()`.
+function RunQuiescence(const Mode: string): Integer;
+var
+  Params: string;
+  ResultCode: Integer;
+begin
+  ExtractTemporaryFile('quiesce.ps1');
+  ForceDirectories(QuiesceLogDirectory());
+
+  Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'
+          + ExpandConstant('{tmp}\quiesce.ps1') + '"'
+          + ' -AppDir "' + ExpandConstant('{app}') + '"'
+          + ' -DataDir "' + ExpandConstant('{localappdata}\RAGTools') + '"'
+          + ' -LogPath "' + QuiesceLogDirectory() + '\upgrade-quiesce.json"'
+          + ' -TimeoutSeconds 180'
+          + ' -Mode ' + Mode;
+
+  if not Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    ResultCode := 3;   // could not even launch it — an internal error, so abort
+  Log('Quiescence(' + Mode + ') -> ' + IntToStr(ResultCode));
+  Result := ResultCode;
+end;
+
+// What the script found, in the words the user needs: which processes and which
+// files, by PID and by path. A plain-text sibling of the JSON verdict, because
+// Pascal reads a string far more reliably than it parses JSON — and because
+// "close this application" is actionable where "restart Windows" is what an
+// installer says when it does not know.
+function QuiesceBlockerText(): string;
+var
+  Text: AnsiString;
+begin
+  Result := '';
+  if LoadStringFromFile(QuiesceLogDirectory() + '\quiesce-blockers.txt', Text) then
+    Result := Trim(Text);
+end;
+
+// Copy the installed payload and executables to a SIBLING directory before a
+// single byte of it is replaced.
+//
+// A sibling, never inside `{app}`: `[InstallDelete]` removes `{app}\_internal`
+// wholesale and `[UninstallDelete]` removes `{app}` entirely, so a copy kept
+// underneath would be deleted by the very operations it exists to survive —
+// the mistake `BackupConfig` already avoids for `config.toml`.
+//
+// Returns False only when a copy was ATTEMPTED and did not complete. A machine
+// with no previous installation returns True with nothing copied: a fresh
+// install must not pay for any of this.
+function BackupInstallation(): Boolean;
+var
+  Source: string;
+  Flags: string;
+  ResultCode: Integer;
+begin
+  Result := True;
+  RollbackDir := '';
+  Source := ExpandConstant('{app}');
+
+  if not FileExists(AddBackslash(Source) + 'rag.exe') then
+    Exit;
+
+  RollbackDir := Source + '-rollback-' + GetDateTimeString('yyyymmdd-hhnnss', '-', '-');
+  Flags := ' /NFL /NDL /NJH /NJS /NP /R:1 /W:1';
+
+  if DirExists(AddBackslash(Source) + '_internal') then
+  begin
+    Exec(ExpandConstant('{sys}\robocopy.exe'),
+         '"' + AddBackslash(Source) + '_internal" "'
+             + AddBackslash(RollbackDir) + '_internal" /E' + Flags,
+         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Log('Rollback: copied _internal -> ' + IntToStr(ResultCode));
+    // robocopy uses 0..7 for success and 8+ for failure; it is not a program
+    // whose non-zero exit means anything went wrong.
+    if ResultCode >= 8 then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+
+  Exec(ExpandConstant('{sys}\robocopy.exe'),
+       '"' + Source + '" "' + RollbackDir + '" rag.exe ragw.exe' + Flags,
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Log('Rollback: copied executables -> ' + IntToStr(ResultCode));
+  if ResultCode >= 8 then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  // Verified HERE, while refusing is still free. A rollback copy discovered to
+  // be incomplete after `_internal` has been deleted is not a rollback copy —
+  // it is a second way to lose the installation.
+  Result := FileExists(AddBackslash(RollbackDir) + 'rag.exe')
+        and (DirExists(AddBackslash(RollbackDir) + '_internal')
+             or not DirExists(AddBackslash(Source) + '_internal'));
+  if not Result then
+    Log('Rollback: the copy at ' + RollbackDir + ' is incomplete');
+end;
+
+// Put the previous version back. `_internal` FIRST, then the executables:
+// `rag.exe` without its payload is precisely the mixed state being undone, so
+// it must never be the thing that exists first.
+procedure RestoreInstallation();
+var
+  Target: string;
+  Flags: string;
+  ResultCode: Integer;
+begin
+  if RollbackDir = '' then
+    Exit;
+  if not DirExists(RollbackDir) then
+    Exit;
+
+  Target := ExpandConstant('{app}');
+  Flags := ' /IS /IT /NFL /NDL /NJH /NJS /NP /R:1 /W:1';
+
+  if DirExists(AddBackslash(RollbackDir) + '_internal') then
+  begin
+    DelTree(AddBackslash(Target) + '_internal', True, True, True);
+    Exec(ExpandConstant('{sys}\robocopy.exe'),
+         '"' + AddBackslash(RollbackDir) + '_internal" "'
+             + AddBackslash(Target) + '_internal" /E' + Flags,
+         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Log('Rollback: restored _internal -> ' + IntToStr(ResultCode));
+  end;
+
+  Exec(ExpandConstant('{sys}\robocopy.exe'),
+       '"' + RollbackDir + '" "' + Target + '" rag.exe ragw.exe' + Flags,
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Log('Rollback: restored executables -> ' + IntToStr(ResultCode));
+end;
+
+// Only once the machine has been shown to be running the new version. Half a
+// gigabyte left behind silently is its own defect.
+procedure DiscardRollback();
+begin
+  if RollbackDir = '' then
+    Exit;
+  if DirExists(RollbackDir) then
+  begin
+    DelTree(RollbackDir, True, True, True);
+    Log('Rollback: discarded ' + RollbackDir);
+  end;
+  RollbackDir := '';
+end;
+
+// The executables and the payload the bundle names are all present.
+//
+// This is the reproduced failure's exact signature: `rag.exe` survives a
+// half-completed `[InstallDelete]` while `_internal\python312.dll` does not, and
+// the only thing the user ever sees is `[PYI-2072]`.
+function InstallationBinariesArePresent(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\rag.exe'))
+        and FileExists(ExpandConstant('{app}\ragw.exe'))
+        and FileExists(ExpandConstant('{app}\_internal\python312.dll'));
+end;
+
+// THE GATE. Runs before [InstallDelete] and [Files]; a non-empty return refuses
+// the installation with exit 7 having written nothing.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Code: Integer;
+  Blockers: string;
+begin
+  NeedsRestart := False;
+  Result := '';
+
+  Code := RunQuiescence('Quiesce');
+  if Code <> 0 then
+  begin
+    Blockers := QuiesceBlockerText();
+    if Blockers = '' then
+      Blockers := 'RAG Tools could not prove that the files of the installed '
+                + 'version can be replaced (quiescence exit ' + IntToStr(Code) + ').';
+    Result := Blockers + #13#10 + #13#10
+            + 'NOTHING HAS BEEN CHANGED. The version already on this machine is '
+            + 'intact and still runnable.' + #13#10 + #13#10
+            + 'Close whatever is listed above — an editor, an MCP client, a '
+            + 'terminal — and run this installer again.' + #13#10 + #13#10
+            + 'Full details: ' + QuiesceLogDirectory() + '\upgrade-quiesce.json';
+    Exit;
+  end;
+
+  // Quiescence is proven; the rollback copy is the second half of the same
+  // promise. Refusing here is still free — nothing has been written yet.
+  if not BackupInstallation() then
+  begin
+    Result := 'RAG Tools could not make a rollback copy of the version already '
+            + 'installed, so it will not begin replacing it.' + #13#10 + #13#10
+            + 'NOTHING HAS BEEN CHANGED. The most likely cause is free disk '
+            + 'space: the copy needs roughly as much room as the installed '
+            + 'program.' + #13#10 + #13#10
+            + 'Free some space and run this installer again.';
+    Exit;
+  end;
+end;
+
 // Forward declaration: the verifier is defined below, next to the reasoning
 // that explains it, but CurStepChanged has to reach it. Pascal resolves this
 // with a declaration, not by demanding the reader meet the mechanism first.
 procedure VerifyInstallation(); forward;
 
-// Pre-install: stop running service and force-close any remaining rag.exe.
 // Post-install (ssDone, after [Run] has re-registered the tasks): verify.
+//
+// ssInstall does NOTHING here any more, and that is the fix. Everything it used
+// to do — the bounded graceful stop, `StopOwnedTasks`, `ForceKillRagProcesses` —
+// is one protocol now, running in `PrepareToInstall` where a failure can REFUSE
+// rather than abort mid-write. Two pre-install phases doing the same job in two
+// places is how the second one came to be the only one that could fail.
 procedure CurStepChanged(CurStep: TSetupStep);
-var
-  ResultCode: Integer;
 begin
   if CurStep = ssDone then
     VerifyInstallation();
-
-  if CurStep = ssInstall then
-  begin
-    // Phase 1: ask the service to stop gracefully (if upgrading).
-    //
-    // BOUNDED, because this runs the PREVIOUS release's `rag.exe`. Which
-    // release that is, and how it behaves when its own service is wedged, is
-    // not knowable from here — every version ever shipped is a possible callee.
-    // Unbounded, a single old binary that never returns stops the upgrade dead
-    // before any file is touched, with no output explaining why.
-    //
-    // Overrunning the limit is fine. Phases 2 and 3 do the same job without
-    // asking, so this is the polite attempt, not the mechanism.
-    if FileExists(ExpandConstant('{app}\rag.exe')) then
-    begin
-      ResultCode := ExecBounded(ExpandConstant('{app}\rag.exe'), 'service stop', 60000);
-      ResultCode := ExecBounded(ExpandConstant('{app}\rag.exe'), 'service uninstall', 60000);
-    end;
-    // Phase 2: end the scheduled tasks BEFORE killing, so the scheduler cannot
-    // restart what we are about to kill. The registration carries
-    // RestartOnFailure and a force-kill is precisely the failure it reacts to.
-    StopOwnedTasks();
-    // Phase 3: force-kill every owned image still holding a file open.
-    ForceKillRagProcesses();
-  end;
 end;
 
 // After the files are in place: prove the machine actually moved.
@@ -394,12 +657,34 @@ var
   ResultCode: Integer;
   Verifier: string;
 begin
+  // STARTUP LIFECYCLE RESTORED. `quiesce.ps1` DISABLED the owned scheduled
+  // tasks for the upgrade window — not merely `/end`-ed them, because an ended
+  // task leaves its trigger armed and the scheduler is free to restart what we
+  // just killed. Leaving them disabled afterwards would silently switch off a
+  // user's autostart, so the same script re-enables EXACTLY what it disabled
+  // and nothing else: a task the user had already turned off stays off.
+  //
+  // Runs before the verification below, because "autostart targets" is one of
+  // the things being verified.
+  RunQuiescence('Restore');
+
+  // FINAL EXECUTABLE / DLL CONSISTENCY, checked before anything is asked to
+  // run. This is the reproduced failure's exact signature — `rag.exe` survives
+  // a half-completed `[InstallDelete]` while `_internal\python312.dll` does not,
+  // and all the user ever sees is `[PYI-2072] Failed to load Python DLL`.
+  //
+  // An integrity failure, so the rollback copy goes back.
   Verifier := ExpandConstant('{app}\rag.exe');
-  if not FileExists(Verifier) then
+  if not InstallationBinariesArePresent() then
   begin
-    SuppressibleMsgBox('Installation problem: ' + Verifier + ' is missing after setup.' + #13#10 + #13#10 +
-           'The installation is incomplete. Please re-run this installer and, if it fails '
-           + 'again, restart Windows first so no old files remain locked.',
+    RestoreInstallation();
+    SuppressibleMsgBox('RAG Tools could not be installed cleanly, so the version that was '
+           + 'already on this machine has been RESTORED.' + #13#10 + #13#10 +
+           'Files are missing from the new installation — most often because '
+           + 'something was still holding them open while they were replaced.' + #13#10 + #13#10 +
+           'Your projects, configuration and index were not touched. Close any '
+           + 'application that uses RAG Tools (an editor, an MCP client, a terminal) '
+           + 'and run this installer again.',
            mbCriticalError, MB_OK, IDOK);
     Exit;
   end;
@@ -411,13 +696,31 @@ begin
   // 258 is the overrun code from ExecBounded; -1 means it could not be
   // launched. Neither is evidence of a bad install, so neither invents a
   // verdict.
+  // WHAT `selfcheck` PROVES, and therefore what this step verifies: that
+  // `rag.exe` launches at all (it is the process being run), that it reports
+  // the candidate version, that the uninstall registry entry moved, that the
+  // autostart targets name the new binaries, that the service started and
+  // /health answers with the new version, that the storage contract and managed
+  // engine ownership hold, and that the index identity and config schema
+  // survived. Eleven checks, categorised — see `ragtools.selfcheck`.
   ResultCode := ExecBounded(Verifier,
                             'selfcheck --quiet --expect-version {#MyAppVersion}', 120000);
   if (ResultCode = -1) or (ResultCode = 258) then
-    Exit;   // could not run the check, or it overran; do not invent a verdict
+  begin
+    // Could not run the check, or it overran. Neither is evidence of a bad
+    // install, so neither invents a verdict — and neither justifies restoring
+    // the previous version over a new one that is probably fine. The binaries
+    // were already proven present above, so the copy is discarded rather than
+    // left behind as half a gigabyte nobody knows about.
+    DiscardRollback();
+    Exit;
+  end;
 
   if ResultCode = 0 then
+  begin
+    DiscardRollback();
     Exit;   // clean
+  end;
 
   // ONE MESSAGE PER CAUSE.
   //
@@ -434,45 +737,73 @@ begin
   // knows. So `rag selfcheck` now exits with a CATEGORY and this only chooses
   // words. Codes are from `ragtools.selfcheck`: 1 integrity, 2 runtime,
   // 3 migrating, 4 warning.
+  //
+  // AND ONE ROLLBACK PER CATEGORY. Restoring the previous bundle is the right
+  // answer to an INTEGRITY failure — a mixed directory is exactly what the copy
+  // can undo. It is the wrong answer to a RUNTIME one: a storage outage, a held
+  // port or a rebuild that stopped early would survive the rollback unchanged,
+  // and the machine would end up on an older version with the original problem
+  // still there. This installer has already learned the general form of that
+  // lesson once, when a single fixed "restart Windows and reinstall" message was
+  // shown for every failing check.
   case ResultCode of
     3:
-      // Installed correctly; the index is being rebuilt. Nothing to do, and
-      // saying anything alarming here is how a user reinstalls over a healthy
-      // migration and starts it again from zero.
-      SuppressibleMsgBox('RAG Tools {#MyAppVersion} was installed successfully.' + #13#10 + #13#10 +
-             'Your index is being rebuilt for the new storage layout. This runs in '
-             + 'the background and can take a while on a large corpus.' + #13#10 + #13#10 +
-             'Searches will report "migration in progress" until it finishes. '
-             + 'No action is needed.' + #13#10 + #13#10 +
-             'To watch progress:  rag status',
-             mbInformation, MB_OK, IDOK);
+      begin
+        // Installed correctly; the index is being rebuilt. Nothing to do, and
+        // saying anything alarming here is how a user reinstalls over a healthy
+        // migration and starts it again from zero.
+        DiscardRollback();
+        SuppressibleMsgBox('RAG Tools {#MyAppVersion} was installed successfully.' + #13#10 + #13#10 +
+               'Your index is being rebuilt for the new storage layout. This runs in '
+               + 'the background and can take a while on a large corpus.' + #13#10 + #13#10 +
+               'Searches will report "migration in progress" until it finishes. '
+               + 'No action is needed.' + #13#10 + #13#10 +
+               'To watch progress:  rag status',
+               mbInformation, MB_OK, IDOK);
+      end;
     2:
-      // Installed correctly; something at run time is stuck. Name it, and do
-      // NOT prescribe a reboot — nothing about this is fixed by restarting
-      // Windows or replacing files that are already correct.
-      SuppressibleMsgBox('RAG Tools {#MyAppVersion} was installed successfully, but it is not '
-             + 'running properly yet.' + #13#10 + #13#10 +
-             'The files on this machine are correct. The problem is at run time — '
-             + 'most often the storage engine is unreachable, its port is held by '
-             + 'another RAG Tools instance, or an index rebuild stopped early.' + #13#10 + #13#10 +
-             'Reinstalling will NOT help. To see the exact cause and its remedy, run:'
-             + #13#10 + #13#10 +
-             '    rag selfcheck' + #13#10 + #13#10 +
-             'If a rebuild stopped, resume it with:  rag upgrade --resume',
-             mbError, MB_OK, IDOK);
+      begin
+        // Installed correctly; something at run time is stuck. Name it, and do
+        // NOT prescribe a reboot — nothing about this is fixed by restarting
+        // Windows or replacing files that are already correct. For the same
+        // reason the rollback copy is discarded rather than applied: an older
+        // version would meet the identical runtime problem.
+        DiscardRollback();
+        SuppressibleMsgBox('RAG Tools {#MyAppVersion} was installed successfully, but it is not '
+               + 'running properly yet.' + #13#10 + #13#10 +
+               'The files on this machine are correct. The problem is at run time — '
+               + 'most often the storage engine is unreachable, its port is held by '
+               + 'another RAG Tools instance, or an index rebuild stopped early.' + #13#10 + #13#10 +
+               'Reinstalling will NOT help. To see the exact cause and its remedy, run:'
+               + #13#10 + #13#10 +
+               '    rag selfcheck' + #13#10 + #13#10 +
+               'If a rebuild stopped, resume it with:  rag upgrade --resume',
+               mbError, MB_OK, IDOK);
+      end;
     4:
-      ;  // warnings only — logged by selfcheck, not worth a dialog
+      DiscardRollback();  // warnings only — logged by selfcheck, not worth a dialog
   else
     // 1, and anything unrecognised: treat as an integrity failure, because
     // that is the case where doing nothing leaves a genuinely broken install.
-    SuppressibleMsgBox('RAG Tools {#MyAppVersion} was installed, but verification found that this '
-           + 'machine is NOT fully running it.' + #13#10 + #13#10 +
-           'This usually means a process from the previous version was still running '
-           + 'while files were replaced, so some files were skipped.' + #13#10 + #13#10 +
-           'To fix it: restart Windows, then run this installer again. Your projects, '
-           + 'configuration and index are not affected.' + #13#10 + #13#10 +
-           'For details run:  rag selfcheck',
-           mbCriticalError, MB_OK, IDOK);
+    //
+    // And an integrity failure is precisely what the rollback copy exists for.
+    // The machine goes back to the version it was running, which is a state
+    // known to work, instead of being left on a mixed tree that will fail at
+    // every start until someone reinstalls by hand. Never leave a mixed
+    // PyInstaller directory silently.
+    begin
+      RestoreInstallation();
+      SuppressibleMsgBox('RAG Tools {#MyAppVersion} could not be installed cleanly, so the '
+             + 'version that was already on this machine has been RESTORED.' + #13#10 + #13#10 +
+             'This usually means a process from the previous version was still running '
+             + 'while files were replaced, so some files were skipped.' + #13#10 + #13#10 +
+             'Your projects, configuration and index are not affected. Close any '
+             + 'application that uses RAG Tools — an editor, an MCP client, a terminal — '
+             + 'and run this installer again. If it fails the same way, restart Windows '
+             + 'first so nothing can still be holding the old files.' + #13#10 + #13#10 +
+             'For details run:  rag selfcheck',
+             mbCriticalError, MB_OK, IDOK);
+    end;
   end;
 end;
 

@@ -9,6 +9,10 @@ Split by intent, because the difference matters when something goes wrong:
   run cannot disagree.
 * :mod:`ragtools.upgrade.preflight` — **refuses**. Every "can this finish?"
   gate, run before a single service is stopped.
+* :mod:`ragtools.upgrade.quiescence` — **proves**, then refuses. Whether the
+  installed files can actually be REPLACED, decided before the installer's first
+  destructive write. The policy only; the OS work is ``installer/quiesce.ps1``,
+  held in step with it by ``tests/test_installer_quiescence_contract.py``.
 * :mod:`ragtools.upgrade.reconcile` — **proves**. The five properties that must
   hold before an upgrade may be called successful.
 * :mod:`ragtools.upgrade.state` — **remembers**. Where it got to, and which side

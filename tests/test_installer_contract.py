@@ -136,7 +136,16 @@ def test_a_failed_backup_cancels_the_deletion(script):
 def test_the_backup_lands_outside_the_directory_being_deleted(script):
     """A backup inside the data root is deleted by the wipe it exists to
     survive."""
-    match = re.search(r"Target\s*:=\s*ExpandConstant\('([^']+)'\)", script)
+    # Scoped to BackupConfig by name. It used to take the FIRST
+    # `Target := ExpandConstant(...)` in the whole script, which is only the
+    # right one for as long as no other procedure happens to use a variable
+    # called Target — and one now does (`RestoreInstallation`, which puts the
+    # rollback copy back into `{app}`). A structural test that identifies its
+    # subject by position rather than by name silently changes subject.
+    body = re.search(r"function BackupConfig\(.*?^end;", script,
+                     re.DOTALL | re.MULTILINE)
+    assert body, "BackupConfig is gone"
+    match = re.search(r"Target\s*:=\s*ExpandConstant\('([^']+)'\)", body.group(0))
     assert match, "the backup target is no longer a literal path"
     target = match.group(1)
 
@@ -215,16 +224,26 @@ def test_scheduled_tasks_are_ended_before_the_processes_are_killed(script):
 
     The task carries RestartOnFailure, and a force-kill is exactly the failure
     it reacts to — so killing first lets the scheduler start a replacement
-    between the kill and the copy.
+    between the kill and the copy. Observed on an uninstall: `qdrant.exe
+    pid=1184` still running afterwards, with `['bin', '_internal']` surviving in
+    the program directory.
+
+    Asserted on the UNINSTALL path, because that is where these two procedures
+    still run. As of v3.5.1 the INSTALL path no longer has a pre-install phase
+    of its own: the whole protocol moved into `PrepareToInstall` ->
+    `installer/quiesce.ps1`, which does the same thing more strongly — it
+    DISABLES the tasks rather than `/end`-ing them, so the trigger is not merely
+    idle but disarmed. `tests/test_installer_quiescence_contract.py` asserts the
+    ordering there.
     """
-    install = re.search(r"if CurStep = ssInstall then.*?^  end;", script,
-                        re.DOTALL | re.MULTILINE)
-    assert install, "the pre-install step is gone"
-    text = install.group(0)
+    uninstall = re.search(r"if CurUninstallStep = usUninstall then.*?^  end;", script,
+                          re.DOTALL | re.MULTILINE)
+    assert uninstall, "the pre-uninstall step is gone"
+    text = uninstall.group(0)
 
     stop = text.find("StopOwnedTasks()")
     kill = text.find("ForceKillRagProcesses()")
-    assert stop != -1, "scheduled tasks are never stopped before replacement"
+    assert stop != -1, "scheduled tasks are never stopped before removal"
     assert kill != -1
     assert stop < kill, "processes are killed before the tasks that restart them"
 
@@ -362,13 +381,32 @@ def test_a_bounded_exec_helper_exists_and_enforces_a_timeout(script):
 
 
 def test_the_graceful_stop_is_bounded(script):
-    """Phase 1 of ssInstall is a courtesy, not a mechanism — it must not block."""
+    """The pre-install stop sequence is a courtesy, not a mechanism — it must
+    not block.
+
+    It used to live in `CurStepChanged(ssInstall)` and be bounded by
+    `ExecBounded`. As of v3.5.1 it lives in `PrepareToInstall`, which runs the
+    whole protocol through `installer/quiesce.ps1` — and the bound moved with
+    it: the script takes an explicit `-TimeoutSeconds`, and starts every child
+    process (including the PREVIOUS release's `rag.exe`, whose behaviour when
+    its own service is wedged is not knowable from here) through its own bounded
+    helper. The property is unchanged; only its address is.
+    """
     code = _code_section(script)
-    step = re.search(r"if CurStep = ssInstall then.*?^  end;", code,
+    step = re.search(r"function PrepareToInstall\(.*?^end;", code,
                      re.DOTALL | re.MULTILINE)
-    assert step, "ssInstall handling not found"
-    text = step.group(0)
-    assert "ExecBounded" in text, "the pre-install stop sequence is not bounded"
+    assert step, "PrepareToInstall handling not found"
+    assert "RunQuiescence(" in step.group(0), (
+        "PrepareToInstall does not run the quiescence protocol"
+    )
+
+    runner = re.search(r"function RunQuiescence\(.*?^end;", code,
+                       re.DOTALL | re.MULTILINE)
+    assert runner, "RunQuiescence has no body"
+    assert "-TimeoutSeconds" in runner.group(0), (
+        "the pre-install stop sequence is invoked with no time bound, so one old "
+        "binary that never returns stops the upgrade dead with no output"
+    )
 
 
 def test_verification_cannot_hang_a_completed_installation(script):
@@ -512,6 +550,12 @@ INNO_BUILTINS = {
     "MsgBox", "Pos", "RegQueryStringValue", "RegWriteStringValue",
     "RemoveBackslash", "SetLength", "Sleep", "StringChangeEx", "Trim",
     "UpperCase", "Copy", "IsAdminLoggedOn", "GetEnv", "SuppressibleMsgBox",
+    # v3.5.1, both checked against Inno's Support Functions Reference:
+    # ExtractTemporaryFile unpacks a `Flags: dontcopy` entry into {tmp} so
+    # PrepareToInstall can run it before anything is installed;
+    # LoadStringFromFile reads the protocol's plain-text blocker summary, which
+    # exists because Pascal reads a string far more reliably than it parses JSON.
+    "ExtractTemporaryFile", "LoadStringFromFile",
 }
 
 #: Pascal keywords that can be followed by a parenthesis.
