@@ -1,18 +1,28 @@
 """Semantic Map data pipeline — file-level 2D/3D projection.
 
 Pipeline:
-  1. Scroll all chunk vectors from Qdrant
+  0. Establish that the routed collections share ONE vector space
+     (:mod:`ragtools.service.vector_space`); exclude the ones that do not
+  1. Scroll the surviving collections' chunk vectors from Qdrant
   2. Group by file_path → compute mean embedding per file
   3. PCA reduce to 3D (2D view uses x,y; 3D view uses x,y,z)
   4. Normalize coordinates to [0, 1]
   5. Cache in SQLite
+
+Step 0 is not decoration. Every later step assumes the vectors are points in
+one space, and until it existed nothing checked: a collection of a different
+dimension raised an uncaught ``ValueError`` out of ``np.array`` (HTTP 500, the
+whole map gone, including the projects that were fine), a named-vector
+collection raised ``TypeError`` the same way, and a same-dimension /
+different-model mix produced a projection that separated ENCODERS rather than
+meaning — a plausible picture that was wrong, and silent.
 """
 
 import hashlib
 import json
 import logging
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -20,12 +30,15 @@ import numpy as np
 from qdrant_client import QdrantClient
 
 from ragtools.config import Settings
+from ragtools.identity import is_framework_collection_name
 
 logger = logging.getLogger("ragtools.service.map")
 
-#: Bumped from ``file_map_v2``: the payload gained coverage/excluded and the
-#: sampler changed, so a v2 blob would be served as if it described this map.
-CACHE_KEY = "file_map_v3"
+#: Bumped from ``file_map_v3``: coverage gained the collection-level breakdown
+#: (excluded / incompatible / failed / empty) and the cache identity now folds
+#: in the recorded model, so a v3 blob would be served as if it described this
+#: map — and would have been computed without any compatibility pre-flight.
+CACHE_KEY = "file_map_v4"
 
 #: Files plotted. The map is an overview, but "overview" means EVERY project is
 #: represented — a different requirement from "as many points as possible".
@@ -99,16 +112,26 @@ def _spread(paths: list[str], k: int) -> list[str]:
 
 
 def _fetch_vectors(
-    client: QdrantClient, collection: str, wanted: list[str]
+    client: QdrantClient, collection: str, wanted: list[str],
+    vector_name: str | None = "", dimension: int | None = None,
 ) -> dict[str, list[np.ndarray]]:
-    """Every chunk vector of each requested file.
+    """Every chunk vector of each requested file, IN THE MAP'S SPACE.
 
     ALL chunks, not the ones that happened to fall inside a prefix. v3.4 built
     a file's position from whatever subset the global budget reached, so 347 of
     375 displayed files were plotted from an incomplete mean — the map was
     wrong about position, not merely incomplete.
+
+    ``vector_name`` and ``dimension`` come from the pre-flight's reference
+    space. Extraction goes through ``extract_vector`` rather than
+    ``np.array(record.vector)``: a named-vector record is a ``dict``, and
+    handing that to numpy is the ``TypeError`` that returned a 500. A vector
+    that is not in the reference space is DROPPED, not coerced — which is what
+    makes the matrix rectangular by construction rather than by hope.
     """
     from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+    from ragtools.service.vector_space import extract_vector
 
     out: dict[str, list[np.ndarray]] = defaultdict(list)
     for i in range(0, len(wanted), _FETCH_BATCH):
@@ -127,12 +150,46 @@ def _fetch_vectors(
             )
             for record in records:
                 fp = (record.payload or {}).get("file_path")
-                vec = record.vector
-                if fp and vec is not None:
-                    out[fp].append(np.array(vec, dtype=np.float32))
+                if not fp:
+                    continue
+                vec = extract_vector(record.vector, vector_name)
+                if vec is None or (dimension is not None and len(vec) != dimension):
+                    continue
+                out[fp].append(np.array(vec, dtype=np.float32))
             if offset is None:
                 break
     return out
+
+
+def _stack(file_keys: list[tuple[str, str]],
+           file_vectors: dict[tuple[str, str], list[np.ndarray]]):
+    """``(matrix, keys)`` — the mean embedding per file, guaranteed rectangular.
+
+    The pre-flight makes a ragged stack almost impossible; this makes it
+    impossible. Rows of the modal width are kept and any other width is
+    dropped, so ``np.array`` cannot raise here whatever a collection turns out
+    to hold. A drop is logged rather than counted into a coverage field: it is
+    a per-FILE anomaly, and coverage counts collections and files the sampler
+    chose, not rows numpy refused.
+    """
+    means: dict[tuple[str, str], np.ndarray] = {}
+    for key in file_keys:
+        vectors = file_vectors.get(key) or []
+        if vectors:
+            means[key] = np.mean(vectors, axis=0)
+
+    widths = Counter(int(v.shape[0]) for v in means.values() if v.ndim == 1)
+    if not widths:
+        return np.empty((0, 0)), []
+    width = widths.most_common(1)[0][0]
+
+    kept = [k for k in file_keys
+            if k in means and means[k].ndim == 1 and means[k].shape[0] == width]
+    dropped = len(means) - len(kept)
+    if dropped:
+        logger.warning("Map: dropped %d file(s) whose mean embedding was not "
+                       "%d-dimensional", dropped, width)
+    return np.array([means[k] for k in kept]), kept
 
 
 def compute_map_points(
@@ -140,44 +197,68 @@ def compute_map_points(
 ) -> dict:
     """Coordinates for a balanced sample of indexed files, plus honest coverage.
 
-    Returns ``{"points": [...], "coverage": {...}, "excluded": [...]}``.
+    Returns ``{"points", "coverage", "excluded", "space"}``, where ``space``
+    names the vector space the projection was actually built in — the thing
+    every exclusion is measured against, and unreadable prose without it.
 
-    Two passes. The first enumerates files per collection without vectors; the
-    second fetches every chunk of the files actually selected. That ordering is
-    what makes both guarantees possible at once: each project gets a quota
-    (so none is dropped for being enumerated late), and each plotted file is
-    positioned from ALL of its chunks (so the coordinates are true).
+    Three passes. The first establishes which collections share ONE vector
+    space; the second enumerates the survivors' files without vectors; the
+    third fetches every chunk of the files actually selected. That ordering is
+    what makes the guarantees possible at once: an incompatible collection
+    costs one cheap probe rather than a full enumeration, each project gets a
+    quota (so none is dropped for being enumerated late), and each plotted file
+    is positioned from ALL of its chunks (so the coordinates are true).
 
-    A collection that cannot be read is reported in ``excluded`` — never
-    silently skipped, and never allowed to take the other collections down.
+    A collection that cannot be read, or whose vectors are not points in the
+    same space as the rest, is reported in ``excluded`` with a stated reason —
+    never silently skipped, and never allowed to take the other collections
+    down. There is no input shape for which this returns an error instead of a
+    map: every refusal is data.
     """
     targets = list(collections or [])
     if not targets:
         # No legacy fallback. Under per_project the configured name identifies
         # nothing that exists; asking for "the collection" is the v2 question.
-        return {"points": [], "coverage": _coverage(0, 0, 0, 0, 0, False, []),
-                "excluded": []}
+        return {"points": [], "coverage": _coverage(0, 0, 0, 0, 0, False, [], []),
+                "excluded": [], "space": None}
 
-    excluded: list[dict] = []
+    # --- pass 0: do these collections share a vector space? ---------------
+    from ragtools.service import vector_space as vspace
+
+    recorded = vspace.recorded_models(getattr(settings, "state_db", None))
+    spaces = {name: vspace.probe_space(client, name, recorded) for name in targets}
+    reference, compatible, excluded = vspace.partition(spaces)
+    for entry in excluded:
+        logger.warning("Map: excluding collection %s — %s",
+                       entry["collection"], entry["reason"])
+
+    if reference is None:
+        return {"points": [],
+                "coverage": _coverage(len(targets), 0, 0, 0, 0, False, [], excluded),
+                "excluded": excluded, "space": None}
+
     inventory: dict[str, dict[str, dict]] = {}
-    for collection_name in targets:
+    for collection_name in compatible:
         try:
             found = _enumerate_files(client, collection_name)
         except Exception as exc:  # noqa: BLE001
             # Report it. "No results" and "could not be read" are different
             # answers and the UI must be able to tell them apart.
             excluded.append({"collection": collection_name,
+                             "kind": vspace.KIND_FAILED,
                              "reason": f"unreadable: {type(exc).__name__}"})
             logger.warning("Map: collection %s unreadable: %s", collection_name, exc)
             continue
         if not found:
-            excluded.append({"collection": collection_name, "reason": "empty"})
+            excluded.append({"collection": collection_name, "kind": "empty",
+                             "reason": "empty"})
             continue
         inventory[collection_name] = found
 
     if not inventory:
-        return {"points": [], "coverage": _coverage(len(targets), 0, 0, 0, 0, False, []),
-                "excluded": excluded}
+        return {"points": [],
+                "coverage": _coverage(len(targets), 0, 0, 0, 0, False, [], excluded),
+                "excluded": excluded, "space": reference.describe()}
 
     # --- balanced file quota, with the unused share redistributed ---------
     quota = max(MIN_FILES_PER_PROJECT, MAP_MAX_FILES // len(inventory))
@@ -207,16 +288,21 @@ def compute_map_points(
     for name, paths in selected.items():
         if sampled_vectors >= MAP_MAX_POINTS:
             truncated = True
-            excluded.append({"collection": name, "reason": "vector budget exhausted"})
+            excluded.append({"collection": name, "kind": "truncated",
+                             "reason": "vector budget exhausted"})
             continue
         try:
-            fetched = _fetch_vectors(client, name, paths)
+            fetched = _fetch_vectors(client, name, paths,
+                                     vector_name=reference.vector_name,
+                                     dimension=reference.dimension)
         except Exception as exc:  # noqa: BLE001
-            excluded.append({"collection": name,
+            excluded.append({"collection": name, "kind": vspace.KIND_FAILED,
                              "reason": f"vector fetch failed: {type(exc).__name__}"})
             logger.warning("Map: vector fetch failed for %s: %s", name, exc)
             continue
-        is_framework = name.startswith("fw_")
+        # One predicate answers "what kind of collection is this" (R08); this
+        # was the third independent spelling of it.
+        is_framework = is_framework_collection_name(name)
         for fp, vecs in fetched.items():
             if not vecs:
                 continue
@@ -238,15 +324,15 @@ def compute_map_points(
             }
             sampled_vectors += len(vecs)
 
-    if not file_vectors:
+    file_keys = sorted(file_vectors.keys())
+    mean_embeddings, file_keys = _stack(file_keys, file_vectors)
+    if not file_keys:
         return {"points": [],
                 "coverage": _coverage(len(targets), 0,
                                       sum(len(f) for f in inventory.values()), 0, 0,
-                                      truncated, []),
-                "excluded": excluded}
+                                      truncated, [], excluded),
+                "excluded": excluded, "space": reference.describe()}
 
-    file_keys = sorted(file_vectors.keys())
-    mean_embeddings = np.array([np.mean(file_vectors[k], axis=0) for k in file_keys])
     coords_norm = _normalize_coords(_pca_project(mean_embeddings))
 
     points = []
@@ -280,18 +366,32 @@ def compute_map_points(
         vectors_sampled=sampled_vectors,
         truncated=truncated or len(points) < files_eligible,
         per_project=per_project,
+        excluded=excluded,
     )
     logger.info(
-        "Computed map: %d/%d files across %d/%d collections (%d vectors)",
+        "Computed map: %d/%d files across %d/%d collections (%d vectors, "
+        "%d excluded: %d incompatible, %d failed)",
         len(points), files_eligible, coverage["projects_represented"],
-        len(targets), sampled_vectors,
+        len(targets), sampled_vectors, coverage["collections_excluded"],
+        coverage["collections_incompatible"], coverage["collections_failed"],
     )
-    return {"points": points, "coverage": coverage, "excluded": excluded}
+    return {"points": points, "coverage": coverage, "excluded": excluded,
+            "space": reference.describe()}
 
 
 def _coverage(projects_total, projects_represented, files_eligible,
-              files_sampled, vectors_sampled, truncated, per_project) -> dict:
-    """The map's own account of what it did and did not draw."""
+              files_sampled, vectors_sampled, truncated, per_project,
+              excluded) -> dict:
+    """The map's own account of what it did and did not draw.
+
+    The ``collections_*`` counts are derived from ``excluded`` rather than
+    accumulated alongside it, so a reason recorded without a count (or the
+    reverse) is not expressible. Each names its unit and its meaning: a reader
+    must never have to guess whether a number counts files or collections, nor
+    whether an exclusion was a refusal (``incompatible``) or a fault
+    (``failed``).
+    """
+    kinds = Counter(entry.get("kind", "excluded") for entry in excluded)
     return {
         "projects_total": projects_total,
         "projects_represented": projects_represented,
@@ -300,6 +400,12 @@ def _coverage(projects_total, projects_represented, files_eligible,
         "vectors_sampled": vectors_sampled,
         "truncated": bool(truncated),
         "per_project": per_project,
+        # Collections routed to the map but not drawn, by why.
+        "collections_excluded": len(excluded),
+        "collections_incompatible": kinds.get("incompatible", 0),
+        "collections_failed": kinds.get("failed", 0),
+        "collections_empty": kinds.get("empty", 0),
+        "collections_truncated": kinds.get("truncated", 0),
     }
 
 
@@ -368,7 +474,19 @@ def _ensure_cache_table(db_path: str) -> None:
 
 
 def get_cache_version_hash(db_path: str) -> str:
-    """Compute a hash of the current index state. Changes when any file is added/removed/modified."""
+    """Hash of everything that decides what the map should look like.
+
+    Two inputs, because there are two ways the picture changes:
+
+    * **What is indexed** — the file hashes. A file added, removed or edited
+      moves a point.
+    * **What it was indexed WITH** — the recorded index identity (model,
+      dimension, project → collection mapping). Re-embedding under a different
+      model rewrites every vector while leaving every file hash untouched, so a
+      file-only digest kept serving the previous model's projection as current.
+      That is the same input the compatibility pre-flight reads, and the cache
+      has to be keyed on it or a model change is invisible to the map.
+    """
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(
@@ -380,7 +498,11 @@ def get_cache_version_hash(db_path: str) -> str:
     finally:
         conn.close()
 
+    from ragtools.service.vector_space import identity_meta_rows
+
+    identity = identity_meta_rows(db_path)
     raw = "|".join(f"{fp}:{fh}" for fp, fh in rows)
+    raw += "||" + "|".join(f"{k}={identity[k]}" for k in sorted(identity))
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 

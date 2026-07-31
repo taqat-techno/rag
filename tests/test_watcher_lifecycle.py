@@ -221,7 +221,11 @@ def test_shutdown_does_not_mutate_desired_state(wenv, monkeypatch):
     monkeypatch.setattr(activity_mod, "log_activity", lambda *a, **k: None)
 
     routes_mod._watcher_desired_run = True
-    routes_mod.shutdown()
+    # `/api/shutdown` gained a confirmation contract in v3.5.1 (WP-R09):
+    # the token is this process's own instance id, published by
+    # /identity. What this test pins is unchanged — a shutdown must not
+    # record a user "stop" intent.
+    routes_mod.shutdown(confirm=routes_mod._INSTANCE_ID)
     assert routes_mod._watcher_desired_run is True
 
 

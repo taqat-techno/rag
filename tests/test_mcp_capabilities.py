@@ -72,9 +72,19 @@ def test_reindex_has_annotation_and_is_not_read_only():
 
 
 def test_destructive_tools_are_the_irreversible_ones():
-    assert destructive_tools() == frozenset({"delete_collection", "restore_collection"})
+    """``delete_project`` joined the set in v3.5.1 (WP-R09).
+
+    It belongs by the same standard the other two meet: removing a project drops
+    its collection AND its config entry, and nothing brings either back. Until it
+    was named here, "Manage projects" — the group an owner grants so a client can
+    add a folder and edit ignore rules — silently carried the power to erase one,
+    because the destructive modifier only applies to the tools listed here.
+    """
+    assert destructive_tools() == frozenset({
+        "delete_collection", "restore_collection", "delete_project"})
     assert tool_spec("delete_collection").destructive is True
     assert tool_spec("delete_collection").read_only is False
+    assert tool_spec("delete_project").destructive is True
 
 
 def test_destructive_modifier_removes_unless_allowed():

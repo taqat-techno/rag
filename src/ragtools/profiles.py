@@ -34,14 +34,15 @@ CAPABILITY_GROUPS: dict[str, frozenset[str]] = {
         "find_definition", "secret_audit", "list_projects", "index_status",
     }),
     "project_management": frozenset({
-        "add_project", "set_project_mode", "add_project_ignore_rule",
+        "add_project", "update_project", "delete_project",
+        "set_project_mode", "add_project_ignore_rule",
         "remove_project_ignore_rule", "project_status", "project_summary",
         "list_project_files", "get_project_ignore_rules", "preview_ignore_effect",
     }),
-    "indexing": frozenset({"run_index", "reindex_project"}),
+    "indexing": frozenset({"run_index", "reindex_project", "rebuild_index"}),
     "framework_management": frozenset({
-        "list_dependencies", "add_dependency", "set_project_dependencies",
-        "remove_dependency",
+        "list_dependencies", "add_dependency", "update_dependency",
+        "set_project_dependencies", "remove_dependency",
         "list_frameworks", "link_framework", "unlink_framework", "reindex_framework",
         "framework_status",
     }),
@@ -49,11 +50,17 @@ CAPABILITY_GROUPS: dict[str, frozenset[str]] = {
         "list_collections", "collection_status", "create_collection",
         "snapshot_collection", "restore_collection", "delete_collection",
     }),
-    "configuration": frozenset({"get_config", "get_ignore_rules", "get_paths"}),
+    "configuration": frozenset({"get_config", "get_ignore_rules", "get_paths",
+                                "update_config"}),
     "service_operations": frozenset({
         "service_status", "recent_activity", "tail_logs", "crash_history",
         "system_health", "list_indexed_paths",
     }),
+    # Stopping the service is not a diagnostic. Folding `shutdown_service` into
+    # `service_operations` would have let every profile granted "view the logs"
+    # stop the machine's knowledge base; it gets its own group so granting it is
+    # a separate, deliberate act.
+    "service_control": frozenset({"shutdown_service"}),
     "profile_administration": frozenset({
         "list_client_profiles", "client_profile_status",
     }),

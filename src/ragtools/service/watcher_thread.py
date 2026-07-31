@@ -19,6 +19,7 @@ from watchfiles import watch, Change
 from ragtools.config import Settings
 from ragtools.ignore import IgnoreRules, RAGIGNORE_FILENAME
 from ragtools.service.owner import QdrantOwner
+from ragtools.service.pending_changes import KIND_DELETE, KIND_UPSERT
 
 logger = logging.getLogger("ragtools.watcher")
 
@@ -50,13 +51,26 @@ def _affected_projects(changed_paths, project_map) -> set:
     the scanner excludes them from the parent's scan — silently dropping the
     change. ``project_map`` maps a resolved project root Path to its id.
     """
-    affected: set = set()
-    for changed_path in changed_paths:
+    return set(_changes_by_project([(None, p) for p in changed_paths], project_map))
+
+
+def _changes_by_project(changes, project_map) -> dict:
+    """``project_id -> [(kind, path), ...]`` by the SAME deepest-match rule.
+
+    One attribution routine, so the set of projects to index and the set of
+    changes queued for a project can never disagree about who owns a path.
+    ``kind`` is this layer's vocabulary (``"upsert"``/``"delete"``), so nothing
+    downstream has to import watchfiles to understand a queued event.
+    """
+    grouped: dict = {}
+    for change, changed_path in changes:
         resolved = Path(changed_path).resolve()
         root = _deepest_matching_root(resolved, project_map.keys())
-        if root is not None:
-            affected.add(project_map[root])
-    return affected
+        if root is None:
+            continue
+        kind = KIND_DELETE if change == Change.deleted else KIND_UPSERT
+        grouped.setdefault(project_map[root], []).append((kind, changed_path))
+    return grouped
 
 
 class WatcherThread(threading.Thread):
@@ -286,10 +300,11 @@ class WatcherThread(threading.Thread):
 
                 # Determine affected projects — DEEPEST match, not first match
                 # (S1/A6, B25), so a nested child's change is not mis-attributed
-                # to its parent and silently dropped.
-                affected = _affected_projects(
-                    [p for _, p in md_changes], project_map
-                )
+                # to its parent and silently dropped. Grouped, so the changes
+                # queued for a project when indexing cannot run right now are
+                # exactly the ones attributed to it.
+                by_project = _changes_by_project(md_changes, project_map)
+                affected = set(by_project)
 
                 added = sum(1 for c, _ in md_changes if c == Change.added)
                 modified = sum(1 for c, _ in md_changes if c == Change.modified)
@@ -298,15 +313,31 @@ class WatcherThread(threading.Thread):
                 log_activity("info", "watcher", f"Changes in {', '.join(affected)}: +{added} ~{modified} -{deleted}")
 
                 # Index only affected projects
-                for pid in affected:
+                for pid, pid_changes in by_project.items():
                     try:
                         stats = self._owner.run_incremental_index(project_id=pid)
+                        if stats.get("busy"):
+                            # An index run — most often a rebuild, which holds
+                            # the mutex from end to end — is in progress. There
+                            # is no "next tick" to fall back on: the watcher
+                            # only wakes when the filesystem moves again, and a
+                            # rebuild rewrites this project's state rows from
+                            # its own scan, so this edit would be recorded as
+                            # already-current over pre-edit content. Queue it.
+                            self._queue_for_replay(pid, pid_changes, log_activity,
+                                                   "an index run was in progress")
+                            continue
                         if stats["indexed"] > 0 or stats["deleted"] > 0:
                             logger.info("Project %s: indexed=%d, skipped=%d, deleted=%d",
                                         pid, stats["indexed"], stats["skipped"], stats["deleted"])
                     except Exception as e:
                         logger.error("Indexing error for project %s: %s", pid, e)
                         log_activity("error", "watcher", f"Indexing error ({pid}): {e}")
+                        # The changes are real whether or not indexing them
+                        # worked. Queuing them is what turns a logged error into
+                        # something that actually gets retried.
+                        self._queue_for_replay(pid, pid_changes, log_activity,
+                                               f"indexing raised {type(e).__name__}")
 
         except Exception as e:
             if not self._stop_event.is_set():
@@ -315,6 +346,35 @@ class WatcherThread(threading.Thread):
 
         logger.info("Watcher stopped")
         log_activity("info", "watcher", "Watcher stopped")
+
+    def _queue_for_replay(self, project_id, changes, log_activity, why: str) -> None:
+        """Hand changes that could not be indexed now to the durable ledger.
+
+        Best-effort at the boundary only: a ledger that cannot be written is
+        logged loudly rather than raised, because raising here would take down
+        the watch loop that is the only thing still observing the filesystem.
+        """
+        try:
+            result = self._owner.capture_pending_changes(project_id, changes)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not queue %d change(s) for %s (%s): %s",
+                         len(changes), project_id, why, exc)
+            log_activity("error", "watcher",
+                         f"Changes to '{project_id}' could not be queued: {exc}")
+            return
+        status = result.get("status")
+        if status == "unavailable":
+            logger.error("Changes to %s were seen while %s but there is no "
+                         "ledger to queue them in", project_id, why)
+            log_activity("error", "watcher",
+                         f"Changes to '{project_id}' could not be recorded — "
+                         f"re-index that project once the current run finishes")
+            return
+        logger.info("Queued %d change(s) for %s (%s): %s",
+                    len(changes), project_id, why, status)
+        log_activity("info", "watcher",
+                     f"{len(changes)} change(s) to '{project_id}' queued for "
+                     f"replay — {why}")
 
     def stop(self):
         """Signal the watcher to stop."""

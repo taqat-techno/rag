@@ -60,6 +60,17 @@ STATUS_BLOCKED = "blocked"
 PLAN_RUNNING = "running"
 PLAN_COMPLETE = "complete"
 
+#: A plan that is re-driving work an INTERRUPTED REBUILD left unfinished, rather
+#: than performing a layout transition.
+#:
+#: Deliberately not ``running``. :func:`active_plan` filters on ``running`` and
+#: :func:`guard_ready` refuses EVERY search while an active plan exists — correct
+#: for a layout migration, where the index genuinely is half-built, and the
+#: v3.1.0 disproportion all over again if one project's failed rebuild disabled
+#: retrieval for the other twenty-four. A recovery plan borrows this module's
+#: per-unit accounting (attempts, backoff, blocked-vs-failed) and nothing else.
+PLAN_RECOVERING = "recovering"
+
 #: How many times a unit is retried automatically before it is left alone.
 #: `rag upgrade --resume` clears this: an operator who has fixed the cause is
 #: entitled to a fresh budget, and only they know the cause was fixed.
@@ -322,12 +333,19 @@ def capture_inventory(settings, owner=None) -> Inventory:
 
 
 def begin(settings, inventory: Inventory, *, from_backend: str, to_backend: str,
-          from_strategy: str, to_strategy: str) -> int:
+          from_strategy: str, to_strategy: str,
+          status: str = PLAN_RUNNING) -> int:
     """Persist the plan and its units. Returns the plan id.
 
     Called BEFORE the old index is retired. If the process dies immediately
     afterwards, the next start finds a running plan with every unit pending —
     which is exactly the correct state to resume from.
+
+    ``status`` exists so a recovery plan (:data:`PLAN_RECOVERING`) can be created
+    at its final status rather than spending a window as ``running``. That window
+    is not cosmetic: :func:`guard_ready` refuses every search while a plan is
+    ``running``, so a recovery plan that passed through that state would take
+    retrieval down for as long as it took to correct itself.
     """
     conn = _connect(settings)
     try:
@@ -336,7 +354,7 @@ def begin(settings, inventory: Inventory, *, from_backend: str, to_backend: str,
                 "INSERT INTO relayout_plan (created_at, from_backend, to_backend,"
                 " from_strategy, to_strategy, status) VALUES (?,?,?,?,?,?)",
                 (time.time(), from_backend, to_backend, from_strategy,
-                 to_strategy, PLAN_RUNNING))
+                 to_strategy, status))
             plan_id = int(cursor.lastrowid or 0)
             conn.executemany(
                 "INSERT OR REPLACE INTO relayout_unit"
@@ -369,6 +387,28 @@ def active_plan(settings) -> Optional[int]:
         row = conn.execute(
             "SELECT id FROM relayout_plan WHERE status=? ORDER BY id DESC LIMIT 1",
             (PLAN_RUNNING,)).fetchone()
+        return int(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def plan_with_status(settings, status: str) -> Optional[int]:
+    """The newest plan at ``status``, or None. Asks WITHOUT creating anything.
+
+    Same discipline as :func:`active_plan`: ``_connect`` runs the schema script,
+    so connecting to find out whether a plan exists would bring the database into
+    being as a side effect of the question.
+    """
+    if not _db_path(settings).exists():
+        return None
+    try:
+        conn = _connect(settings)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id FROM relayout_plan WHERE status=? ORDER BY id DESC LIMIT 1",
+            (status,)).fetchone()
         return int(row[0]) if row else None
     finally:
         conn.close()

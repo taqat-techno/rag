@@ -5,6 +5,7 @@ import logging
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
+from ragtools.collection_router import identity_from_name
 from ragtools.config import Settings
 from ragtools.embedding.encoder import Encoder
 from ragtools.models import SearchResult
@@ -30,11 +31,16 @@ def point_to_search_result(point, scope: str = "project",
     per-project search path, so both return the same result type regardless of
     which collection model produced the hit.
 
-    ``scope`` records WHICH collection answered — the project's own, or a
+    ``scope`` records WHICH KIND of collection answered — a project's own, or a
     framework corpus it links. The reader needs that: "your code does X" and
     "the framework you vendor does X" lead to different next actions, and the
     payload alone cannot say which, because a framework chunk carries the
     framework's id rather than the project's.
+
+    ``scope_source`` names that source in terms the reader can act on — the
+    project id, or the dependency's corpus id — never the ``proj_<uuid>``
+    collection it happens to be stored in. Both come from
+    :meth:`Searcher.collection_identities`.
     """
     from ragtools.secret_scan import redact_text
 
@@ -74,10 +80,17 @@ class Searcher:
         encoder: Encoder,
         settings: Settings | None = None,
         collections: list[str] | None = None,
+        router=None,
     ):
         self.client = client
         self.encoder = encoder
         self.settings = settings or Settings()
+        #: The routing authority, when the caller has one. It is what turns a
+        #: collection NAME into what that collection IS — see
+        #: :meth:`collection_identities`. Optional so a bare Searcher still
+        #: works; without it the naming scheme is read instead, which knows the
+        #: kind but not which project owns a ``proj_<uuid>``.
+        self.router = router
         #: Routed collections this searcher reads when a call does not name its
         #: own. Every caller that built a bare Searcher — dev-search, MCP direct
         #: mode, the CLI's offline branch, the code graph — silently fell back
@@ -110,6 +123,28 @@ class Searcher:
             "read requested with no routed collections under per_project; "
             "refusing to guess — resolve them through CollectionRouter")
         return []
+
+    def collection_identities(self, targets: list[str]) -> dict:
+        """What each collection being read IS — never where it sat in the list.
+
+        Provenance is a property of the STORE that answered, so it is derived
+        from the store. The previous rule — "index 0 is the project, the rest
+        are frameworks" — encoded the router's ordering *preference* as if it
+        were a statement of kind, and an explicit multi-project search made it
+        wrong for every project but the first.
+
+        A labelling failure must never fail the search: if the router cannot
+        answer, fall back to the naming scheme, which still gets the kind right
+        and simply says less about the source.
+        """
+        if self.router is not None:
+            try:
+                return self.router.identify(targets)
+            except Exception:  # noqa: BLE001 — see docstring
+                logger.exception(
+                    "could not identify the collections being read; "
+                    "labelling from the naming scheme instead")
+        return {name: identity_from_name(name) for name in targets}
 
     def search(
         self,
@@ -148,6 +183,9 @@ class Searcher:
                 is then omitted — it would be redundant for the project's own
                 collection and actively WRONG for a framework corpus, whose
                 chunks carry the framework's id, not the project's.
+                FILTERING ONLY. It says nothing about what any collection is;
+                provenance comes from :meth:`collection_identities`. Conflating
+                the two is the defect this flag used to carry.
 
         Returns:
             List of SearchResult objects, sorted by score descending.
@@ -210,10 +248,13 @@ class Searcher:
         if not targets:
             return []
 
-        # The router puts the project's OWN collection first and its linked
-        # framework corpora after it, so position identifies the scope.
+        # Provenance comes from what each collection IS, resolved once for the
+        # whole batch. The router's ordering (own collection first) is a ranking
+        # preference and says nothing about kind — reading it as one is what
+        # told users their own project's code came from a vendored dependency.
+        identities = self.collection_identities(targets)
         scoped: list = []
-        for index, collection in enumerate(targets):
+        for collection in targets:
             try:
                 hits = self.client.query_points(
                     collection_name=collection,
@@ -228,13 +269,8 @@ class Searcher:
                 # take down search of the project's own content. A missing
                 # collection contributes nothing; it is not an error.
                 continue
-            is_framework = collection.startswith("fw_") or (
-                collection_scoped and index > 0
-            )
-            scope = "framework" if is_framework else "project"
-            scoped.extend(
-                (p, scope, collection if is_framework else "") for p in hits
-            )
+            identity = identities.get(collection) or identity_from_name(collection)
+            scoped.extend((p, identity.scope, identity.source) for p in hits)
 
         # Merge across collections: scores are cosine similarities from one
         # shared embedding model, so they are directly comparable. Ties keep

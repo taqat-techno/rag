@@ -93,7 +93,10 @@ def _migration_remedy(settings) -> str:
 
         return migration_remedy(settings)
     except Exception:  # noqa: BLE001
-        return "restart the service — it resumes the rebuild automatically"
+        # NOT "restart the service": a restart re-drives nothing that the
+        # automatic retry has not already tried, and saying otherwise sends the
+        # user to lose the state that explains the failure.
+        return "rag upgrade --resume — the service also retries automatically"
 
 
 def _collection_display() -> str:
@@ -207,6 +210,21 @@ def health():
     except Exception:  # noqa: BLE001
         pass
 
+    # ...and what is being DONE about it. An unresolved plan stays here until the
+    # work is genuinely finished, and it carries both the reason recorded when
+    # the block was written and the verdict from the most recent re-test. A
+    # persisted `blocked_reason` shown alone is a fact about the past presented
+    # as the present, which is how a health payload loses its credibility.
+    recovery_state = None
+    try:
+        from ragtools.service import recovery as _recovery
+
+        recovery_state = _recovery.health(owner.settings)
+        if recovery_state is not None:
+            issues.append("recovery_unresolved")
+    except Exception:  # noqa: BLE001 — reporting must never break liveness
+        recovery_state = None
+
     # A registry that cannot be vouched for. The collections still hold the
     # vectors, but nothing can prove whose they are — so project→collection
     # pointer swaps and collection reaping are refused until it is reconciled,
@@ -280,6 +298,13 @@ def health():
             # responses: one wants patience, the other wants a person.
             "blocked": migration_state.blocked,
             "blocked_reason": migration_state.blocked_reason or None,
+            # The same value, named for what it actually is: the reason recorded
+            # WHEN the block was written. Nothing about that record expires, and
+            # presenting it as current state beside a healthy engine is how a
+            # health payload loses its credibility. `blocked_reason` is kept
+            # because /health's 200 body is a stable contract (Decision 16) —
+            # keys may be added, never renamed.
+            "blocked_reason_recorded": migration_state.blocked_reason or None,
             "stalled": migration_state.stalled,
             "failures": [
                 {"kind": k, "id": i, "error": e}
@@ -321,6 +346,11 @@ def health():
         # reconciliation has run yet); "ok"/"extended"/"repointed" are sound;
         # anything else is why `registry_integrity_unresolved` is in `issues`.
         "registry_integrity": registry_integrity,
+        # An interrupted rebuild that is being re-driven, or `None` when there is
+        # nothing unresolved. It reports `blocked_reason_recorded` and
+        # `precondition` (re-tested, with the time it was measured) separately,
+        # so a stale record can never be mistaken for current state.
+        "recovery": recovery_state,
         # What the schema migration did on this boot, so "am I actually running
         # a v3 configuration?" is answerable without reading the file.
         "config_version": getattr(owner.settings, "config_version", None),
@@ -518,6 +548,7 @@ def secret_audit_endpoint(
 
 @router.post("/api/index")
 def index(req: IndexRequest, wait: bool = Query(False), response: Response = None,
+          request: Request = None,
           idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")):
     """Trigger indexing. Incremental by default.
 
@@ -528,31 +559,39 @@ def index(req: IndexRequest, wait: bool = Query(False), response: Response = Non
 
     ``?wait=true`` preserves the original synchronous contract for the CLI and
     existing tests.
+
+    Guarded: an incremental run is delete-aware, so it is a write to the index
+    like any other and needs the caller's ``run_index`` capability and a store
+    that is actually there.
     """
+    from ragtools.service import destructive
+
     owner = get_owner()
-    if wait:
-        if req.full:
-            stats = owner.run_full_index(project_id=req.project)
-        else:
-            stats = owner.run_incremental_index(project_id=req.project)
-        return {"stats": stats}
+    with destructive.guarded(owner, "index", request=request,
+                             subject=req.project or ""):
+        if wait:
+            if req.full:
+                stats = owner.run_full_index(project_id=req.project)
+            else:
+                stats = owner.run_incremental_index(project_id=req.project)
+            return {"stats": stats}
 
-    try:
-        runtime = get_runtime()
-    except RuntimeError:
-        # No job engine (degraded) — never silently drop the request.
-        if req.full:
-            stats = owner.run_full_index(project_id=req.project)
-        else:
-            stats = owner.run_incremental_index(project_id=req.project)
-        return {"stats": stats}
+        try:
+            runtime = get_runtime()
+        except RuntimeError:
+            # No job engine (degraded) — never silently drop the request.
+            if req.full:
+                stats = owner.run_full_index(project_id=req.project)
+            else:
+                stats = owner.run_incremental_index(project_id=req.project)
+            return {"stats": stats}
 
-    job = runtime.submit("index", {"project": req.project, "full": bool(req.full)},
-                         idempotency_key=idempotency_key)
-    if response is not None:
-        response.status_code = 202
-        response.headers["Location"] = f"/api/jobs/{job.id}"
-    return job.to_dict()
+        job = runtime.submit("index", {"project": req.project, "full": bool(req.full)},
+                             idempotency_key=idempotency_key)
+        if response is not None:
+            response.status_code = 202
+            response.headers["Location"] = f"/api/jobs/{job.id}"
+        return job.to_dict()
 
 
 # --- Jobs (Phase 2 / W2) ---
@@ -682,22 +721,28 @@ def events_stream(
 
 
 @router.post("/api/rebuild")
-def rebuild():
+def rebuild(request: Request = None, confirm: Optional[str] = Query(None)):
     """Drop all data and rebuild index from scratch.
 
     Refuses with **409 Conflict** — never 500 — when the store is unreachable, a
     migration owns the index, an indexing run is active, or another destructive
     operation holds the lock. The request is well-formed; the server is
     temporarily unable to honour it, and that is a conflict, not an error.
+
+    A caller that is not the owner additionally needs the ``rebuild_index``
+    capability, and ``confirm=rebuild`` when its profile requires a token.
     """
     from ragtools.service import destructive
 
     owner = get_owner()
     try:
-        with destructive.destructive_operation(owner, operation="rebuild"):
+        with destructive.guarded(owner, "rebuild", request=request,
+                                 subject="rebuild", confirm=confirm):
             stats = owner.rebuild()
     except destructive.OperationRefused as refused:
-        raise HTTPException(status_code=409, detail={
+        from ragtools.service.errors import refusal_status
+
+        raise HTTPException(status_code=refusal_status(refused.code), detail={
             "error": "rebuild_refused",
             "code": refused.code,
             "message": refused.reason,
@@ -761,6 +806,130 @@ def migration_resume():
         "plan": plan,
         "state": report.describe() if report else "",
     })
+
+
+#: The recovery worker, so a second one is never started on top of it.
+_recovery_thread: Optional[threading.Thread] = None
+
+
+@router.get("/api/recovery")
+def recovery_status():
+    """What an interrupted rebuild is still waiting on — re-tested, not recalled.
+
+    ``blocked_reason_recorded`` is what was written down when the block was
+    written; ``precondition`` is the verdict from the most recent re-test, with
+    the time it was taken. Presenting only the first is how a two-hour-old
+    ``WinError 10061`` comes to sit beside a healthy engine.
+    """
+    from ragtools.service import recovery
+
+    owner = get_owner()
+    state = recovery.health(owner.settings)
+    if state is None:
+        return {"status": "clear",
+                "message": "no rebuild is unresolved on this installation"}
+    return {"status": "unresolved", **state}
+
+
+@router.post("/api/recovery/retry")
+def recovery_retry():
+    """Give an unresolved rebuild a fresh attempt budget and drive it now.
+
+    Automatic retries are bounded so a machine cannot loop; an operator asking
+    for this has fixed the cause, and only they know that. Restarting the service
+    is NOT the alternative — it re-drives nothing, which is why this exists.
+
+    Returns 202: the re-index runs on its own thread and can take a long time; an
+    HTTP request must not be the thing holding it.
+    """
+    from fastapi.responses import JSONResponse
+
+    from ragtools.service import recovery
+    from ragtools.upgrade import relayout
+
+    global _recovery_thread
+
+    owner = get_owner()
+    plan = recovery.pending_plan(owner.settings)
+    if plan is None and recovery.ensure_plan(owner, owner.settings) is None:
+        return {"status": "clear",
+                "message": "no rebuild is unresolved on this installation"}
+    plan = plan if plan is not None else recovery.pending_plan(owner.settings)
+
+    # Durable and immediate, before the worker: a reset that only happens inside
+    # a thread nobody waited for is a reset the caller cannot rely on.
+    relayout.reset_attempts(owner.settings, plan)
+
+    existing = _recovery_thread
+    if existing is not None and existing.is_alive():
+        return JSONResponse(status_code=202, content={
+            "status": "already_running", "plan": plan,
+            "message": "a recovery pass is already in progress"})
+
+    def _run():
+        try:
+            report = recovery.drive(owner)
+            logger.info("recovery retry: %s", report.describe())
+        except Exception:  # noqa: BLE001
+            logger.exception("the recovery pass failed")
+
+    _recovery_thread = threading.Thread(target=_run, name="rebuild-recovery",
+                                        daemon=True)
+    _recovery_thread.start()
+    report = relayout.progress(owner.settings, plan)
+    return JSONResponse(status_code=202, content={
+        "status": "retrying", "plan": plan,
+        "state": report.describe() if report else "",
+    })
+
+
+@router.get("/api/storage/orphans")
+def storage_orphans(grace_hours: float = 24.0):
+    """Which generation collections are orphaned, and why the rest are not.
+
+    Read-only and dry-run by construction — it cannot delete, whatever the
+    configuration says. The counterpart that can is ``POST /api/storage/reap``,
+    which is a separate, explicit act for the same reason ``rag storage reclaim``
+    is separate from a layout change.
+
+    A refusal (an unresolved registry, an unreachable engine) is reported in the
+    body rather than raised: the moment somebody needs this endpoint is the
+    moment the thing it reports on is already broken, and a 500 then is useless.
+    """
+    from ragtools import generation_reaper
+
+    owner = get_owner()
+    report = generation_reaper.reap(owner, apply=False,
+                                    grace_seconds=grace_hours * 3600.0)
+    body = report.to_dict()
+    body["auto_reap_enabled"] = generation_reaper.auto_reap_enabled(owner.settings)
+    body["audit"] = generation_reaper.audit_log(owner.settings, limit=25)
+    return body
+
+
+@router.post("/api/storage/reap")
+def storage_reap(grace_hours: float = 24.0):
+    """Drop the orphaned generation collections the sweep can account for.
+
+    Destructive, and therefore refused with **409 Conflict** — never 500 — when
+    the registry cannot be vouched for, the store is unreachable, an indexing run
+    or a migration owns the index, or another destructive operation holds the
+    lock. The sweep is re-run here rather than trusting anything a previous
+    ``/api/storage/orphans`` call reported: a candidate list ages, and acting on
+    a stale one is how a live staging collection gets deleted.
+    """
+    from ragtools import generation_reaper
+
+    owner = get_owner()
+    report = generation_reaper.reap(owner, apply=True,
+                                    grace_seconds=grace_hours * 3600.0)
+    if not report.allowed:
+        raise HTTPException(status_code=409, detail={
+            "error": "reap_refused",
+            "message": report.refusal,
+            "report": report.to_dict(),
+        })
+    return report.to_dict()
 
 
 # --- Status ---
@@ -1027,10 +1196,14 @@ def _schedule_framework_sync(cause: str):
 
 
 @router.post("/api/projects")
-def project_create(req: ProjectCreateRequest):
+def project_create(req: ProjectCreateRequest, request: Request = None):
     """Add a new project."""
     from pathlib import Path as P
     from ragtools.config import ProjectConfig
+    from ragtools.service import destructive
+
+    destructive.authorize(get_owner(), "project_create", request=request,
+                          subject=req.id)
 
     err = _validate_project_id(req.id)
     if err:
@@ -1080,9 +1253,14 @@ def project_create(req: ProjectCreateRequest):
 
 
 @router.put("/api/projects/{project_id}")
-def project_update(project_id: str, req: ProjectUpdateRequest):
+def project_update(project_id: str, req: ProjectUpdateRequest,
+                   request: Request = None):
     """Update a project."""
     from pathlib import Path as P
+    from ragtools.service import destructive
+
+    destructive.authorize(get_owner(), "project_update", request=request,
+                          subject=project_id)
     settings = get_settings()
     project = next((p for p in settings.projects if p.id == project_id), None)
     if not project:
@@ -1147,30 +1325,49 @@ def project_update(project_id: str, req: ProjectUpdateRequest):
 
 
 @router.delete("/api/projects/{project_id}")
-def project_delete(project_id: str):
-    """Remove a project and delete its indexed data."""
-    settings = get_settings()
-    updated = [p for p in settings.projects if p.id != project_id]
-    if len(updated) == len(settings.projects):
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+def project_delete(project_id: str, request: Request = None,
+                   confirm: Optional[str] = Query(None)):
+    """Remove a project and delete its indexed data.
 
-    # Delete indexed data (Qdrant chunks + state DB entries)
+    The heaviest door in the product: it drops the project's collection and its
+    config entry, and nothing brings either back. Through v3.5.0 it reached
+    ``delete_project_data`` with no gate whatsoever — so it ran while ``/health``
+    was reporting the store unreachable, and any caller that could reach the port
+    could erase a project.
+    """
+    from ragtools.service import destructive
+
     owner = get_owner()
-    cleanup = owner.delete_project_data(project_id)
+    with destructive.guarded(owner, "project_delete", request=request,
+                             subject=project_id, confirm=confirm):
+        settings = get_settings()
+        updated = [p for p in settings.projects if p.id != project_id]
+        if len(updated) == len(settings.projects):
+            raise HTTPException(status_code=404,
+                                detail=f"Project '{project_id}' not found")
 
-    from ragtools.service.pages import _save_projects_to_toml
-    _save_projects_to_toml(updated)
-    owner.update_projects(updated)
+        # Delete indexed data (Qdrant chunks + state DB entries) BEFORE the
+        # config entry: a delete that fails must leave a project that still
+        # exists, not a config with no project and vectors with no owner.
+        cleanup = owner.delete_project_data(project_id)
 
-    from ragtools.service.activity import log_activity
-    log_activity("warning", "config", f"Project removed: {project_id} ({cleanup['files_deleted']} files deleted)")
-    _restart_watcher_if_running()
-    return {"status": "removed", "project_id": project_id, "files_deleted": cleanup["files_deleted"]}
+        from ragtools.service.pages import _save_projects_to_toml
+        _save_projects_to_toml(updated)
+        owner.update_projects(updated)
+
+        from ragtools.service.activity import log_activity
+        log_activity("warning", "config", f"Project removed: {project_id} ({cleanup['files_deleted']} files deleted)")
+        _restart_watcher_if_running()
+        return {"status": "removed", "project_id": project_id, "files_deleted": cleanup["files_deleted"]}
 
 
 @router.post("/api/projects/{project_id}/toggle")
-def project_toggle(project_id: str):
+def project_toggle(project_id: str, request: Request = None):
     """Toggle project enabled/disabled."""
+    from ragtools.service import destructive
+
+    destructive.authorize(None, "project_toggle", request=request,
+                          subject=project_id)
     settings = get_settings()
     project = next((p for p in settings.projects if p.id == project_id), None)
     if not project:
@@ -1193,13 +1390,19 @@ class ModeRequest(BaseModel):
 
 
 @router.post("/api/projects/{project_id}/mode")
-def project_set_mode(project_id: str, req: ModeRequest):
+def project_set_mode(project_id: str, req: ModeRequest, request: Request = None,
+                     confirm: Optional[str] = Query(None)):
     """Set a project's Mode (docs / code / general) and reindex if it changed.
 
     A single-purpose endpoint (vs PUT /api/projects/{id}) so the CLI/MCP can set
     the Mode without risking a stale name/path overwrite. Reindex is delete-aware
-    (G1) so narrowing the Mode purges the project's now-excluded chunks.
+    (G1) so narrowing the Mode purges the project's now-excluded chunks — which
+    is why this is gated, not merely validated.
     """
+    from ragtools.service import destructive
+
+    destructive.authorize(get_owner(), "project_set_mode", request=request,
+                          subject=project_id, confirm=confirm)
     settings = get_settings()
     project = next((p for p in settings.projects if p.id == project_id), None)
     if not project:
@@ -1446,11 +1649,14 @@ def dependencies_list():
 
 
 @router.post("/api/dependencies")
-def dependency_create(req: DependencyCreateRequest):
+def dependency_create(req: DependencyCreateRequest, request: Request = None):
     """Add a shared dependency to the catalog. Indexes nothing by itself."""
     from ragtools.config import DependencyConfig
     from ragtools.dependency_catalog import CatalogError, validate_new_entry
+    from ragtools.service import destructive
 
+    destructive.authorize(None, "dependency_create", request=request,
+                          subject=req.id)
     settings = get_settings()
     try:
         resolved = validate_new_entry(settings.dependencies, req.id, req.path)
@@ -1473,10 +1679,14 @@ def dependency_create(req: DependencyCreateRequest):
 
 
 @router.put("/api/dependencies/{dependency_id}")
-def dependency_update(dependency_id: str, req: DependencyUpdateRequest):
+def dependency_update(dependency_id: str, req: DependencyUpdateRequest,
+                      request: Request = None):
     """Rename, re-point or disable a catalog entry."""
     from ragtools.dependency_catalog import CatalogError, validate_new_entry
+    from ragtools.service import destructive
 
+    destructive.authorize(get_owner(), "dependency_update", request=request,
+                          subject=dependency_id)
     settings = get_settings()
     entry = settings.dependency(dependency_id)
     if entry is None:
@@ -1514,9 +1724,15 @@ def dependency_update(dependency_id: str, req: DependencyUpdateRequest):
 
 
 @router.delete("/api/dependencies/{dependency_id}")
-def dependency_delete(dependency_id: str, cascade: bool = Query(False)):
+def dependency_delete(dependency_id: str, cascade: bool = Query(False),
+                      request: Request = None,
+                      confirm: Optional[str] = Query(None)):
     """Remove a catalog entry. Refused while projects link it unless cascade."""
     from ragtools.dependency_catalog import projects_using, unlink_everywhere
+    from ragtools.service import destructive
+
+    destructive.authorize(get_owner(), "dependency_delete", request=request,
+                          subject=dependency_id, confirm=confirm)
 
     # Called directly (UI fragment, tests), an unpassed `cascade` is FastAPI's
     # Query sentinel — which is TRUTHY. Trusting it verbatim turns the refusal
@@ -1591,10 +1807,14 @@ def project_dependency_options(project_id: str):
 
 
 @router.put("/api/projects/{project_id}/dependencies")
-def project_dependencies_set(project_id: str, req: ProjectDependencyLinkRequest):
+def project_dependencies_set(project_id: str, req: ProjectDependencyLinkRequest,
+                             request: Request = None):
     """Replace a project's dependency links (multi-select save)."""
     from ragtools.dependency_catalog import CatalogError, validate_link_set
+    from ragtools.service import destructive
 
+    destructive.authorize(get_owner(), "project_dependencies_set", request=request,
+                          subject=project_id)
     settings = get_settings()
     project = next((p for p in settings.projects if p.id == project_id), None)
     if not project:
@@ -1667,8 +1887,11 @@ def frameworks_list():
 
 
 @router.post("/api/frameworks/sync")
-def frameworks_sync():
+def frameworks_sync(request: Request = None):
     """Reconcile declared dependencies -> framework corpora (background job)."""
+    from ragtools.service import destructive
+
+    destructive.authorize(get_owner(), "frameworks_sync", request=request)
     if not get_owner().router.is_per_project:
         raise HTTPException(
             status_code=409,
@@ -1742,8 +1965,11 @@ VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 
 
 @router.put("/api/config")
-def update_config(req: ConfigUpdateRequest):
+def update_config(req: ConfigUpdateRequest, request: Request = None):
     """Update configuration. Returns which fields changed and if restart is needed."""
+    from ragtools.service import destructive
+
+    destructive.authorize(None, "update_config", request=request)
     errors = []
     updates = {}
 
@@ -2124,6 +2350,10 @@ def map_points(project: Optional[str] = Query(None, description="Scope to one pr
     global sample. Filtering was why ``?project=rag`` answered ``count: 0`` for
     a project holding 1,716 chunks — a filter cannot recover data the sampler
     never fetched.
+
+    ``space`` names the vector space the projection was built in. Every entry
+    in ``excluded`` is measured against it, so a reason like "dimension 16 (map
+    uses 8)" is only checkable when the map says which 8 it means.
     """
     owner = get_owner()
     result = owner.get_map_points(project_id=project)
@@ -2133,6 +2363,7 @@ def map_points(project: Optional[str] = Query(None, description="Scope to one pr
         "count": len(points),
         "coverage": result.get("coverage", {}),
         "excluded": result.get("excluded", []),
+        "space": result.get("space"),
         "cache": result.get("cache", {}),
     }
 
@@ -2147,6 +2378,7 @@ def map_recompute():
         "count": len(result.get("points", [])),
         "coverage": result.get("coverage", {}),
         "excluded": result.get("excluded", []),
+        "space": result.get("space"),
     }
 
 
@@ -2437,19 +2669,31 @@ class IgnoreRuleRequest(BaseModel):
 
 
 @router.post("/api/projects/{project_id}/reindex")
-def project_reindex_endpoint(project_id: str, request: Request):
-    """Drop and re-index one project's data. Other projects are untouched."""
-    project = _resolve_project(project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
-    owner = get_owner()
-    stats = owner.reindex_project(project_id)
+def project_reindex_endpoint(project_id: str, request: Request,
+                             confirm: Optional[str] = Query(None)):
+    """Drop and re-index one project's data. Other projects are untouched.
 
-    from ragtools.service.activity import log_activity
-    log_activity("warning", _mcp_source(request),
-                 f"Reindex executed for project '{project_id}' "
-                 f"({stats.get('files_indexed', 0)} files indexed)")
-    return {"status": "reindexed", "project_id": project_id, "stats": stats}
+    ``reindex_project`` is ``delete_project_data`` followed by a full index, so
+    it destroys before it builds. Through v3.5.0 it reached that with no gate:
+    it would happily drop a project's collection while ``/health`` was reporting
+    the store unreachable, leaving the project with nothing and no way back.
+    """
+    from ragtools.service import destructive
+
+    owner = get_owner()
+    with destructive.guarded(owner, "project_reindex", request=request,
+                             subject=project_id, confirm=confirm):
+        project = _resolve_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404,
+                                detail=f"Project '{project_id}' not found")
+        stats = owner.reindex_project(project_id)
+
+        from ragtools.service.activity import log_activity
+        log_activity("warning", _mcp_source(request),
+                     f"Reindex executed for project '{project_id}' "
+                     f"({stats.get('files_indexed', 0)} files indexed)")
+        return {"status": "reindexed", "project_id": project_id, "stats": stats}
 
 
 @router.post("/api/projects/{project_id}/ignore")
@@ -2459,9 +2703,12 @@ def project_ignore_add_endpoint(project_id: str, req: IgnoreRuleRequest, request
     Does NOT reindex automatically — agent should call the reindex tool
     separately. This keeps cause-and-effect explicit.
     """
+    from ragtools.service import destructive
     from ragtools.service.activity import log_activity
     from ragtools.service.pages import _save_projects_to_toml
 
+    destructive.authorize(None, "project_ignore_add", request=request,
+                          subject=project_id)
     project = _resolve_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
@@ -2498,9 +2745,12 @@ def project_ignore_remove_endpoint(
     pattern: str = Query(..., description="Pattern to remove"),
 ):
     """Remove a pattern from the project's ignore_patterns list."""
+    from ragtools.service import destructive
     from ragtools.service.activity import log_activity
     from ragtools.service.pages import _save_projects_to_toml
 
+    destructive.authorize(None, "project_ignore_remove", request=request,
+                          subject=project_id)
     project = _resolve_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
@@ -2700,8 +2950,26 @@ def system_health_endpoint():
 # --- Shutdown ---
 
 @router.post("/api/shutdown")
-def shutdown():
-    """Graceful shutdown. Stops watcher, then signals uvicorn to exit."""
+def shutdown(request: Request = None, confirm: Optional[str] = Query(None)):
+    """Graceful shutdown. Stops watcher, then signals uvicorn to exit.
+
+    Through v3.5.0 this had no authorization, no confirmation and no guard:
+    anything that could reach ``127.0.0.1:21420`` could stop the knowledge base
+    for every client on the machine, and being on the loopback interface was
+    treated as permission. It is not — the MCP proxy makes a restricted client's
+    calls arrive on exactly that interface.
+
+    Two requirements now. The caller needs the ``shutdown_service`` capability,
+    which lives in its own group precisely so "may read the logs" never implies
+    "may stop the service". And ``confirm`` must equal this process's
+    ``instance_id`` — published by ``GET /identity`` and different after every
+    restart, so a blind or replayed call cannot produce it.
+    """
+    from ragtools.service import destructive
+
+    destructive.authorize(None, "service_shutdown", request=request,
+                          subject=_INSTANCE_ID, confirm=confirm)
+
     logger.info("Shutdown requested via API")
     from ragtools.service.activity import log_activity
     log_activity("warning", "service", "Shutdown requested")

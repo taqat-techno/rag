@@ -73,6 +73,10 @@ CAPABILITY_CATALOG: tuple[CapabilityInfo, ...] = (
                    "Link, unlink, and re-index framework corpora.", "write"),
     CapabilityInfo("collection_management", "Manage collections",
                    "Create, snapshot, restore, and delete collections.", "write"),
+    CapabilityInfo("service_control", "Stop the service",
+                   "Shut the local service down. Separate from diagnostics on "
+                   "purpose — reading the logs is not permission to stop it.",
+                   "write"),
     CapabilityInfo("profile_administration", "Administer client profiles",
                    "List and inspect other client profiles (owner only).", "owner"),
 )

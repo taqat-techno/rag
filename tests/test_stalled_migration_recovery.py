@@ -210,15 +210,23 @@ def test_recovery_never_deletes_the_rollback_store(stalled):
 
 
 def test_the_remedy_offered_for_this_machine_can_actually_run(stalled):
-    """This installation is `managed`, so `rag upgrade --resume` alone is a dead
-    end — the CLI refuses while the service is up and cannot build a client while
-    it is down."""
+    """This installation is `managed`, so `rag upgrade --resume` alone was a dead
+    end — the CLI refused while the service was up and could not build a client
+    while it was down. It now FORWARDS, so the command works.
+
+    The remedy no longer offers a restart (WP-R05). A restart re-runs
+    ``run_pending`` with no fresh attempt budget, so a plan whose units have
+    spent theirs comes back in exactly the state it went down in: the advice was
+    not merely unnecessary, it did not work.
+    """
     from ragtools.service.app import migration_remedy
 
     settings, _plan, _units = stalled
     remedy = migration_remedy(settings)
 
-    assert "restart the service" in remedy
+    assert "rag upgrade --resume" in remedy
+    assert "forwarded to the service" in remedy
+    assert "restart the service" not in remedy
 
 
 def test_a_stale_manifest_is_not_treated_as_a_reattach_candidate(stalled):

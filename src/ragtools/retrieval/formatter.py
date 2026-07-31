@@ -23,6 +23,25 @@ def _class_tag(r: SearchResult) -> str:
     return f" [{sc}]" if sc != "owned" else ""
 
 
+def _scope_tag(r: SearchResult) -> str:
+    """Name the shared dependency a framework hit came from.
+
+    ``_class_tag`` cannot say this. A vendored corpus is indexed ONCE and
+    referenced by every project that links it, so its chunks carry the
+    FRAMEWORK's id — the ``project/file`` line then reads as if the dependency
+    were a project of the user's own. Every structured surface has carried the
+    label since it existed; the text surfaces (MCP's default output, the CLI,
+    the panel) showed nothing, which is where most readers actually look.
+
+    Only framework hits are tagged: a project hit is already fully identified by
+    the ``project_id/file_path`` prefix, and tagging it would churn every
+    existing line for no added fact.
+    """
+    if getattr(r, "scope", "project") != "framework":
+        return ""
+    return f" [framework: {getattr(r, 'scope_source', '') or 'shared dependency'}]"
+
+
 def format_context(results: list[SearchResult], query: str) -> str:
     """Format search results into a full context block for the admin UI.
 
@@ -53,7 +72,7 @@ def format_context(results: list[SearchResult], query: str) -> str:
 
     for i, r in enumerate(results, 1):
         source = (
-            f"[{i}] Source: {_loc(r)}{_class_tag(r)}"
+            f"[{i}] Source: {_loc(r)}{_class_tag(r)}{_scope_tag(r)}"
             f" | Section: {' > '.join(r.headings) if r.headings else 'N/A'}"
             f" | Score: {r.score:.3f} ({r.confidence})"
         )
@@ -94,7 +113,7 @@ def format_context_compact(results: list[SearchResult], query: str) -> str:
     for i, r in enumerate(results, 1):
         # Compact header: [N] project/file.md:Lstart-end > Heading (score):
         heading = r.headings[-1] if r.headings else ""
-        lines.append(f"[{i}] {_loc(r)}{_class_tag(r)} > {heading} ({r.score:.2f}):")
+        lines.append(f"[{i}] {_loc(r)}{_class_tag(r)}{_scope_tag(r)} > {heading} ({r.score:.2f}):")
         lines.append(_truncate(r.text))
         lines.append("")
 
@@ -158,7 +177,8 @@ def format_context_brief(results: list[SearchResult], query: str) -> str:
     lines = []
     for i, r in enumerate(results, 1):
         heading_str = " > ".join(r.headings) if r.headings else "N/A"
-        lines.append(f"[{i}] ({r.score:.3f}) {r.project_id}/{r.file_path} | {heading_str}")
+        lines.append(f"[{i}] ({r.score:.3f}) {r.project_id}/{r.file_path}"
+                     f"{_scope_tag(r)} | {heading_str}")
         lines.append(f"    {r.text[:200]}{'...' if len(r.text) > 200 else ''}")
         lines.append("")
     return "\n".join(lines)
@@ -263,7 +283,8 @@ def format_dev_context(results: list[SearchResult], query: str, triggers: list[s
     lines.append("--- Retrieved chunks ---")
     for i, r in enumerate(results, 1):
         sym = f" | {' > '.join(r.headings)}" if r.headings else ""
-        lines.append(f"[{i}] {_loc(r)}{_class_tag(r)}{sym} ({r.chunk_type}, {_score_label(r)}):")
+        lines.append(f"[{i}] {_loc(r)}{_class_tag(r)}{_scope_tag(r)}{sym} "
+                     f"({r.chunk_type}, {_score_label(r)}):")
         lines.append(_truncate(r.text, 800))
         lines.append("")
 
