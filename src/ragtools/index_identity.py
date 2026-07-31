@@ -23,6 +23,17 @@ This composes with, and does not replace,
 :func:`ragtools.embedding.backend.assert_model_compatible`: that guards vector
 *comparability* (model / dimension / runtime), this guards *whereabouts*.
 
+**Whereabouts is not only the settings.** Under ``per_project`` the collection a
+project's chunks live in is named by ``registry.projects.collection_name`` — the
+swap primitive — and every field above is invariant to that table. Lose
+``registry.db`` and ``build_router`` recreates it empty, ``sync_projects_from_config``
+mints a fresh uuid4 per project, and N brand-new EMPTY ``proj_<hex>`` collections
+appear beside the N that still hold the data. Storage backend, layout, legacy
+collection name, model and dimension are all unchanged, so this module said
+"compatible", the incremental run trusted the state DB, and it skipped every
+file. Nothing raised; search returned nothing; the dashboard showed the
+historical counts. ``registry_fingerprint`` closes that door (R06).
+
 Plan: docs/planning/RAG_COLLECTION_ARCHITECTURE_IMPLEMENTATION_PLAN.md (W9, W10)
 """
 
@@ -48,6 +59,11 @@ class IndexIdentity:
     collection_name: str
     model_name: str
     dimension: int
+    #: Digest of the registry's ``project_id -> collection_name`` mapping, the
+    #: thing that actually says where a per-project chunk lands. Empty means
+    #: "not known", NOT "no projects": a v3.5.0 stamp predates the field and a
+    #: shared-layout install has no registry at all. See ``differences``.
+    registry_fingerprint: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True)
@@ -61,15 +77,41 @@ class IndexIdentity:
             collection_name=data.get("collection_name", ""),
             model_name=data.get("model_name", ""),
             dimension=int(data.get("dimension", 0)),
+            # Absent in every identity stamped before R06. Defaulting to "" is
+            # what lets an upgraded install load its own stamp instead of
+            # reading it as a mismatch and re-embedding the whole corpus.
+            registry_fingerprint=str(data.get("registry_fingerprint", "") or ""),
         )
 
     def differences(self, other: "IndexIdentity") -> list[str]:
-        """Field names that differ — used to explain the refusal."""
-        return [f for f in asdict(self) if getattr(self, f) != getattr(other, f)]
+        """Field names that differ — used to explain the refusal.
+
+        The fingerprint is compared only when BOTH sides have one. An unknown
+        fingerprint is unknown, not different: treating "" as a value would
+        make every v3.5.0 stamp mismatch on the first v3.5.1 start, and would
+        make ``rag doctor`` (which has no registry to hand) contradict the
+        service. A known-vs-known difference, though, is the R06 signal — the
+        mapping the state DB was written against no longer holds.
+        """
+        changed = [
+            f for f in asdict(self)
+            if f != "registry_fingerprint" and getattr(self, f) != getattr(other, f)
+        ]
+        if (self.registry_fingerprint and other.registry_fingerprint
+                and self.registry_fingerprint != other.registry_fingerprint):
+            changed.append("registry_fingerprint")
+        return changed
 
 
-def current_identity(settings, dimension: int) -> IndexIdentity:
-    """The identity of the store ``settings`` currently points at."""
+def current_identity(settings, dimension: int, *, registry=None) -> IndexIdentity:
+    """The identity of the store ``settings`` currently points at.
+
+    ``registry`` is optional so every existing caller keeps its exact behaviour
+    (fingerprint ""). Supply it wherever one is already open — the service owner
+    holds one whenever the layout is ``per_project`` — and the identity then
+    covers *where each project's chunks actually go*, not merely which layout
+    was configured.
+    """
     return IndexIdentity(
         storage_backend=(getattr(settings, "storage_backend", "embedded")
                          or "embedded"),
@@ -78,7 +120,22 @@ def current_identity(settings, dimension: int) -> IndexIdentity:
         collection_name=settings.collection_name,
         model_name=settings.embedding_model,
         dimension=int(dimension),
+        registry_fingerprint=_fingerprint(registry),
     )
+
+
+def _fingerprint(registry) -> str:
+    """Digest the registry mapping, or "" when there is no registry to read.
+
+    Imported lazily: this module is deliberately dependency-light (it is on the
+    ``rag doctor`` path, which must work when the service does not), and the
+    registry pulls in SQLite plus the identity rules.
+    """
+    if registry is None:
+        return ""
+    from ragtools.registry import registry_fingerprint
+
+    return registry_fingerprint(registry)
 
 
 def reconcile(state, identity: IndexIdentity) -> tuple[bool, list[str]]:
@@ -127,4 +184,12 @@ def explain(changed: list[str]) -> str:
                 "cannot be matched to the current store")
     if changed == ["unreadable"]:
         return "the recorded storage identity could not be read"
-    return "changed: " + ", ".join(sorted(changed))
+    detail = "changed: " + ", ".join(sorted(changed))
+    if "registry_fingerprint" in changed:
+        # Name the cause, because the operator-visible symptom (an unexplained
+        # full re-index) is otherwise indistinguishable from a bug.
+        return (detail + " — the project -> collection mapping is no longer the "
+                "one this index was built against; a lost or recreated "
+                "registry.db re-mints project UUIDs, so every collection name "
+                "changes while nothing else does")
+    return detail

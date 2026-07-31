@@ -189,6 +189,10 @@ def test_the_identity_is_recorded_after_a_full_index():
                 recorded = IndexIdentity.from_json(state.get_meta(META_KEY))
             finally:
                 state.close()
-            assert recorded == current_identity(settings, owner.encoder.dimension)
+            # ``registry=`` because a per-project owner stamps the registry
+            # fingerprint too: the identity records which collection each
+            # project's chunks went to, not merely which layout was configured.
+            assert recorded == current_identity(settings, owner.encoder.dimension,
+                                                registry=owner.registry)
         finally:
             owner.close()

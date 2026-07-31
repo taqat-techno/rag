@@ -1040,25 +1040,49 @@ class QdrantOwner:
                 "scope": "project", "total": 0, "returned": 0, "truncated": False,
                 "chunks": []}
 
+    def _identity_registry(self):
+        """The registry the store identity is fingerprinted against, or None.
+
+        ``None`` under ``shared``, where there is no registry and the identity
+        is exactly what it was before R06 — so the fingerprint stays "" and
+        nothing about the default layout changes.
+
+        A registry that raises is NOT smoothed over into ``None`` here. Both
+        callers already guard: the check assumes trustworthy (its existing
+        behaviour), and the stamp is skipped, which leaves the previous identity
+        standing and forces a re-index next run. Substituting "" instead would
+        stamp "unknown" and quietly switch the guard off for this install.
+        """
+        return self._registry
+
     def _check_index_identity(self, state) -> tuple[bool, list[str]]:
         """Whether ``state``'s file hashes may be trusted for skipping."""
         from ragtools.index_identity import current_identity, reconcile
 
         try:
-            identity = current_identity(self._settings, self._encoder.dimension)
+            identity = current_identity(self._settings, self._encoder.dimension,
+                                        registry=self._identity_registry())
             return reconcile(state, identity)
         except Exception:  # noqa: BLE001 — never block indexing on the guard
             logger.exception("index-identity check failed; assuming trustworthy")
             return True, []
 
     def _stamp_index_identity(self) -> None:
-        """Record the current store on the state DB, after a run has written it."""
+        """Record the current store on the state DB, after a run has written it.
+
+        The registry goes in too, so the stamp records which collection each
+        project's chunks went to — not merely which layout was configured. That
+        is what makes a later registry loss visible: everything else about the
+        store is invariant to it.
+        """
         from ragtools.index_identity import current_identity, stamp
 
         try:
             state = IndexState(self._settings.state_db)
             try:
-                stamp(state, current_identity(self._settings, self._encoder.dimension))
+                stamp(state, current_identity(self._settings,
+                                              self._encoder.dimension,
+                                              registry=self._identity_registry()))
             finally:
                 state.close()
         except Exception:  # noqa: BLE001

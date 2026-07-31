@@ -106,6 +106,41 @@ def project_collection_name(project_uuid: str) -> str:
     return f"proj_{canon}"
 
 
+#: The SHAPE of a project collection name: the prefix, then a UUID with its
+#: hyphens removed. A shape is not a claim — another installation's collections
+#: match it exactly — so nothing may infer ownership from it. Ask
+#: :func:`ragtools.registry.owns_collection`, which reads the rows.
+_PROJECT_COLLECTION_RE = re.compile(r"^proj_([0-9a-f]{32})$")
+
+
+def is_project_collection_name(name: object) -> bool:
+    """True iff ``name`` has the project-collection shape. Says nothing about
+    who created it."""
+    return bool(_PROJECT_COLLECTION_RE.match(str(name).strip().lower()))
+
+
+def project_uuid_from_collection_name(collection_name: str) -> str:
+    """Recover the project UUID a collection name was derived from.
+
+    The exact inverse of :func:`project_collection_name`, and the reason a
+    collection orphaned by a lost registry is *recoverable*: its name still
+    carries the identity, so the project can be reattached to the vectors it
+    already has instead of being handed a freshly minted UUID and an empty
+    collection. Round-trips for every name the forward function produces from a
+    real UUID::
+
+        project_collection_name(project_uuid_from_collection_name(n)) == n
+    """
+    match = _PROJECT_COLLECTION_RE.match(str(collection_name).strip().lower())
+    if not match:
+        raise InvalidProjectId(
+            f"{collection_name!r} is not a project collection name "
+            f"(expected proj_ followed by 32 hex characters)"
+        )
+    h = match.group(1)
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
 def framework_collection_name(
     name: str,
     *,
