@@ -51,7 +51,10 @@ def _remedy() -> str:
 
         return migration_remedy(get_settings())
     except Exception:  # noqa: BLE001
-        return "restart the service"
+        # Deliberately not "restart the service". The rebuild is resumed by the
+        # service on a timer while attempts remain, and a restart adds nothing a
+        # retry has not already done — it only discards the running diagnosis.
+        return "rag upgrade --resume — the service also retries automatically"
 
 
 def migration_payload(exc) -> dict:

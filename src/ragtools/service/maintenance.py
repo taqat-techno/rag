@@ -209,6 +209,21 @@ def build_default_tasks(owner, *, runtime=None) -> list[Task]:
 
         resume_stalled_migration()
 
+    def _recover_rebuild():
+        # THE OTHER TASK THAT DID NOT EXIST. `migration-recovery` below re-drives
+        # a parked LAYOUT MIGRATION; nothing re-drove an interrupted REBUILD. Its
+        # marker sat on /health as `rebuild_interrupted` forever, and the advice
+        # attached to it — "restart the service" — re-drove nothing either,
+        # because the start path does not resume a rebuild.
+        #
+        # `LOCK_INDEX`, so it skips rather than stacking a re-index on a run that
+        # already holds the mutex.
+        from ragtools.service import recovery
+
+        report = recovery.drive(owner)
+        if report.acted or report.parked:
+            logger.info("rebuild recovery: %s", report.describe())
+
     def _reap_generations():
         # DRY RUN UNLESS SOMEBODY SAID OTHERWISE. The sweep runs either way, and
         # that is the point: it records the first time each orphan was SEEN, so
@@ -248,6 +263,10 @@ def build_default_tasks(owner, *, runtime=None) -> list[Task]:
         Task("migration-recovery", 5 * MINUTE, _recover_migration, LOCK_INDEX,
              run_at_startup=True,
              description="resume a migration whose blocker has lifted"),
+        Task("rebuild-recovery", 5 * MINUTE, _recover_rebuild, LOCK_INDEX,
+             run_at_startup=True,
+             description="re-drive the projects an interrupted rebuild left "
+                         "unfinished, re-testing the blocker each time"),
         Task("count-reconciliation", DAY, _reconcile_counts, LOCK_INDEX,
              description="state DB and Qdrant agree on chunk counts"),
         Task("generation-reap", DAY, _reap_generations, LOCK_INDEX,

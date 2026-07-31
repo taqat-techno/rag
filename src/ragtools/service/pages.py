@@ -1554,9 +1554,12 @@ def ui_crash_banner():
             title = "File watcher stopped — changes are no longer being indexed"
             retries = item.get("retries", "?")
             error = item.get("error", "")
+            # NOT "restart the service". Starting the watcher from this panel
+            # replaces the given-up thread in place; a restart discards the
+            # process holding the diagnosis to achieve the same thing.
             short = (
                 f"Watcher exhausted {retries} restart attempts. "
-                f"Use Rebuild or restart the service to recover."
+                f"Start the watcher again to recover."
             )
             full_detail = error
         else:

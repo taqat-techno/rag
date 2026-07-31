@@ -357,7 +357,11 @@ def test_notify_watcher_gave_up_includes_retry_count():
     assert "watcher" in call["title"].lower() or "indexed" in call["title"].lower()
     assert "5" in call["message"]
     assert "PermissionError" in call["message"]
-    assert "Rebuild" in call["message"] or "restart" in call["message"].lower()
+    # An actionable remedy — and NOT a service restart (WP-R05). Starting the
+    # watcher from the panel replaces the given-up thread in place; a restart
+    # discards the process holding the diagnosis to achieve the same thing.
+    assert "start the watcher" in call["message"].lower()
+    assert "restart the service" not in call["message"].lower()
 
 
 def test_notify_watcher_gave_up_truncates_long_error():

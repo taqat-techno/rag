@@ -431,6 +431,13 @@ def notify_watcher_gave_up(
     Same severity as ``notify_supervisor_gave_up`` — user needs to know
     their `.md` changes are no longer being auto-indexed, otherwise they
     find out hours later when search results are stale.
+
+    The remedy names the thing that actually fixes it. This used to say "restart
+    the service", which asks the user to discard the process holding the
+    diagnosis in order to do something ``POST /api/watcher/start`` does in place:
+    a given-up thread is replaced with a fresh one, no restart involved. The
+    *automatic* in-process revival of a given-up watcher is a deliberate
+    non-goal; a deliberate one from the panel never was.
     """
     n = notifier or get_shared_notifier(settings)
     truncated = error if len(error) <= 180 else error[:177] + "..."
@@ -439,7 +446,7 @@ def notify_watcher_gave_up(
         title="File watcher stopped — changes are no longer being indexed",
         message=(
             f"After {retries} retries: {truncated}\n"
-            "Use Rebuild or restart the service to recover."
+            "Start the watcher again from the admin panel to recover."
         ),
         deep_link=_admin_url(settings),
     )

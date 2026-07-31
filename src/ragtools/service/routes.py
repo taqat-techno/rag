@@ -93,7 +93,10 @@ def _migration_remedy(settings) -> str:
 
         return migration_remedy(settings)
     except Exception:  # noqa: BLE001
-        return "restart the service — it resumes the rebuild automatically"
+        # NOT "restart the service": a restart re-drives nothing that the
+        # automatic retry has not already tried, and saying otherwise sends the
+        # user to lose the state that explains the failure.
+        return "rag upgrade --resume — the service also retries automatically"
 
 
 def _collection_display() -> str:
@@ -207,6 +210,21 @@ def health():
     except Exception:  # noqa: BLE001
         pass
 
+    # ...and what is being DONE about it. An unresolved plan stays here until the
+    # work is genuinely finished, and it carries both the reason recorded when
+    # the block was written and the verdict from the most recent re-test. A
+    # persisted `blocked_reason` shown alone is a fact about the past presented
+    # as the present, which is how a health payload loses its credibility.
+    recovery_state = None
+    try:
+        from ragtools.service import recovery as _recovery
+
+        recovery_state = _recovery.health(owner.settings)
+        if recovery_state is not None:
+            issues.append("recovery_unresolved")
+    except Exception:  # noqa: BLE001 — reporting must never break liveness
+        recovery_state = None
+
     # A registry that cannot be vouched for. The collections still hold the
     # vectors, but nothing can prove whose they are — so project→collection
     # pointer swaps and collection reaping are refused until it is reconciled,
@@ -280,6 +298,13 @@ def health():
             # responses: one wants patience, the other wants a person.
             "blocked": migration_state.blocked,
             "blocked_reason": migration_state.blocked_reason or None,
+            # The same value, named for what it actually is: the reason recorded
+            # WHEN the block was written. Nothing about that record expires, and
+            # presenting it as current state beside a healthy engine is how a
+            # health payload loses its credibility. `blocked_reason` is kept
+            # because /health's 200 body is a stable contract (Decision 16) —
+            # keys may be added, never renamed.
+            "blocked_reason_recorded": migration_state.blocked_reason or None,
             "stalled": migration_state.stalled,
             "failures": [
                 {"kind": k, "id": i, "error": e}
@@ -321,6 +346,11 @@ def health():
         # reconciliation has run yet); "ok"/"extended"/"repointed" are sound;
         # anything else is why `registry_integrity_unresolved` is in `issues`.
         "registry_integrity": registry_integrity,
+        # An interrupted rebuild that is being re-driven, or `None` when there is
+        # nothing unresolved. It reports `blocked_reason_recorded` and
+        # `precondition` (re-tested, with the time it was measured) separately,
+        # so a stale record can never be mistaken for current state.
+        "recovery": recovery_state,
         # What the schema migration did on this boot, so "am I actually running
         # a v3 configuration?" is answerable without reading the file.
         "config_version": getattr(owner.settings, "config_version", None),
@@ -759,6 +789,81 @@ def migration_resume():
     return JSONResponse(status_code=202, content={
         "status": "resuming" if started else "not_started",
         "plan": plan,
+        "state": report.describe() if report else "",
+    })
+
+
+#: The recovery worker, so a second one is never started on top of it.
+_recovery_thread: Optional[threading.Thread] = None
+
+
+@router.get("/api/recovery")
+def recovery_status():
+    """What an interrupted rebuild is still waiting on — re-tested, not recalled.
+
+    ``blocked_reason_recorded`` is what was written down when the block was
+    written; ``precondition`` is the verdict from the most recent re-test, with
+    the time it was taken. Presenting only the first is how a two-hour-old
+    ``WinError 10061`` comes to sit beside a healthy engine.
+    """
+    from ragtools.service import recovery
+
+    owner = get_owner()
+    state = recovery.health(owner.settings)
+    if state is None:
+        return {"status": "clear",
+                "message": "no rebuild is unresolved on this installation"}
+    return {"status": "unresolved", **state}
+
+
+@router.post("/api/recovery/retry")
+def recovery_retry():
+    """Give an unresolved rebuild a fresh attempt budget and drive it now.
+
+    Automatic retries are bounded so a machine cannot loop; an operator asking
+    for this has fixed the cause, and only they know that. Restarting the service
+    is NOT the alternative — it re-drives nothing, which is why this exists.
+
+    Returns 202: the re-index runs on its own thread and can take a long time; an
+    HTTP request must not be the thing holding it.
+    """
+    from fastapi.responses import JSONResponse
+
+    from ragtools.service import recovery
+    from ragtools.upgrade import relayout
+
+    global _recovery_thread
+
+    owner = get_owner()
+    plan = recovery.pending_plan(owner.settings)
+    if plan is None and recovery.ensure_plan(owner, owner.settings) is None:
+        return {"status": "clear",
+                "message": "no rebuild is unresolved on this installation"}
+    plan = plan if plan is not None else recovery.pending_plan(owner.settings)
+
+    # Durable and immediate, before the worker: a reset that only happens inside
+    # a thread nobody waited for is a reset the caller cannot rely on.
+    relayout.reset_attempts(owner.settings, plan)
+
+    existing = _recovery_thread
+    if existing is not None and existing.is_alive():
+        return JSONResponse(status_code=202, content={
+            "status": "already_running", "plan": plan,
+            "message": "a recovery pass is already in progress"})
+
+    def _run():
+        try:
+            report = recovery.drive(owner)
+            logger.info("recovery retry: %s", report.describe())
+        except Exception:  # noqa: BLE001
+            logger.exception("the recovery pass failed")
+
+    _recovery_thread = threading.Thread(target=_run, name="rebuild-recovery",
+                                        daemon=True)
+    _recovery_thread.start()
+    report = relayout.progress(owner.settings, plan)
+    return JSONResponse(status_code=202, content={
+        "status": "retrying", "plan": plan,
         "state": report.describe() if report else "",
     })
 

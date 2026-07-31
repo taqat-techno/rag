@@ -1655,6 +1655,74 @@ def upgrade(
         console.print("Restart the service for the new configuration to take effect.")
 
 
+@app.command()
+def recover(
+    retry: bool = typer.Option(
+        False, "--retry",
+        help="Give an unresolved rebuild a fresh attempt budget and drive it."),
+):
+    """Show — and optionally re-drive — a rebuild that did not finish.
+
+    A rebuild that ends with failures leaves a durable marker naming the projects
+    it could not finish. The service re-drives them on its own, every few
+    minutes, re-testing the blocker each time; this command is for seeing that,
+    and for the one case the automatic retry deliberately will not cover — a
+    project that has spent its bounded attempt budget, which needs somebody who
+    knows the cause was fixed to say so.
+
+    **Restarting the service is not the remedy and never was.** The start path
+    re-drives an interrupted rebuild with no fresh budget, so a restart returned
+    the same banner with a newer timestamp.
+    """
+    settings = _get_settings()
+    if not _probe_service(settings):
+        console.print("[yellow]The service is not running.[/yellow] "
+                      "It owns the store, so recovery runs there — start it with "
+                      "`rag service start`.")
+        raise typer.Exit(2)
+
+    import httpx
+
+    try:
+        if retry:
+            response = httpx.post(f"{_service_url(settings)}/api/recovery/retry",
+                                  timeout=30.0)
+        else:
+            response = httpx.get(f"{_service_url(settings)}/api/recovery",
+                                 timeout=10.0)
+        response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Could not reach the service:[/red] {exc}")
+        raise typer.Exit(1)
+
+    body = response.json()
+    if body.get("status") == "clear":
+        console.print("[green]No rebuild is unresolved on this installation.[/green]")
+        return
+    if retry:
+        console.print(f"[green]Retrying via the service[/green] — "
+                      f"{body.get('state') or 'recovery started'}")
+        console.print("  Progress: `rag recover`, /health, or the admin panel. "
+                      "Completed work is not repeated.")
+        return
+
+    console.print(f"  plan:    {body.get('plan')}")
+    console.print(f"  state:   {body.get('state')}")
+    recorded = body.get("blocked_reason_recorded")
+    if recorded:
+        console.print(f"  blocked (as recorded): {recorded}")
+    check = body.get("precondition") or {}
+    if check:
+        verdict = "clear" if check.get("ok") else (check.get("reason") or "blocked")
+        ago = check.get("retested_seconds_ago")
+        when = f" ({ago:.0f}s ago)" if isinstance(ago, (int, float)) else ""
+        console.print(f"  re-tested{when}: {verdict}")
+    for unit in body.get("attempts_exhausted") or []:
+        console.print(f"  [yellow]exhausted[/yellow]: {unit.get('kind')} "
+                      f"{unit.get('id')} after {unit.get('attempts')} attempts")
+    console.print(f"  remedy:  {body.get('remedy')}")
+
+
 # --- Storage commands ---
 #
 # The storage engine and the collection layout were readable everywhere and
