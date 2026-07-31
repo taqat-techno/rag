@@ -115,3 +115,119 @@ def test_owner_full_index(owner):
     stats = owner.run_full_index()
     assert stats["files_indexed"] > 0
     assert stats["chunks_indexed"] > 0
+
+
+# --- honest per-project state (v3.5 WP-19/20/21) --------------------------
+
+
+def _drift_fixture(tmp_path, strategy: str):
+    """Two projects indexed, then one project's vectors deleted underneath it.
+
+    The shape that produced the field report: a project that is configured,
+    enabled, has a real folder and a full set of state-DB rows, and holds not
+    one live vector — 41,832 of them gone, with the dashboard showing "14
+    projects" over a table of 15 and nothing anywhere saying which.
+    """
+    from ragtools.config import ProjectConfig
+
+    for name in ("alpha", "beta"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "doc.md").write_text(f"# {name}\n\nLedger reconciliation.\n",
+                                  encoding="utf-8")
+    settings = Settings(
+        content_root=str(tmp_path),
+        qdrant_path=str(tmp_path / "qdrant"),
+        state_db=str(tmp_path / "state.db"),
+        data_dir=str(tmp_path / "data"),
+        collection_strategy=strategy,
+        projects=[ProjectConfig(id=name, path=str(tmp_path / name), mode="docs")
+                  for name in ("alpha", "beta")],
+    )
+    o = QdrantOwner(settings=settings, client=Settings.get_memory_client())
+    o.run_full_index()
+    return o, settings
+
+
+@pytest.mark.parametrize("strategy", ["shared", "per_project"])
+def test_a_project_whose_vectors_vanished_reads_as_drifted(tmp_path, strategy):
+    """Recorded files, zero live vectors: `drifted`, in BOTH layouts.
+
+    Under `shared` the number needs a payload-filtered count; under
+    `per_project` the collection is the project. The layout decides how the
+    question is asked, never what the answer means.
+
+    NEGATIVE CONTROL: before this work package `get_status_projects` did not
+    exist, and the dashboard rendered this project as "Not indexed yet" — the
+    same string it showed for a folder that had been deleted.
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+    owner, _settings = _drift_fixture(tmp_path, strategy)
+    try:
+        before = {row["id"]: row for row in owner.get_status_projects()}
+        assert before["beta"]["state"] == "indexed", before["beta"]
+
+        if strategy == "per_project":
+            owner.client.delete_collection(
+                collection_name=owner.router.write_collection("beta"))
+        else:
+            owner.client.delete(
+                collection_name=owner.router.shared_collection,
+                points_selector=Filter(must=[FieldCondition(
+                    key="project_id", match=MatchValue(value="beta"))]))
+
+        after = {row["id"]: row for row in owner.get_status_projects()}
+        assert after["beta"]["state"] == "drifted", after["beta"]
+        assert after["beta"]["files"] > 0, "the state DB rows are the evidence"
+        assert after["beta"]["points"] == 0
+        assert "re-index" in after["beta"]["reason"]
+        # One project losing its vectors says nothing about the other.
+        assert after["alpha"]["state"] == "indexed", after["alpha"]
+    finally:
+        owner.close()
+
+
+def test_a_project_the_last_rebuild_failed_on_says_so(tmp_path):
+    """A failed rebuild leaves the previous index in place, so the counts look
+    fine and the remedy is still "read the error" — not "wait". It is recorded
+    in the pending rebuild intent and was visible nowhere else."""
+    from ragtools.service import destructive
+
+    owner, settings = _drift_fixture(tmp_path, "per_project")
+    try:
+        destructive.record_intent(settings, {
+            "operation": "rebuild", "status": "completed_with_failures",
+            "failed_projects": ["beta"], "projects_rebuilt": ["alpha"]})
+        rows = {row["id"]: row for row in owner.get_status_projects()}
+        assert rows["beta"]["state"] == "failed", rows["beta"]
+        assert rows["alpha"]["state"] == "indexed", rows["alpha"]
+    finally:
+        destructive.clear_intent(settings)
+        owner.close()
+
+
+def test_status_counts_projects_configured_apart_from_projects_indexed(tmp_path):
+    """The two numbers the dashboard merged, and the third nobody had.
+
+    NEGATIVE CONTROL: on the pre-fix status dict none of these keys exist —
+    there was only `projects`, the file-state list, and every surface read its
+    length as though it meant "projects".
+    """
+    from ragtools.config import ProjectConfig
+
+    owner, settings = _drift_fixture(tmp_path, "per_project")
+    try:
+        (tmp_path / "gamma").mkdir()
+        owner.update_projects(list(settings.projects) + [
+            ProjectConfig(id="gamma", path=str(tmp_path / "gamma"), mode="docs"),
+            ProjectConfig(id="delta", path=str(tmp_path / "alpha"), mode="docs",
+                          enabled=False),
+        ])
+        status = owner.get_status()
+        assert status["projects_configured"] == 4, status
+        assert status["projects_enabled"] == 3, status
+        assert status["projects_indexed"] == 2, status
+        assert status["projects_searchable"] == 2, status
+    finally:
+        owner.close()

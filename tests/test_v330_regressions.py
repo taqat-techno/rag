@@ -86,10 +86,17 @@ def test_the_busy_return_value_is_actually_inspected():
 
 
 class DeadStorageOwner:
-    """An owner whose engine is gone — the state both machines were left in."""
+    """An owner whose engine is gone — the state both machines were left in.
+
+    It carries settings but no client and no encoder: the storage-down branch is
+    allowed to read the CONFIGURATION (how many projects exist does not depend
+    on the store) and is not allowed to reach for the engine. ``counted`` staying
+    empty is what proves the second half.
+    """
 
     def __init__(self):
         self._status_snapshot = None
+        self._settings = types.SimpleNamespace(projects=[])
         self.counted = []
 
     def storage_reachable(self):

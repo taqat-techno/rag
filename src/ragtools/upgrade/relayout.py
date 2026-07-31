@@ -775,6 +775,39 @@ def points_for_unit(owner, kind: str, unit_id: str) -> int:
         return POINTS_UNKNOWN
 
 
+def indexable_file_count(owner, unit_id: str) -> int:
+    """How many files the INDEXER would take for ``unit_id``.
+
+    THE INDEXER'S OWN DEFINITION OF "INDEXABLE", ASKED IN ONE PLACE. Two
+    callers need it and they must never disagree: :func:`classify_empty` asks it
+    to decide whether zero points is legitimate, and
+    :meth:`ragtools.service.owner.QdrantOwner.get_status_projects` asks it to
+    tell ``no_eligible_files`` (scanned, nothing to index) from
+    ``never_indexed`` (files are sitting there and none of them landed). Those
+    two states have opposite remedies, and a second definition of "eligible" is
+    how a project comes to be empty-by-design here and full of files there.
+
+    Raises whatever the scan raises — a count nobody could take is not zero, and
+    each caller decides what to say about that.
+    """
+    return len(owner._scan_files(unit_id))
+
+
+def indexable_file_counts(owner, unit_ids) -> dict[str, int]:
+    """:func:`indexable_file_count` for several units, in ONE scan.
+
+    ``_scan_files(pid)`` scans every configured project and then filters, so
+    asking it once per project costs N walks of the whole corpus — on the
+    installed machine that is 145,906 files per poll, per project. The dashboard
+    asks about every configured project at once, so it asks here.
+    """
+    counts = {str(u): 0 for u in unit_ids}
+    for pid, _path in owner._scan_files():
+        if pid in counts:
+            counts[pid] += 1
+    return counts
+
+
 def classify_empty(owner, settings, kind: str, unit_id: str) -> tuple[str, str]:
     """Is zero points legitimate here? Returns ``(disposition, reason)``.
 
@@ -829,7 +862,7 @@ def classify_empty(owner, settings, kind: str, unit_id: str) -> tuple[str, str]:
         # The INDEXER's own definition of "indexable", not a second one. If this
         # asked a different question than `run_full_index` does, a project could
         # be "empty by design" here and full of files there.
-        count = len(owner._scan_files(unit_id))
+        count = indexable_file_count(owner, unit_id)
     except Exception as exc:  # noqa: BLE001 — cannot prove empty => not empty
         return ("failed",
                 f"rebuilt to zero points and the source could not be counted "

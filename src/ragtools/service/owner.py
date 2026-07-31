@@ -47,11 +47,44 @@ _QDRANT_LOCAL_HARD_WARN = 20_000
 
 logger = logging.getLogger("ragtools.service")
 
+#: What :meth:`QdrantOwner.get_status_projects` may say about one project.
+#: Exactly one applies at a time and each names a DIFFERENT remedy — which is
+#: the entire point. The dashboard used to render one string, "Not indexed yet",
+#: for a project that was scanned and legitimately had nothing, one whose folder
+#: had been moved, one the user had disabled, and one whose rebuild had failed.
+#: Four causes, four remedies, one string.
+PROJECT_STATE_DISABLED = "disabled"                      # off on purpose
+PROJECT_STATE_PATH_MISSING = "path_missing"              # fix the path
+PROJECT_STATE_NEVER_INDEXED = "never_indexed"            # index it
+PROJECT_STATE_INDEXED = "indexed"                        # nothing to do
+PROJECT_STATE_INDEXED_STALE = "indexed_stale"            # re-run the index
+PROJECT_STATE_NO_ELIGIBLE_FILES = "no_eligible_files"    # widen the Mode
+PROJECT_STATE_FAILED = "failed"                          # read the rebuild error
+PROJECT_STATE_STORAGE_UNAVAILABLE = "storage_unavailable"  # fix the engine
+PROJECT_STATE_DRIFTED = "drifted"                        # rebuild THIS project
+
+PROJECT_STATES = (
+    PROJECT_STATE_DISABLED,
+    PROJECT_STATE_PATH_MISSING,
+    PROJECT_STATE_NEVER_INDEXED,
+    PROJECT_STATE_INDEXED,
+    PROJECT_STATE_INDEXED_STALE,
+    PROJECT_STATE_NO_ELIGIBLE_FILES,
+    PROJECT_STATE_FAILED,
+    PROJECT_STATE_STORAGE_UNAVAILABLE,
+    PROJECT_STATE_DRIFTED,
+)
+
 #: Shape returned when status is requested while indexing owns the lock and no
 #: snapshot has been taken yet. Never blocks the caller.
 _EMPTY_STATUS = {
     "points_count": 0, "collection_name": "", "total_files": 0, "total_chunks": 0,
     "projects": [], "last_indexed": None,
+    # The project counts, named apart. `len(projects)` answers "how many have at
+    # least one indexed FILE" and nothing else; rendering it under the bare word
+    # "projects" above a table of the CONFIGURED ones is the 14-vs-15.
+    "projects_configured": 0, "projects_enabled": 0, "projects_indexed": 0,
+    "projects_searchable": None,
     "collection_strategy": "shared", "collections": [],
     "storage": {"backend": "embedded", "engine_version": None, "hnsw": False,
                 "payload_indexes": False, "concurrent_readers": False},
@@ -261,6 +294,10 @@ class QdrantOwner:
         # Last good reads, served without the lock while indexing runs.
         self._status_snapshot: dict | None = None
         self._projects_snapshot: list | None = None
+        self._status_projects_snapshot: list | None = None
+        #: ``(taken_at, {project_id: eligible_file_count})``. See
+        #: :meth:`_explain_unindexed` for why the scan behind it is cached.
+        self._eligibility_cache: tuple[float, dict] | None = None
         self._settings = settings
         self._client = client or settings.get_qdrant_client()
         self._encoder = Encoder(settings.embedding_model)
@@ -1941,6 +1978,7 @@ class QdrantOwner:
         reachable, detail = self.storage_reachable()
         if not reachable:
             snapshot = dict(self._status_snapshot or _EMPTY_STATUS)
+            configured = list(getattr(self._settings, "projects", None) or [])
             snapshot.update({
                 "stale": True,
                 "storage_reachable": False,
@@ -1952,6 +1990,13 @@ class QdrantOwner:
                 "index_availability": AVAILABILITY_STORAGE_DOWN,
                 "collections": [{**c, "points": None}
                                 for c in (snapshot.get("collections") or [])],
+                # How many projects EXIST does not depend on the store, so it is
+                # still known here. How many are searchable is precisely what
+                # nobody can say while the store is unreachable.
+                "projects_configured": len(configured),
+                "projects_enabled": sum(1 for p in configured
+                                        if getattr(p, "enabled", True)),
+                "projects_searchable": None,
             })
             return snapshot
 
@@ -1993,6 +2038,42 @@ class QdrantOwner:
                 total += count
             per.append({**entry, "points": count, "reachable": count is not None})
         return (None if unknown else total), per
+
+    def _existing_collections(self) -> set | None:
+        """Collection names the store currently holds, or ``None`` if unasked.
+
+        The difference between "the collection is not there" and "the store did
+        not answer" is not visible in a count — both make ``_count_points``
+        raise — and the two have opposite meanings for a project: its index was
+        dropped, versus nobody knows.
+        """
+        try:
+            return {c.name for c in self._client.get_collections().collections}
+        except Exception:  # noqa: BLE001 — unknown, and it says so
+            return None
+
+    def _searchable_projects(self, per_collection) -> int | None:
+        """How many CONFIGURED projects hold live vectors, or ``None``.
+
+        UNKNOWN IS NOT ZERO, twice over:
+
+        * a collection whose count could not be taken does not vote. It is not
+          searchable *and* it is not empty — it is unasked;
+        * under ``shared`` every project's vectors live in one collection, so
+          the inventory cannot attribute them to projects at all. That is
+          unknown, not zero, and the per-project answer — which costs a
+          payload-filtered count — is :meth:`get_status_projects`.
+
+        Registered-but-unconfigured collections (an archived project the config
+        no longer lists) are excluded, so this can never exceed
+        ``projects_configured``.
+        """
+        if not self._router.is_per_project:
+            return None
+        configured = {p.id for p in (getattr(self._settings, "projects", None) or [])}
+        return sum(1 for entry in per_collection
+                   if entry.get("project") in configured
+                   and (entry.get("points") or 0) > 0)
 
     def _count_points(self, collection: str) -> int | None:
         """Exact point count for one collection, or ``None`` if it cannot be taken.
@@ -2056,8 +2137,24 @@ class QdrantOwner:
             summary.get("last_indexed"),
             getattr(self._settings, "stale_index_hours", 24),
         )
+        configured = list(getattr(self._settings, "projects", None) or [])
         return {
             "points_count": points_count,
+            # FOUR QUESTIONS, FOUR NUMBERS, AND THE LABEL SAYS WHICH.
+            #
+            # `projects` (below, via **summary) is `SELECT DISTINCT project_id
+            # FROM file_state` — projects with at least one indexed FILE. The
+            # dashboard rendered its length under the word "projects", directly
+            # above a table iterating `settings.projects`. On the installed
+            # machine that read "14" above a list of 15 and BOTH were correct:
+            # one project was configured, enabled, had a real folder, and had
+            # lost all 41,832 of its points. Patching the 14 to a 15 would have
+            # hidden exactly that.
+            "projects_configured": len(configured),
+            "projects_enabled": sum(1 for p in configured
+                                    if getattr(p, "enabled", True)),
+            "projects_indexed": len(summary.get("projects") or []),
+            "projects_searchable": self._searchable_projects(collections),
             # THE TWO NUMBERS, NAMED. `points_count` (live) and `total_chunks`
             # (historical, from the state DB) were merged into one flat dict
             # with no stated relationship, and the dashboard rendered the
@@ -2221,6 +2318,251 @@ class QdrantOwner:
                 })
             state.close()
             return projects
+
+    #: How long an eligibility scan is trusted. The filesystem walk is the whole
+    #: cost of this call, the dashboard polls it, and the answer only changes
+    #: when files do — at which point the state DB moves the project out of the
+    #: branch that needs the scan at all.
+    _ELIGIBILITY_TTL_S = 60.0
+
+    def get_status_projects(self, lock_timeout: float = 0.75) -> list[dict]:
+        """One row per CONFIGURED project, each carrying the state that names
+        its remedy. Thread-safe and **non-blocking**.
+
+        ``get_projects`` answers a different question — it lists projects the
+        state DB has rows for — and a project that is configured, enabled, and
+        holds nothing appears there not at all. That silence is what the
+        dashboard rendered as "14 projects" over a table of 15.
+
+        Rows are ``{id, name, path, enabled, state, files, chunks, points,
+        last_indexed, reason}``. ``points`` is the LIVE count and is ``None``
+        when it could not be taken — never 0.
+        """
+        acquired = self._lock.acquire(timeout=lock_timeout)
+        if not acquired:
+            return [dict(row) for row in (self._status_projects_snapshot or [])]
+        try:
+            rows = self._compute_status_projects()
+        finally:
+            self._lock.release()
+        # The eligibility scan walks the filesystem, so it runs with the lock
+        # RELEASED. Holding it here is the mistake `get_status` documents: one
+        # dashboard poll stalling every search on the machine.
+        rows = self._explain_unindexed(rows)
+        self._status_projects_snapshot = rows
+        return rows
+
+    def _compute_status_projects(self) -> list[dict]:
+        """Caller must hold ``self._lock``.
+
+        A row whose state cannot be decided without scanning the source is left
+        with ``state=None`` for :meth:`_explain_unindexed` to finish. No ``None``
+        escapes ``get_status_projects``.
+        """
+        settings = self._settings
+        reachable, _detail = self.storage_reachable()
+        per_collection = self._collection_points()[1] if reachable else []
+        live = self._project_live_points(per_collection) if reachable else {}
+
+        # Named in the pending rebuild intent = the last rebuild tried this
+        # project and could not do it. Its previous index was left exactly as it
+        # was, so the counts below may look fine; the remedy is still "read the
+        # error", not "wait".
+        try:
+            from ragtools.service import destructive
+            intent = destructive.pending_intent(settings) or {}
+            failed = {str(p) for p in (intent.get("failed_projects") or [])}
+        except Exception:  # noqa: BLE001 — a diagnostic must never fail the page
+            failed = set()
+
+        stale_after = getattr(settings, "stale_index_hours", 24)
+        state_path = Path(settings.state_db)
+        state = IndexState(settings.state_db) if state_path.exists() else None
+        rows: list[dict] = []
+        try:
+            for project in (settings.projects or []):
+                recorded = (state.get_project_summary(project.id) if state
+                            else {"files": 0, "chunks": 0, "last_indexed": None})
+                files = int(recorded.get("files") or 0)
+                chunks = int(recorded.get("chunks") or 0)
+                points, collection_points = live.get(project.id, (None, None))
+                row = {
+                    "id": project.id,
+                    "name": getattr(project, "name", "") or project.id,
+                    "path": str(getattr(project, "path", "") or ""),
+                    "enabled": bool(getattr(project, "enabled", True)),
+                    "mode": getattr(project, "mode", None),
+                    "files": files,
+                    "chunks": chunks,
+                    "points": points,
+                    "last_indexed": recorded.get("last_indexed"),
+                    "state": None,
+                    "reason": "",
+                }
+                rows.append(row)
+                self._decide_project_state(
+                    row, project=project, points=points,
+                    collection_points=collection_points, reachable=reachable,
+                    failed=failed, stale_after=stale_after)
+        finally:
+            if state is not None:
+                state.close()
+        return rows
+
+    @staticmethod
+    def _decide_project_state(row, *, project, points, collection_points,
+                              reachable, failed, stale_after) -> None:
+        """First match wins, in this order, because several are true at once and
+        the REMEDY differs. Mutates ``row`` in place."""
+        if not row["enabled"]:
+            row["state"] = PROJECT_STATE_DISABLED
+            row["reason"] = "Indexing is switched off for this project."
+            return
+
+        path = Path(row["path"]) if row["path"] else None
+        if path is None or not path.is_dir():
+            row["state"] = PROJECT_STATE_PATH_MISSING
+            row["reason"] = (f"The configured folder is not there: {row['path']}"
+                             if row["path"] else "No folder is configured.")
+            return
+
+        # UNKNOWN IS NOT ZERO. A store that could not be asked says nothing
+        # about this project's data, and rendering that silence as "empty" is
+        # how a dead engine came to look like an empty index.
+        if not reachable or collection_points is None or points is None:
+            row["state"] = PROJECT_STATE_STORAGE_UNAVAILABLE
+            row["reason"] = ("The vector store could not be asked, so this "
+                             "project's live count is unknown.")
+            return
+
+        if project.id in failed:
+            row["state"] = PROJECT_STATE_FAILED
+            row["reason"] = ("The last rebuild failed for this project; its "
+                             "previous index was left in place.")
+            return
+
+        if row["files"] and points > 0:
+            fresh = compute_index_freshness(row["last_indexed"], stale_after)
+            if fresh.get("level") == "stale":
+                row["state"] = PROJECT_STATE_INDEXED_STALE
+                row["reason"] = fresh.get("message", "")
+            else:
+                row["state"] = PROJECT_STATE_INDEXED
+            return
+
+        if row["files"]:
+            # THE 41,832-POINT CASE. Files and chunks are recorded, the store is
+            # answering, and it holds nothing for this project.
+            row["state"] = PROJECT_STATE_DRIFTED
+            row["reason"] = (
+                f"{row['files']:,} file(s) and {row['chunks']:,} chunk(s) are "
+                f"recorded, but the store holds no vectors for this project — "
+                f"re-index it.")
+            return
+
+        # Nothing recorded. Whether that is "there was nothing to index" or
+        # "nothing ever landed" can only be answered by the SOURCE, and that
+        # costs a filesystem walk. Deferred, deliberately, to outside the lock.
+        row["state"] = None
+
+    def _explain_unindexed(self, rows: list[dict]) -> list[dict]:
+        """Finish the rows the source has to answer for. Never holds the lock.
+
+        ``no_eligible_files`` and ``never_indexed`` look identical from the
+        index — both are zero rows and zero points — and have opposite remedies:
+        widen the project's Mode, or run an index. Only the scan tells them
+        apart, and it is :func:`~ragtools.upgrade.relayout.indexable_file_count`
+        that defines "eligible", so the dashboard and the migration cannot
+        disagree about what an empty project is.
+        """
+        pending = [row["id"] for row in rows if row.get("state") is None]
+        if not pending:
+            return rows
+
+        note = ""
+        cached = self._eligibility_cache
+        if (cached is not None
+                and time.monotonic() - cached[0] < self._ELIGIBILITY_TTL_S
+                and set(pending) <= set(cached[1])):
+            counts = cached[1]
+        else:
+            try:
+                from ragtools.upgrade.relayout import indexable_file_counts
+                counts = indexable_file_counts(self, pending)
+                self._eligibility_cache = (time.monotonic(), counts)
+            except Exception as exc:  # noqa: BLE001 — a count nobody could take
+                counts = {}
+                note = (f"The folder could not be scanned "
+                        f"({type(exc).__name__}: {exc}).")
+
+        for row in rows:
+            if row.get("state") is not None:
+                continue
+            count = counts.get(row["id"])
+            if count is None:
+                row["state"] = PROJECT_STATE_NEVER_INDEXED
+                row["reason"] = note or "Nothing has been indexed for this project."
+            elif count == 0:
+                row["state"] = PROJECT_STATE_NO_ELIGIBLE_FILES
+                row["reason"] = ("The folder was scanned and no file matched this "
+                                 "project's Mode or its ignore rules.")
+            else:
+                row["state"] = PROJECT_STATE_NEVER_INDEXED
+                row["reason"] = (f"{count:,} file(s) are waiting — this project has "
+                                 f"never been indexed.")
+        return rows
+
+    def _project_live_points(self, per_collection) -> dict:
+        """``{project_id: (project_points, collection_points)}``, both live.
+
+        Two numbers, because only one of them is per-project and they answer
+        different questions:
+
+        * ``collection_points`` — what the project's routed collection holds.
+          ``None`` means the store could not be asked, which is a verdict about
+          STORAGE, not about the project's data.
+        * ``project_points`` — what this project holds inside it. Under
+          ``per_project`` the collection *is* the project, so they are the same
+          number by construction. Under ``shared`` attribution costs a
+          payload-filtered count — skipped when the collection is empty, since
+          every project's share of nothing is nothing, which keeps the common
+          case at one count per poll rather than one per project.
+        """
+        from ragtools.collection_router import UnknownProject
+
+        by_name = {entry.get("name"): entry.get("points") for entry in per_collection}
+        existing = self._existing_collections()
+        out: dict = {}
+        for project in (getattr(self._settings, "projects", None) or []):
+            try:
+                name = self._router.write_collection(project.id)
+            except UnknownProject:
+                # No registry record means no collection, which means there is
+                # nothing that could be holding vectors. Provable zero.
+                out[project.id] = (0, 0)
+                continue
+            except Exception:  # noqa: BLE001 — could not resolve => could not ask
+                out[project.id] = (None, None)
+                continue
+
+            if existing is not None and name not in existing:
+                # The store ANSWERED and the collection is not in it. That is a
+                # provable zero, and it is how "this project's index was
+                # dropped" reads — which must never be confused with "the store
+                # could not be asked". `_count_points` cannot tell those apart:
+                # both make it raise.
+                out[project.id] = (0, 0)
+                continue
+
+            counted = by_name[name] if name in by_name else self._count_points(name)
+            if counted is None:
+                out[project.id] = (None, None)
+            elif self._router.is_per_project or counted == 0:
+                out[project.id] = (counted, counted)
+            else:
+                out[project.id] = (self._count_project_points(name, project.id),
+                                   counted)
+        return out
 
     def update_settings(self, **kwargs) -> None:
         """Hot-reload mutable settings in the running service. Thread-safe."""

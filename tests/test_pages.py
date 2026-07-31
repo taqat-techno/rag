@@ -81,6 +81,74 @@ def test_ui_projects_fragment(client):
     assert "project_a" in r.text
 
 
+def test_dash_status_tiles_say_which_question_each_number_answers(client):
+    """The vitals row must not answer two questions with one label.
+
+    A tile reading `projects` sat above a table iterating the CONFIGURED ones;
+    on the installed machine that was 14 over a list of 15 and both were right,
+    because the tile counted projects with at least one indexed FILE. And
+    `searchable` (live vectors) and `chunks` (the state DB's total) were two
+    labels over one quantity — 26,713 twice — since they agree on a healthy
+    index, which is exactly why presenting both as independent facts misleads.
+
+    NEGATIVE CONTROL: against the pre-fix fragment the labels are `searchable`,
+    `files`, `chunks`, `projects`, and this fixture's live count equals its
+    recorded chunk total — so both assertions below fail.
+    """
+    import re
+
+    html = client.get("/ui/dash/status").text
+    tiles = re.findall(r"<strong>([\d,]+)</strong>\s*<span>([^<]+)</span>", html)
+    labels = [label.strip().lower() for _value, label in tiles]
+    assert tiles, html
+
+    project_labels = [label for label in labels if "project" in label]
+    assert project_labels, f"no projects tile at all: {labels}"
+    assert all("configured" in label or "indexed" in label
+               for label in project_labels), (
+        f"a projects tile does not say WHICH projects it counts: {project_labels}")
+
+    by_value: dict[str, set[str]] = {}
+    for value, label in tiles:
+        by_value.setdefault(value, set()).add(label.strip().lower())
+    for value, shared_labels in by_value.items():
+        assert not ({"searchable", "chunks"} <= shared_labels), (
+            f"{value} appears under both 'searchable' and 'chunks' — one "
+            f"quantity, two labels: {tiles}")
+
+
+def test_dash_projects_rows_carry_a_state_and_not_one_string(client):
+    """`Not indexed yet` rendered identically for a project that was scanned and
+    legitimately had nothing, one whose folder had moved, one that was switched
+    off, and one whose rebuild had FAILED. Four causes, four remedies, one
+    string — so each row now carries its state.
+
+    NEGATIVE CONTROL: the pre-fix card emits no `data-state` at all.
+    """
+    html = client.get("/ui/dash/projects").text
+    assert 'data-state="indexed"' in html, html
+    assert "project_a" in html
+    # The counts stay the headline for a healthy project.
+    assert "files" in html and "chunks" in html
+
+
+def test_every_project_state_has_a_human_badge():
+    """The owner owns the vocabulary, the page owns the wording.
+
+    A state with no entry here falls back to printing its raw enum name at the
+    reader, and `no_eligible_files` is not English — the same defect the
+    degraded banner had when it read `Degraded: scale_over`.
+    """
+    from ragtools.service.owner import PROJECT_STATES
+    from ragtools.service.pages import _PROJECT_STATE_BADGE
+
+    missing = [state for state in PROJECT_STATES
+               if state not in _PROJECT_STATE_BADGE]
+    assert not missing, f"no badge wording for {missing}"
+    for state, (_css, label) in _PROJECT_STATE_BADGE.items():
+        assert "_" not in label, f"{state} still reads as an identifier: {label}"
+
+
 def test_ui_watcher_fragment(client):
     r = client.get("/ui/watcher")
     assert r.status_code == 200

@@ -802,7 +802,15 @@ def _validate_project_id(pid: str) -> str | None:
 
 @router.get("/api/projects/configured")
 def projects_configured():
-    """List configured projects with index stats."""
+    """List configured projects with index stats.
+
+    Carries the same ``state`` the dashboard renders (see
+    :meth:`ragtools.service.owner.QdrantOwner.get_status_projects`) so the UI
+    and the API cannot disagree about whether a project is indexed — the two
+    surfaces answering the same question differently is the defect this release
+    is fixing. Additive: every field this route already returned is unchanged,
+    and ``state`` is absent only when the owner could not be asked.
+    """
     from pathlib import Path as P
     settings = get_settings()
     state_path = P(settings.state_db)
@@ -815,6 +823,13 @@ def projects_configured():
             index_data[project.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
         state.close()
 
+    try:
+        states = {row["id"]: row for row in get_owner().get_status_projects()}
+    except Exception as exc:  # noqa: BLE001 — the roster must still list, and an
+        # ABSENT state is honest where a guessed one would not be.
+        logger.debug("project states unavailable (non-fatal): %s", exc)
+        states = {}
+
     return {"projects": [
         {
             "id": p.id, "name": p.name, "path": p.path,
@@ -822,6 +837,10 @@ def projects_configured():
             "mode": p.mode,
             "files": index_data.get(p.id, {}).get("files", 0),
             "chunks": index_data.get(p.id, {}).get("chunks", 0),
+            "state": states.get(p.id, {}).get("state"),
+            "state_reason": states.get(p.id, {}).get("reason", ""),
+            # LIVE, and `None` when it could not be taken — never 0.
+            "points": states.get(p.id, {}).get("points"),
         }
         for p in settings.projects
     ]}

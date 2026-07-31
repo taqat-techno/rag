@@ -182,7 +182,110 @@ _ISSUE_HEADLINES = {
     "index_empty": "Nothing is indexed yet",
     "index_partial": "Search is unavailable — the index is incomplete",
     "storage_unavailable": "Storage is not responding",
+    "service_starting": "The service is still starting",
 }
+
+#: How each project state from :data:`ragtools.service.owner.PROJECT_STATES`
+#: reads, and how urgent it looks. The vocabulary is the owner's; only the
+#: wording and the badge colour are decided here. Four of these used to render
+#: as the single string "Not indexed yet".
+_PROJECT_STATE_BADGE = {
+    "disabled": ("badge-muted", "Disabled"),
+    "path_missing": ("badge-danger", "Folder missing"),
+    "never_indexed": ("badge-warning", "Not indexed yet"),
+    "indexed": ("badge-success", "Indexed"),
+    "indexed_stale": ("badge-warning", "Indexed (stale)"),
+    "no_eligible_files": ("badge-muted", "Nothing to index"),
+    "failed": ("badge-danger", "Rebuild failed"),
+    "storage_unavailable": ("badge-muted", "Unknown"),
+    "drifted": ("badge-danger", "Index missing"),
+}
+
+#: Tile tooltips. Each says which SOURCE its number comes from, because the row
+#: mixes two: the live vector store and the state DB's record of the last index.
+_LIVE_HINT = "Vectors the store can answer a search from right now"
+_FILES_HINT = "Files the last index recorded in the state database"
+_CHUNKS_HINT = ("Chunks the last index recorded in the state database — what was "
+                "written, not what the store holds now")
+_CONFIGURED_HINT = "Projects in your configuration"
+_INDEXED_HINT = "Configured projects with at least one file in the index"
+
+
+def _stat_tile(value, label: str, hint: str) -> str:
+    """One dashboard tile. ``None`` renders as UNKNOWN, never as zero.
+
+    ``_count_points`` returns ``None`` when it could not ask, and that
+    distinction has to survive the last inch to the screen: a dead engine
+    rendering a confident ``0`` beside a state DB reporting 145,906 chunks is
+    the exact failure the ``None`` exists to prevent.
+    """
+    if value is None:
+        return (f'<div class="dash-stat" title="{escape(hint)}">'
+                f'<strong>—</strong> <span>{escape(label)} (unknown)</span></div>')
+    return (f'<div class="dash-stat" title="{escape(hint)}">'
+            f'<strong>{value:,}</strong> <span>{escape(label)}</span></div>')
+
+
+def _status_row(*, live, files, chunks, configured, indexed, searchable=None,
+                chunks_label="chunks indexed", availability="", degraded=False,
+                badges="", banner="") -> str:
+    """The dashboard's vitals row — the ONE definition of these tiles.
+
+    Both callers render through it (the live status and the not-ready state), so
+    the labels cannot drift apart and a reader is never shown the same word for
+    two different quantities depending on which path produced the page.
+    """
+    hint = _INDEXED_HINT
+    if searchable is not None:
+        hint += f" — {searchable:,} of them hold live vectors"
+    return f"""
+    <div class="dash-status-row" data-degraded="{str(degraded).lower()}"
+         data-availability="{escape(availability)}">
+        {_stat_tile(live, "searchable", _LIVE_HINT)}
+        {_stat_tile(files, "files indexed", _FILES_HINT)}
+        {_stat_tile(chunks, chunks_label, _CHUNKS_HINT)}
+        {_stat_tile(configured, "projects configured", _CONFIGURED_HINT)}
+        {_stat_tile(indexed, "projects indexed", hint)}
+        <div class="dash-status-badges">{badges}</div>
+    </div>
+    {banner}
+    """
+
+
+def _issue_banner(issues: list[tuple[str, str]]) -> str:
+    """The degraded banner. Empty string when there is nothing to say."""
+    if not issues:
+        return ""
+    items = "".join(
+        "<li><strong>{}</strong>{}</li>".format(
+            escape(_ISSUE_HEADLINES.get(key, key)),
+            f" — {escape(detail)}" if detail else "",
+        )
+        for key, detail in issues
+    )
+    keys = escape(",".join(key for key, _ in issues))
+    return (f'<div class="dash-degraded" role="status" data-issues="{keys}">'
+            f'<span aria-hidden="true">⚠</span><ul>{items}</ul>'
+            "</div>")
+
+
+def _configured_project_count() -> int | None:
+    """How many projects the CONFIGURATION declares — no engine required.
+
+    Asked when the service singleton is not up yet. "How many projects exist" is
+    a property of the config file, so it stays answerable while every number
+    that depends on the store is honestly unknown.
+    """
+    try:
+        return len(get_settings().projects or [])
+    except Exception:  # noqa: BLE001 — not initialised; read the config itself
+        pass
+    try:
+        from ragtools.config import Settings
+
+        return len(Settings().projects or [])
+    except Exception:  # noqa: BLE001 — unreadable config: unknown, not zero
+        return None
 
 #: How each availability verdict renders. `None` means "nothing to say".
 _AVAILABILITY_ISSUE = {
@@ -200,7 +303,22 @@ _AVAILABILITY_ISSUE = {
 @page_router.get("/ui/dash/status", response_class=HTMLResponse)
 def ui_dash_status():
     """Index vitals + honest degraded state for the dashboard."""
-    owner = get_owner()
+    try:
+        owner = get_owner()
+    except Exception:  # noqa: BLE001 — the engine is not up yet
+        # A 500 here renders as an error toast over an empty card and tells the
+        # reader nothing. The row still says what is knowable without the store
+        # — how many projects are CONFIGURED — and reports the rest as unknown
+        # rather than as zero.
+        return _status_row(
+            live=None, files=None, chunks=None,
+            configured=_configured_project_count(), indexed=None,
+            degraded=True, availability="",
+            banner=_issue_banner([(
+                "service_starting",
+                "The index counts appear once the engine has finished starting.",
+            )]),
+        )
     s = owner.get_status()
     from ragtools.service.routes import _watcher_thread, _watcher_lock
     with _watcher_lock:
@@ -262,26 +380,25 @@ def ui_dash_status():
         issues.insert(0, (key, detail or ""))
 
     degraded = bool(issues)
-    issue_keys = [k for k, _ in issues]
+    banner = _issue_banner(issues)
 
-    banner = ""
-    if degraded:
-        items = "".join(
-            "<li><strong>{}</strong>{}</li>".format(
-                escape(_ISSUE_HEADLINES.get(key, key)),
-                f" — {escape(detail)}" if detail else "",
-            )
-            for key, detail in issues
-        )
-        banner = (
-            f'<div class="dash-degraded" role="status" data-issues="{escape(",".join(issue_keys))}">'
-            f'<span aria-hidden="true">⚠</span><ul>{items}</ul>'
-            "</div>"
-        )
+    files = s.get("total_files", 0)
+    chunks = s.get("total_chunks", 0)
+    # TWO QUESTIONS, TWO TILES, EACH LABELLED WITH THE ONE IT ANSWERS.
+    #
+    # `len(s["projects"])` is "projects with at least one indexed FILE". It was
+    # rendered under the bare word "projects" directly above a table iterating
+    # the CONFIGURED ones, so the installed machine showed 14 over a list of 15
+    # and both numbers were right. The gap between them is the signal — a
+    # project that exists and holds nothing — so the page states both rather
+    # than picking one and calling it "projects".
+    projects_indexed = s.get("projects_indexed")
+    if projects_indexed is None:
+        projects_indexed = len(s.get("projects") or [])
+    projects_configured = s.get("projects_configured")
+    if projects_configured is None:
+        projects_configured = projects_indexed
 
-    files = s["total_files"]
-    chunks = s["total_chunks"]
-    projects_count = len(s["projects"])
     # A snapshot served while indexing holds the lock — say so rather than
     # presenting stale counts as current.
     stale_note = ('<span class="badge badge-muted">Updating…</span>'
@@ -293,30 +410,25 @@ def ui_dash_status():
     # collection held nothing. Showing only that number is what made an empty,
     # unsearchable install look like a healthy one.
     live = s.get("live_points", s.get("points_count"))
-    if live is None:
-        live_stat = ('<div class="dash-stat"><strong>—</strong> '
-                     '<span>searchable (unknown)</span></div>')
-    else:
-        live_stat = (f'<div class="dash-stat"><strong>{live:,}</strong> '
-                     f'<span>searchable</span></div>')
 
-    # When the two disagree, the historical pair is labelled rather than dropped.
-    # It is still the truth about something — just not about what you can search.
-    historical_label = ("chunks (before rebuild)"
-                        if (live is not None and live == 0 and chunks)
-                        else "chunks")
+    # ONE QUANTITY MUST NOT APPEAR TWICE UNDER TWO LABELS. `searchable` (live
+    # vectors) and `chunks` (the state DB's total) rendered as 26,713 twice on
+    # the installed machine, because on a healthy index they agree — which is
+    # exactly why presenting both as independent facts is misleading. The
+    # recorded pair says it is recorded; when it disagrees with the live count
+    # it is labelled rather than dropped, since it is still the truth about
+    # something — just not about what you can search.
+    chunks_label = ("chunks (before rebuild)"
+                    if (live is not None and live == 0 and chunks)
+                    else "chunks indexed")
 
-    return f"""
-    <div class="dash-status-row" data-degraded="{str(degraded).lower()}"
-         data-availability="{escape(availability)}">
-        {live_stat}
-        <div class="dash-stat"><strong>{files:,}</strong> <span>files</span></div>
-        <div class="dash-stat"><strong>{chunks:,}</strong> <span>{historical_label}</span></div>
-        <div class="dash-stat"><strong>{projects_count:,}</strong> <span>projects</span></div>
-        <div class="dash-status-badges">{stale_note}{watcher_badge}</div>
-    </div>
-    {banner}
-    """
+    return _status_row(
+        live=live, files=files, chunks=chunks,
+        configured=projects_configured, indexed=projects_indexed,
+        searchable=s.get("projects_searchable"), chunks_label=chunks_label,
+        availability=availability, degraded=degraded,
+        badges=f"{stale_note}{watcher_badge}", banner=banner,
+    )
 
 
 @page_router.get("/ui/dash/projects", response_class=HTMLResponse)
@@ -338,18 +450,44 @@ def ui_dash_projects():
         </div>
         """
 
-    index_data = _load_index_stats(settings)
+    # ONE ROW PER CONFIGURED PROJECT, each carrying the state that names its
+    # remedy. `Not indexed yet` used to render identically for a project that
+    # was scanned and legitimately had nothing, one whose folder had been moved,
+    # one that was switched off, and one whose rebuild had FAILED — four causes,
+    # four remedies, one string.
+    try:
+        states = get_owner().get_status_projects()
+    except Exception as exc:  # noqa: BLE001 — the card must render before the
+        # engine is up; it just must not claim the index is empty while it waits.
+        logger.debug("project states unavailable (non-fatal): %s", exc)
+        states = [
+            {"id": p.id, "name": p.name, "enabled": p.enabled,
+             "files": 0, "chunks": 0, "points": None,
+             "state": ("disabled" if not p.enabled else "storage_unavailable"),
+             "reason": "The service is still starting, so this project's index "
+                       "state is not known yet."}
+            for p in settings.projects
+        ]
 
     rows = ""
-    for p in settings.projects:
-        idx = index_data.get(p.id, {"files": 0, "chunks": 0})
-        badge = ('<span class="badge badge-success">Enabled</span>' if p.enabled
-                 else '<span class="badge badge-muted">Disabled</span>')
-        if idx["files"] > 0:
-            info = f'{idx["files"]:,} files &middot; {idx["chunks"]:,} chunks'
+    for row in states:
+        cls, label = _PROJECT_STATE_BADGE.get(
+            row.get("state"), ("badge-muted", str(row.get("state") or "unknown")))
+        badge = f'<span class="badge {cls}">{escape(label)}</span>'
+        reason = escape(row.get("reason") or "")
+        if row.get("state") in ("indexed", "indexed_stale"):
+            # The counts stay the headline for a healthy project; the reason
+            # (why it is stale) rides along as the tooltip rather than pushing
+            # the numbers off the row.
+            title = f' title="{reason}"' if reason else ""
+            info = (f'<span{title}>{row.get("files", 0):,} files '
+                    f'&middot; {row.get("chunks", 0):,} chunks</span>')
+        elif reason:
+            info = f'<span class="cell-empty">{reason}</span>'
         else:
-            info = '<span class="cell-empty">Not indexed yet</span>'
-        rows += (f'<tr><td class="cell-title">{escape(p.name)}</td>'
+            info = '<span class="cell-empty">—</span>'
+        rows += (f'<tr data-state="{escape(str(row.get("state") or ""))}">'
+                 f'<td class="cell-title">{escape(row.get("name") or row.get("id", ""))}</td>'
                  f'<td>{badge}</td><td>{info}</td></tr>')
 
     return f"""
