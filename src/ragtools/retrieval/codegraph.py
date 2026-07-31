@@ -79,9 +79,13 @@ def _lexical_definitions(searcher, sym: str, project_id: str | None, top_k: int)
     # `collections` is supplied by the owner under the per-project model; a
     # symbol may be defined in the project OR in a framework it references, so
     # both are scrolled.
-    targets = getattr(searcher, "definition_collections", None) or [
-        searcher.settings.collection_name
-    ]
+    # One authority decides which collections a read touches. The code graph
+    # must not re-derive it: reaching for the legacy name here scrolled a
+    # collection that does not exist under per_project and silently yielded no
+    # definitions.
+    targets = searcher.resolve_collections(
+        getattr(searcher, "definition_collections", None)
+    )
     points = []
     for collection in targets:
         try:

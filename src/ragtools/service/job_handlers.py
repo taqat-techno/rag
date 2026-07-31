@@ -56,23 +56,35 @@ _BLIND_MAX_WAIT_SECONDS = 900.0
 
 
 def _count_points(owner, project_id: str | None = None) -> int | None:
-    """Count points in the collection, optionally scoped to one project.
+    """Count points for a project, or across the whole index.
 
     Returns ``None`` when the count cannot be obtained — the caller must then
     treat verification as *unproven* rather than assume success.
+
+    Routed, not hard-coded. This counted ``settings.collection_name`` with a
+    ``project_id`` payload filter — the v2 question. Under ``per_project`` that
+    collection does not exist, so the count raised, every rebuild and reindex
+    reported ``verified=False`` forever, and ``purge_handler`` raised
+    "the vectors may still be present" on drops that had in fact succeeded.
     """
     try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-
-        flt = None
+        router = owner._router
         if project_id:
-            flt = Filter(must=[FieldCondition(key="project_id",
-                                              match=MatchValue(value=project_id))])
-        res = owner._client.count(
-            collection_name=owner._settings.collection_name,
-            count_filter=flt, exact=True,
-        )
-        return int(res.count)
+            targets = [router.write_collection(project_id)]
+        else:
+            targets = list(router.all_collections())
+
+        total = 0
+        for name in targets:
+            count = owner._count_points(name)
+            if count is None:
+                # One unknown makes the total unknown. A partial sum would be
+                # indistinguishable from a real one.
+                logger.warning(
+                    "point count unavailable for %s (verification unproven)", name)
+                return None
+            total += count
+        return total
     except Exception as exc:  # noqa: BLE001
         logger.warning("point count failed (verification will be unproven): %s", exc)
         return None
@@ -250,7 +262,8 @@ def make_handlers(get_owner) -> dict:
         """Refresh the semantic map off the request path."""
         owner = get_owner()
         ctx.progress(done=0, total=1, phase="map")
-        points = owner.get_map_points(force_recompute=True)
+        result = owner.get_map_points(force_recompute=True)
+        points = result.get("points", []) if isinstance(result, dict) else result
         return {"points": len(points)}
 
     def sync_frameworks_handler(job, ctx):

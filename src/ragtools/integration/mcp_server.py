@@ -1748,6 +1748,10 @@ def _direct_list_projects() -> str:
                         with_vectors=False,
                     )
                 except Exception:  # noqa: BLE001 — collection not created yet
+                    # Stop paging THIS collection and move to the next one.
+                    # Never abandon the remaining collections: a project whose
+                    # collection is missing contributes nothing, it does not
+                    # make the other projects disappear.
                     break
                 for point in results:
                     pid = point.payload.get("project_id")
@@ -1759,8 +1763,6 @@ def _direct_list_projects() -> str:
                         project_files.setdefault(pid, set()).add(fp)
                 if offset is None:
                     break
-            if offset is None:
-                break
 
         if not project_counts:
             return "No projects found in the knowledge base."

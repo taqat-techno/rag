@@ -158,13 +158,21 @@ def _fake_client(chunks_by_collection):
 
     class _Client:
         def scroll(self, collection_name, limit=500, offset=None,
-                   with_payload=True, with_vectors=True):
+                   with_payload=True, with_vectors=True, scroll_filter=None, **kw):
             if collection_name not in chunks_by_collection:
                 raise RuntimeError("no such collection")
             if offset is not None:
                 return [], None
+            rows = list(enumerate(chunks_by_collection[collection_name]))
+            if scroll_filter is not None:
+                # The map fetches vectors for a named set of files rather than
+                # scrolling everything, so the stand-in has to honour the filter.
+                wanted = set()
+                for cond in scroll_filter.must:
+                    wanted.update(cond.match.any)
+                rows = [(i, r) for i, r in rows if r[0] in wanted]
             out = []
-            for i, (fp, pid) in enumerate(chunks_by_collection[collection_name]):
+            for i, (fp, pid) in rows:
                 vec = list(np.linspace(i, i + 1, 8).astype(float))
                 out.append(_Rec(fp, pid, vec))
             return out, None
@@ -183,7 +191,7 @@ def test_map_points_are_tagged_with_their_scope(tmp_path):
     })
     settings = Settings(content_root=str(tmp_path), qdrant_path=str(tmp_path / "q"),
                         state_db=str(tmp_path / "s.db"), data_dir=str(tmp_path / "d"))
-    points = compute_map_points(client, settings, ["proj_abc", "fw_odoo_1"])
+    points = compute_map_points(client, settings, ["proj_abc", "fw_odoo_1"])["points"]
 
     by_path = {p["file_path"]: p for p in points}
     assert by_path["docs/a.md"]["scope"] == "project"
@@ -204,7 +212,7 @@ def test_a_project_file_and_a_framework_file_sharing_a_path_stay_separate(tmp_pa
     })
     settings = Settings(content_root=str(tmp_path), qdrant_path=str(tmp_path / "q"),
                         state_db=str(tmp_path / "s.db"), data_dir=str(tmp_path / "d"))
-    points = compute_map_points(client, settings, ["proj_abc", "fw_odoo_1"])
+    points = compute_map_points(client, settings, ["proj_abc", "fw_odoo_1"])["points"]
 
     same_path = [p for p in points if p["file_path"] == "odoo/api.py"]
     assert len(same_path) == 2, "the project copy and the framework copy were merged"

@@ -1202,6 +1202,11 @@ class QdrantOwner:
                 client=self._client,
                 encoder=self._encoder,
                 settings=self._settings,
+                # Route it. Without this the dev pipeline's layers each called
+                # search() with no collections and hit the legacy fallback, so
+                # /api/dev-search answered `count: 0` on every per-project
+                # install — indistinguishable from "no matches".
+                collections=self._read_collections(project_id),
             )
             outcome = dev_search(
                 searcher,
@@ -1315,28 +1320,44 @@ class QdrantOwner:
                         break
             return {"scanned": scanned, "files_with_secrets": len(findings), "findings": findings}
 
-    def get_map_points(self, force_recompute: bool = False) -> list[dict]:
-        """Get 2D map coordinates for all indexed files. Uses cache when valid. Thread-safe."""
+    def get_map_points(self, force_recompute: bool = False,
+                       project_id: str | None = None) -> dict:
+        """Map payload: ``{points, coverage, excluded, cache?}``. Thread-safe.
+
+        ``project_id`` computes that project's own collections directly rather
+        than filtering a global sample. Filtering the sample is what made
+        ``?project=rag`` answer ``count: 0`` for a project holding 1,716
+        chunks — the filter cannot recover data the sampler never fetched.
+        """
         with self._lock:
             from ragtools.service.map_data import (
                 compute_map_points, load_cached_map, save_map_cache, invalidate_map_cache,
             )
 
+            if project_id:
+                # Scoped requests are not cached: they are rare, cheap (one
+                # project), and must never be served from the global blob.
+                return compute_map_points(
+                    self._client, self._settings,
+                    self._read_collections(project_id),
+                )
+
             if not force_recompute:
                 # Serve whatever we have IMMEDIATELY (including a stale map) and
                 # let a background job refresh it. Recomputing on the request
                 # path meant scrolling every point + PCA while the machine was
-                # already busy indexing.
+                # already busy indexing. Staleness is stamped on the payload so
+                # the UI can say so rather than implying the map is current.
                 cached = load_cached_map(self._settings.state_db, allow_stale=True)
-                if cached is not None:
+                if isinstance(cached, dict) and "points" in cached:
                     self._request_map_refresh_if_stale()
                     return cached
 
-            points = compute_map_points(
+            result = compute_map_points(
                 self._client, self._settings, self._router.all_collections()
             )
-            save_map_cache(self._settings.state_db, points)
-            return points
+            save_map_cache(self._settings.state_db, result)
+            return result
 
     def run_full_index(self, project_id: str | None = None, progress=None) -> dict:
         """Full index — re-index everything.
@@ -1695,37 +1716,54 @@ class QdrantOwner:
         finally:
             self._lock.release()
 
-    def _collection_points(self) -> tuple[int, list[dict]]:
+    def _collection_points(self) -> tuple[int | None, list[dict]]:
         """Point count per collection, and the total across all of them.
 
         Status must aggregate: with one collection per project, reading only
         ``settings.collection_name`` would report 0 points on a fully indexed
         install.
+
+        The total is ``None`` when ANY collection could not be counted. A
+        partial sum presented as the total is the same failure as a zero
+        presented as empty — it is a number the caller cannot tell is wrong.
+        Each entry carries ``reachable`` so a single broken collection is
+        visible instead of merely subtracting from the total.
         """
         per: list[dict] = []
         total = 0
+        unknown = False
         for entry in self._router.describe():
-            name = entry["name"]
-            total += (count := self._count_points(name))
-            per.append({**entry, "points": count})
-        return total, per
+            count = self._count_points(entry["name"])
+            if count is None:
+                unknown = True
+            else:
+                total += count
+            per.append({**entry, "points": count, "reachable": count is not None})
+        return (None if unknown else total), per
 
-    def _count_points(self, collection: str) -> int:
-        """Exact point count for one collection.
+    def _count_points(self, collection: str) -> int | None:
+        """Exact point count for one collection, or ``None`` if it cannot be taken.
 
         Uses ``count(exact=True)`` rather than ``get_collection().points_count``:
         the latter is an optimizer-maintained estimate that lags recent
         upserts and deletes, so status could report an unchanged total right
         after a file shrank — and it can be ``None`` on a fresh collection,
         which reads as "empty" rather than "unknown".
+
+        UNKNOWN IS NOT ZERO. Swallowing the error and returning 0 is what let a
+        dead engine render as a confidently empty index beside a state DB
+        reporting 145,906 chunks. ``_availability`` already treats ``None`` as
+        ``storage_unavailable``; this function simply has to stop lying to it.
         """
         try:
             return int(self._client.count(collection_name=collection, exact=True).count)
-        except Exception:  # noqa: BLE001 — a missing collection is 0, not fatal
-            try:
-                return int(self._client.get_collection(collection).points_count or 0)
-            except Exception:  # noqa: BLE001
-                return 0
+        except Exception:  # noqa: BLE001 — fall back to the estimate, not to a guess
+            pass
+        try:
+            estimate = self._client.get_collection(collection).points_count
+        except Exception:  # noqa: BLE001
+            return None
+        return None if estimate is None else int(estimate)
 
     def _migration_snapshot(self) -> dict | None:
         """The live migration state, or None when no plan is running."""

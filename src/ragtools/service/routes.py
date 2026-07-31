@@ -2045,21 +2045,40 @@ def _restart_watcher_if_running():
 # --- Semantic Map ---
 
 @router.get("/api/map/points")
-def map_points(project: Optional[str] = Query(None, description="Filter by project")):
-    """Get 2D coordinates for all indexed files."""
+def map_points(project: Optional[str] = Query(None, description="Scope to one project")):
+    """2D/3D coordinates for a balanced sample of indexed files.
+
+    ``points`` and ``count`` keep their shape for existing clients; ``coverage``,
+    ``excluded`` and ``cache`` are additive.
+
+    ``project`` COMPUTES that project's collections rather than filtering the
+    global sample. Filtering was why ``?project=rag`` answered ``count: 0`` for
+    a project holding 1,716 chunks — a filter cannot recover data the sampler
+    never fetched.
+    """
     owner = get_owner()
-    points = owner.get_map_points()
-    if project:
-        points = [p for p in points if p["project_id"] == project]
-    return {"points": points, "count": len(points)}
+    result = owner.get_map_points(project_id=project)
+    points = result.get("points", [])
+    return {
+        "points": points,
+        "count": len(points),
+        "coverage": result.get("coverage", {}),
+        "excluded": result.get("excluded", []),
+        "cache": result.get("cache", {}),
+    }
 
 
 @router.post("/api/map/recompute")
 def map_recompute():
     """Force recomputation of map coordinates."""
     owner = get_owner()
-    points = owner.get_map_points(force_recompute=True)
-    return {"status": "recomputed", "count": len(points)}
+    result = owner.get_map_points(force_recompute=True)
+    return {
+        "status": "recomputed",
+        "count": len(result.get("points", [])),
+        "coverage": result.get("coverage", {}),
+        "excluded": result.get("excluded", []),
+    }
 
 
 # --- MCP Connection ---

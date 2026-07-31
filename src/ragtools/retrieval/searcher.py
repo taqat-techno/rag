@@ -1,5 +1,7 @@
 """Search the knowledge base using query embeddings."""
 
+import logging
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
@@ -7,6 +9,8 @@ from ragtools.config import Settings
 from ragtools.embedding.encoder import Encoder
 from ragtools.models import SearchResult
 from ragtools.retrieval.scope import resolve_scope
+
+logger = logging.getLogger("ragtools.retrieval.searcher")
 
 
 def _score_to_confidence(score: float) -> str:
@@ -69,10 +73,43 @@ class Searcher:
         client: QdrantClient,
         encoder: Encoder,
         settings: Settings | None = None,
+        collections: list[str] | None = None,
     ):
         self.client = client
         self.encoder = encoder
         self.settings = settings or Settings()
+        #: Routed collections this searcher reads when a call does not name its
+        #: own. Every caller that built a bare Searcher — dev-search, MCP direct
+        #: mode, the CLI's offline branch, the code graph — silently fell back
+        #: to the legacy single-collection name, which under per_project does
+        #: not exist. The query then raised, the exception was swallowed as
+        #: "no matches", and `/api/dev-search` answered `count: 0` for a project
+        #: holding 1,716 chunks.
+        self.default_collections = list(collections or [])
+
+    def resolve_collections(self, explicit: list[str] | None = None) -> list[str]:
+        """Which collections a read touches. ONE place decides.
+
+        The fallback is STRATEGY-AWARE, and that is the whole distinction the
+        v3.4 code missed. Under ``shared`` the configured name IS the
+        collection, so reading it is correct compatibility. Under
+        ``per_project`` it names nothing that exists — the query raised, the
+        caller swallowed it as "no matches", and ``/api/dev-search`` answered
+        ``count: 0`` for a project holding 1,716 chunks.
+
+        Refusing beats guessing: a wrong answer here is indistinguishable from
+        a real one. Every reader (search, the code graph) comes through here so
+        the branch cannot be re-implemented slightly differently elsewhere.
+        """
+        targets = list(explicit or self.default_collections)
+        if targets:
+            return targets
+        if getattr(self.settings, "collection_strategy", "shared") == "shared":
+            return [self.settings.collection_name]
+        logger.warning(
+            "read requested with no routed collections under per_project; "
+            "refusing to guess — resolve them through CollectionRouter")
+        return []
 
     def search(
         self,
@@ -169,7 +206,9 @@ class Searcher:
         # owned source — and can outrank it on code-token queries).
         fetch_limit = (top_k * 3 + 10) if exclude_generated else top_k
 
-        targets = collections or [self.settings.collection_name]
+        targets = self.resolve_collections(collections)
+        if not targets:
+            return []
 
         # The router puts the project's OWN collection first and its linked
         # framework corpora after it, so position identifies the scope.

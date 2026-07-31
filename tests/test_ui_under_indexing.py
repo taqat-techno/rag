@@ -107,10 +107,21 @@ def test_projects_listing_also_survives_a_held_lock(owner):
 
 
 def test_map_is_sampled_not_unbounded(owner):
-    """PCA over every point does not scale; a scatter overview only needs a sample."""
+    """PCA over every point does not scale; a scatter overview only needs a sample.
+
+    The bound is now expressed in FILES, because "how many points did we read"
+    was the wrong unit: v3.4's point budget was global and spent in registry
+    order, so bounding it correctly still left 13 of 15 projects unrepresented.
+    Asserting the constant exists is not enough — that is exactly what the
+    previous version of this test did while the map showed 2 of 15 projects.
+    Coverage and balance are asserted for real in tests/test_map_sampling.py.
+    """
     from ragtools.service import map_data
-    assert hasattr(map_data, "MAP_MAX_POINTS")
-    assert 500 <= map_data.MAP_MAX_POINTS <= 20000
+    assert hasattr(map_data, "MAP_MAX_FILES")
+    assert 100 <= map_data.MAP_MAX_FILES <= 20000
+    # A per-project floor is what stops one collection consuming the budget.
+    assert map_data.MIN_FILES_PER_PROJECT >= 1
+    assert map_data.MIN_FILES_PER_PROJECT <= map_data.MAP_MAX_FILES
 
 
 def test_indexing_marks_the_map_stale_instead_of_destroying_the_cache(owner):
@@ -128,11 +139,14 @@ def test_map_serves_the_cache_immediately_when_stale(owner):
     owner.get_map_points()
     owner.run_incremental_index(project_id="p")
     t0 = time.perf_counter()
-    pts = owner.get_map_points()
+    result = owner.get_map_points()
     assert time.perf_counter() - t0 < 2.0
-    assert isinstance(pts, list)
+    assert isinstance(result, dict) and isinstance(result["points"], list)
+    # A stale map must SAY it is stale. v3.4 served an arbitrarily old blob
+    # with no indicator, so a permanently failing refresh was invisible.
+    assert result.get("cache", {}).get("stale") is True
 
 
 def test_map_recompute_can_still_be_forced(owner):
-    pts = owner.get_map_points(force_recompute=True)
-    assert isinstance(pts, list)
+    result = owner.get_map_points(force_recompute=True)
+    assert isinstance(result, dict) and isinstance(result["points"], list)

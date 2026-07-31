@@ -23,106 +23,232 @@ from ragtools.config import Settings
 
 logger = logging.getLogger("ragtools.service.map")
 
-CACHE_KEY = "file_map_v2"
+#: Bumped from ``file_map_v2``: the payload gained coverage/excluded and the
+#: sampler changed, so a v2 blob would be served as if it described this map.
+CACHE_KEY = "file_map_v3"
 
-#: The map is a visual overview, not an exhaustive listing. Scrolling EVERY
-#: point and running PCA over the whole collection is what made the UI crawl
-#: during indexing (reported from real use). A sample of this size is visually
-#: equivalent for a scatter plot and bounds the cost.
-MAP_MAX_POINTS = 5000
+#: Files plotted. The map is an overview, but "overview" means EVERY project is
+#: represented — a different requirement from "as many points as possible".
+#: v3.4 spent one GLOBAL point budget in registry order, so collections 3..15
+#: received zero Qdrant calls and the footer asserted "385 files across 2
+#: projects" as fact while 5,383 files existed across 15.
+MAP_MAX_FILES = 2000
+
+#: A project is never squeezed out by having many neighbours. At 15 projects
+#: the even split is 133; this floor keeps a 4-file project on the map.
+MIN_FILES_PER_PROJECT = 25
+
+#: Safety valve on the vector pass only. Files are the unit of the budget; this
+#: exists so a pathological chunk count cannot scroll without bound.
+MAP_MAX_POINTS = 20000
+
+#: file_paths per filtered scroll. Same reasoning as ``indexer._DELETE_BATCH``:
+#: one request per file exhausts Windows' 16,384-port dynamic range.
+_FETCH_BATCH = 128
+
+
+def _enumerate_files(client: QdrantClient, collection: str) -> dict[str, dict]:
+    """Every file in one collection, with its true chunk count. NO vectors.
+
+    A vector is ~384 floats; enumerating without them is the difference between
+    a pass the UI can afford and the one that made it crawl. This pass is what
+    lets the sampler know how many files each project really has, so coverage
+    can be reported honestly instead of asserted.
+    """
+    files: dict[str, dict] = {}
+    offset = None
+    while True:
+        records, offset = client.scroll(
+            collection_name=collection,
+            limit=1000,
+            offset=offset,
+            with_payload=["file_path", "project_id", "headings"],
+            with_vectors=False,
+        )
+        for record in records:
+            payload = record.payload or {}
+            fp = payload.get("file_path")
+            if not fp:
+                continue
+            entry = files.get(fp)
+            if entry is None:
+                files[fp] = {
+                    "chunks": 1,
+                    "project_id": payload.get("project_id", ""),
+                    "headings": payload.get("headings", []),
+                }
+            else:
+                entry["chunks"] += 1
+        if offset is None:
+            break
+    return files
+
+
+def _spread(paths: list[str], k: int) -> list[str]:
+    """``k`` paths spread evenly across the sorted namespace.
+
+    Deterministic, so the map does not reshuffle between recomputes, and a
+    SPREAD rather than a prefix — taking the first k would show one directory
+    and call it the project.
+    """
+    n = len(paths)
+    if k >= n:
+        return paths
+    step = n / k
+    return [paths[min(int(i * step), n - 1)] for i in range(k)]
+
+
+def _fetch_vectors(
+    client: QdrantClient, collection: str, wanted: list[str]
+) -> dict[str, list[np.ndarray]]:
+    """Every chunk vector of each requested file.
+
+    ALL chunks, not the ones that happened to fall inside a prefix. v3.4 built
+    a file's position from whatever subset the global budget reached, so 347 of
+    375 displayed files were plotted from an incomplete mean — the map was
+    wrong about position, not merely incomplete.
+    """
+    from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+    out: dict[str, list[np.ndarray]] = defaultdict(list)
+    for i in range(0, len(wanted), _FETCH_BATCH):
+        window = wanted[i:i + _FETCH_BATCH]
+        offset = None
+        while True:
+            records, offset = client.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(
+                    must=[FieldCondition(key="file_path", match=MatchAny(any=window))]
+                ),
+                limit=1000,
+                offset=offset,
+                with_payload=["file_path"],
+                with_vectors=True,
+            )
+            for record in records:
+                fp = (record.payload or {}).get("file_path")
+                vec = record.vector
+                if fp and vec is not None:
+                    out[fp].append(np.array(vec, dtype=np.float32))
+            if offset is None:
+                break
+    return out
 
 
 def compute_map_points(
     client: QdrantClient, settings: Settings, collections: list[str] | None = None
-) -> list[dict]:
-    """Compute 2D/3D coordinates for all indexed files.
+) -> dict:
+    """Coordinates for a balanced sample of indexed files, plus honest coverage.
 
-    Returns a list of dicts with: file_path, project_id, x, y, z, chunk_count, headings.
-    The 2D canvas view uses x,y; the 3D ECharts GL view uses all three.
+    Returns ``{"points": [...], "coverage": {...}, "excluded": [...]}``.
 
-    ``collections`` defaults to the single configured collection. The owner
-    passes every routed collection so the map shows the whole knowledge base
-    rather than one project's slice of it.
+    Two passes. The first enumerates files per collection without vectors; the
+    second fetches every chunk of the files actually selected. That ordering is
+    what makes both guarantees possible at once: each project gets a quota
+    (so none is dropped for being enumerated late), and each plotted file is
+    positioned from ALL of its chunks (so the coordinates are true).
+
+    A collection that cannot be read is reported in ``excluded`` — never
+    silently skipped, and never allowed to take the other collections down.
     """
-    # Step 1: Scroll all points with vectors
-    file_vectors: dict[str, list[np.ndarray]] = defaultdict(list)
-    file_meta: dict[str, dict] = {}
+    targets = list(collections or [])
+    if not targets:
+        # No legacy fallback. Under per_project the configured name identifies
+        # nothing that exists; asking for "the collection" is the v2 question.
+        return {"points": [], "coverage": _coverage(0, 0, 0, 0, 0, False, []),
+                "excluded": []}
 
-    targets = collections or [settings.collection_name]
-    scanned = 0
+    excluded: list[dict] = []
+    inventory: dict[str, dict[str, dict]] = {}
     for collection_name in targets:
-        offset = None
-        while True:
-            try:
-                records, offset = client.scroll(
-                    collection_name=collection_name,
-                    limit=500,
-                    offset=offset,
-                    with_payload=True,
-                    with_vectors=True,
-                )
-            except Exception:  # noqa: BLE001 — collection not created yet
+        try:
+            found = _enumerate_files(client, collection_name)
+        except Exception as exc:  # noqa: BLE001
+            # Report it. "No results" and "could not be read" are different
+            # answers and the UI must be able to tell them apart.
+            excluded.append({"collection": collection_name,
+                             "reason": f"unreadable: {type(exc).__name__}"})
+            logger.warning("Map: collection %s unreadable: %s", collection_name, exc)
+            continue
+        if not found:
+            excluded.append({"collection": collection_name, "reason": "empty"})
+            continue
+        inventory[collection_name] = found
+
+    if not inventory:
+        return {"points": [], "coverage": _coverage(len(targets), 0, 0, 0, 0, False, []),
+                "excluded": excluded}
+
+    # --- balanced file quota, with the unused share redistributed ---------
+    quota = max(MIN_FILES_PER_PROJECT, MAP_MAX_FILES // len(inventory))
+    selected: dict[str, list[str]] = {}
+    spare = 0
+    for name, files in inventory.items():
+        paths = sorted(files)
+        take = min(quota, len(paths))
+        spare += quota - take
+        selected[name] = _spread(paths, take)
+    if spare:
+        for name, files in inventory.items():
+            if not spare:
                 break
-            scanned += len(records)
+            paths = sorted(files)
+            room = len(paths) - len(selected[name])
+            if room > 0:
+                extra = min(room, spare)
+                selected[name] = _spread(paths, len(selected[name]) + extra)
+                spare -= extra
 
-            is_framework = collection_name.startswith("fw_")
-            for record in records:
-                payload = record.payload or {}
-                fp = payload.get("file_path", "")
-                if not fp:
-                    continue
-
-                # Key by (collection, path), not path alone. A project file and
-                # a framework file can share a relative path — `odoo/api.py` in
-                # both a project and the corpus it vendors — and a bare-path key
-                # merges them into ONE map point built from two collections'
-                # vectors.
-                key = (collection_name, fp)
-
-                vec = record.vector
-                if vec is not None:
-                    file_vectors[key].append(np.array(vec, dtype=np.float32))
-
-                # Track metadata (first chunk wins for headings/project)
-                if key not in file_meta:
-                    file_meta[key] = {
-                        "project_id": payload.get("project_id", ""),
-                        "headings": payload.get("headings", []),
-                        # A framework corpus carries the FRAMEWORK's id in
-                        # project_id, so without this the map would draw a
-                        # vendored core as if it were a project of your own.
-                        "scope": "framework" if is_framework else "project",
-                        "scope_source": collection_name if is_framework else "",
-                    }
-
-            if offset is None:
-                break
-            if scanned >= MAP_MAX_POINTS:
-                # Bounded by design: the map is an overview. Scrolling every
-                # point and running PCA over the whole collection is what made
-                # the UI crawl during indexing.
-                logger.info("Map sampled the first %d points (cap %d)",
-                            scanned, MAP_MAX_POINTS)
-                break
-        if scanned >= MAP_MAX_POINTS:
-            break
+    # --- vectors for exactly those files ----------------------------------
+    file_vectors: dict[tuple[str, str], list[np.ndarray]] = {}
+    file_meta: dict[tuple[str, str], dict] = {}
+    sampled_vectors = 0
+    truncated = False
+    for name, paths in selected.items():
+        if sampled_vectors >= MAP_MAX_POINTS:
+            truncated = True
+            excluded.append({"collection": name, "reason": "vector budget exhausted"})
+            continue
+        try:
+            fetched = _fetch_vectors(client, name, paths)
+        except Exception as exc:  # noqa: BLE001
+            excluded.append({"collection": name,
+                             "reason": f"vector fetch failed: {type(exc).__name__}"})
+            logger.warning("Map: vector fetch failed for %s: %s", name, exc)
+            continue
+        is_framework = name.startswith("fw_")
+        for fp, vecs in fetched.items():
+            if not vecs:
+                continue
+            # Key by (collection, path), not path alone. A project file and a
+            # framework file can share a relative path — `odoo/api.py` in both
+            # a project and the corpus it vendors — and a bare-path key merges
+            # them into ONE point built from two collections' vectors.
+            key = (name, fp)
+            file_vectors[key] = vecs
+            meta = inventory[name].get(fp, {})
+            file_meta[key] = {
+                "project_id": meta.get("project_id", ""),
+                "headings": meta.get("headings", []),
+                # A framework corpus carries the FRAMEWORK's id in project_id,
+                # so without this the map would draw a vendored core as if it
+                # were a project of your own.
+                "scope": "framework" if is_framework else "project",
+                "scope_source": name if is_framework else "",
+            }
+            sampled_vectors += len(vecs)
 
     if not file_vectors:
-        return []
+        return {"points": [],
+                "coverage": _coverage(len(targets), 0,
+                                      sum(len(f) for f in inventory.values()), 0, 0,
+                                      truncated, []),
+                "excluded": excluded}
 
-    # Step 2: Mean embedding per file
     file_keys = sorted(file_vectors.keys())
-    mean_embeddings = np.array([
-        np.mean(file_vectors[key], axis=0) for key in file_keys
-    ])
+    mean_embeddings = np.array([np.mean(file_vectors[k], axis=0) for k in file_keys])
+    coords_norm = _normalize_coords(_pca_project(mean_embeddings))
 
-    # Step 3: PCA to 3D
-    coords_3d = _pca_project(mean_embeddings)
-
-    # Step 4: Normalize to [0, 1]
-    coords_norm = _normalize_coords(coords_3d)
-
-    # Step 5: Build result
     points = []
     for i, key in enumerate(file_keys):
         meta = file_meta.get(key, {})
@@ -138,8 +264,43 @@ def compute_map_points(
             "headings": meta.get("headings", []),
         })
 
-    logger.info("Computed map: %d files, %d total chunks", len(points), sum(p["chunk_count"] for p in points))
-    return points
+    per_project = [
+        {"collection": name,
+         "project_id": next(iter(inventory[name].values()), {}).get("project_id", ""),
+         "eligible": len(inventory[name]),
+         "sampled": len(selected[name])}
+        for name in sorted(selected)
+    ]
+    files_eligible = sum(len(f) for f in inventory.values())
+    coverage = _coverage(
+        projects_total=len(targets),
+        projects_represented=len({k[0] for k in file_keys}),
+        files_eligible=files_eligible,
+        files_sampled=len(points),
+        vectors_sampled=sampled_vectors,
+        truncated=truncated or len(points) < files_eligible,
+        per_project=per_project,
+    )
+    logger.info(
+        "Computed map: %d/%d files across %d/%d collections (%d vectors)",
+        len(points), files_eligible, coverage["projects_represented"],
+        len(targets), sampled_vectors,
+    )
+    return {"points": points, "coverage": coverage, "excluded": excluded}
+
+
+def _coverage(projects_total, projects_represented, files_eligible,
+              files_sampled, vectors_sampled, truncated, per_project) -> dict:
+    """The map's own account of what it did and did not draw."""
+    return {
+        "projects_total": projects_total,
+        "projects_represented": projects_represented,
+        "files_eligible": files_eligible,
+        "files_sampled": files_sampled,
+        "vectors_sampled": vectors_sampled,
+        "truncated": bool(truncated),
+        "per_project": per_project,
+    }
 
 
 def _pca_project(embeddings: np.ndarray) -> np.ndarray:
@@ -223,12 +384,17 @@ def get_cache_version_hash(db_path: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def load_cached_map(db_path: str, *, allow_stale: bool = True) -> list[dict] | None:
-    """Load cached map points.
+def load_cached_map(db_path: str, *, allow_stale: bool = True):
+    """Load the cached map payload.
 
     ``allow_stale`` (default True) returns the previous map even when the index
     has moved on, so the UI paints instantly instead of blocking on a full
     recompute. Pass ``allow_stale=False`` to require an up-to-date cache.
+
+    When the payload is a mapping it is stamped with ``cache`` —
+    ``{computed_at, stale}``. v3.4 served an arbitrarily old map with no
+    indicator anywhere, so a permanently failing background refresh was
+    indistinguishable from a current map.
     """
     _ensure_cache_table(db_path)
 
@@ -238,7 +404,7 @@ def load_cached_map(db_path: str, *, allow_stale: bool = True) -> list[dict] | N
 
     conn = sqlite3.connect(db_path)
     row = conn.execute(
-        "SELECT version_hash, points_json FROM map_cache WHERE cache_key = ?",
+        "SELECT version_hash, points_json, computed_at FROM map_cache WHERE cache_key = ?",
         (CACHE_KEY,)
     ).fetchone()
     conn.close()
@@ -246,23 +412,28 @@ def load_cached_map(db_path: str, *, allow_stale: bool = True) -> list[dict] | N
     if row is None:
         return None
 
-    stored_hash, points_json = row
-    if stored_hash != current_hash and not allow_stale:
+    stored_hash, points_json, computed_at = row
+    stale = stored_hash != current_hash
+    if stale and not allow_stale:
         logger.debug("Map cache stale (hash mismatch)")
         return None
 
     try:
-        return json.loads(points_json)
+        payload = json.loads(points_json)
     except json.JSONDecodeError:
         return None
 
+    if isinstance(payload, dict):
+        payload["cache"] = {"computed_at": computed_at, "stale": stale}
+    return payload
 
-def save_map_cache(db_path: str, points: list[dict]) -> None:
-    """Save computed map points to the cache."""
+
+def save_map_cache(db_path: str, payload) -> None:
+    """Cache a computed map payload (any JSON-serialisable value)."""
     _ensure_cache_table(db_path)
 
     version_hash = get_cache_version_hash(db_path)
-    points_json = json.dumps(points)
+    points_json = json.dumps(payload)
 
     conn = sqlite3.connect(db_path)
     conn.execute(
@@ -272,7 +443,8 @@ def save_map_cache(db_path: str, points: list[dict]) -> None:
     conn.commit()
     conn.close()
 
-    logger.debug("Map cache saved (%d points)", len(points))
+    size = len(payload.get("points", [])) if isinstance(payload, dict) else len(payload)
+    logger.debug("Map cache saved (%d points)", size)
 
 
 def invalidate_map_cache(db_path: str) -> None:
