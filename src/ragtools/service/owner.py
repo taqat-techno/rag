@@ -1028,7 +1028,9 @@ class QdrantOwner:
                     "file_path": file_path,
                     "project": project_id,
                     "collection": target,
-                    "scope": "framework" if target.startswith("fw_") else "project",
+                    # One authority decides what a collection is (R08); this
+                    # read used to re-derive it from the name prefix inline.
+                    "scope": self._router.identify([target])[target].scope,
                     "language": first["language"],
                     "chunk_type": first["chunk_type"],
                     "source_class": first["source_class"],
@@ -1251,6 +1253,10 @@ class QdrantOwner:
                 client=self._client,
                 encoder=self._encoder,
                 settings=self._settings,
+                # Provenance authority. Without it the searcher can only read
+                # the naming scheme, which knows a collection is a project's
+                # but not WHICH project's.
+                router=self._router,
             )
             return searcher.search(
                 query=query,
@@ -1353,7 +1359,14 @@ class QdrantOwner:
                 # search() with no collections and hit the legacy fallback, so
                 # /api/dev-search answered `count: 0` on every per-project
                 # install — indistinguishable from "no matches".
-                collections=self._read_collections(project_id),
+                #
+                # Both ids, not just the singular one: a multi-project dev
+                # search routed to `read_collections(None)` — every collection
+                # on the machine — and relied on the payload filter to narrow
+                # it afterwards. Search and dev-search must read the same set,
+                # or the two surfaces answer from different stores.
+                collections=self._read_collections(project_id, project_ids),
+                router=self._router,
             )
             outcome = dev_search(
                 searcher,
@@ -1401,12 +1414,17 @@ class QdrantOwner:
         """Find likely definition sites for a symbol (cross-file code-graph v1)."""
         with self._lock:
             from ragtools.retrieval.codegraph import find_definitions as _find
+            # A symbol may be defined in the project or in a framework it
+            # references — the code graph must look in both. Passed on the
+            # constructor so the SEMANTIC fallback routes too: it calls
+            # `search()` with no collections, which under per_project resolved
+            # to nothing at all.
+            collections = self._read_collections(project_id)
             searcher = Searcher(
                 client=self._client, encoder=self._encoder, settings=self._settings,
+                collections=collections, router=self._router,
             )
-            # A symbol may be defined in the project or in a framework it
-            # references — the code graph must look in both.
-            searcher.definition_collections = self._read_collections(project_id)
+            searcher.definition_collections = collections
             searcher.collection_scoped = self._router.is_per_project
             return _find(searcher, symbol, project_id=project_id, top_k=top_k)
 

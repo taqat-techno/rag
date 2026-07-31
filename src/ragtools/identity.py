@@ -119,6 +119,24 @@ def is_project_collection_name(name: object) -> bool:
     return bool(_PROJECT_COLLECTION_RE.match(str(name).strip().lower()))
 
 
+#: The prefix every framework corpus name carries (see
+#: :func:`framework_collection_name`). Deliberately the same test the three
+#: readers already used, moved to one place.
+FRAMEWORK_COLLECTION_PREFIX = "fw_"
+
+
+def is_framework_collection_name(name: object) -> bool:
+    """True iff ``name`` has the framework-corpus shape.
+
+    The counterpart of :func:`is_project_collection_name`, and for the same
+    reason: the searcher, the map and the file inspector had each spelled this
+    as ``name.startswith("fw_")`` inline, so "what kind of collection is this?"
+    was a decision re-made per reader rather than answered once. Like its
+    counterpart it reports SHAPE, not ownership.
+    """
+    return str(name).strip().lower().startswith(FRAMEWORK_COLLECTION_PREFIX)
+
+
 def project_uuid_from_collection_name(collection_name: str) -> str:
     """Recover the project UUID a collection name was derived from.
 
