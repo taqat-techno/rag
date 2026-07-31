@@ -360,7 +360,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # BOTH legs, and the second one is the one that matters.
+        # FIVE legs, and each one is here for a different reason. Every one of
+        # them downloads a GENUINE PUBLISHED INSTALLER from the releases page —
+        # none of them synthesises a folder — because a synthesised layout has
+        # no running processes and no locked files, which is the only state in
+        # which any of this can fail.
         #
         # 2.7.0 registers its scheduled tasks against `rag.exe`, so the running
         # set during that upgrade is `rag.exe` — which even the OLD single-image
@@ -373,16 +377,40 @@ jobs:
         # "ragw.exe (PID 3076) and the task-registered images are now the
         # running set". Only this leg proves the defect is fixed.
         #
-        # 3.3.0 is the release this one exists to rescue, and it is the upgrade
-        # a real machine is about to perform. What this leg proves is that the
-        # PACKAGED path works from there — installer over installer, previous
-        # processes alive. What it does NOT prove is recovery of a STALLED
-        # migration: a runner's fresh 3.3.0 has no plan to be stuck in. That
-        # half is covered by `tests/test_v340_recovery.py`, which synthesises the
-        # exact stalled shape, and by the live end-to-end recovery. Saying which
-        # is which matters — a leg that quietly proves less than its name
-        # suggests is how a gate becomes decoration.
-        from: ["2.7.0", "3.0.1", "3.3.0"]
+        # 3.3.0 is the release that exposed WP-R02, and it is still the leg that
+        # matters most. On job 91273392455 it was the only one of the three that
+        # failed: the candidate installer exited 5 having half-deleted
+        # `_internal`, leaving `[PYI-2072] Failed to load Python DLL`, a registry
+        # still reading 3.3.0, and nothing answering within 300 s — while the
+        # 2.7.0 and 3.0.1 legs of the same run passed. What this leg proves is
+        # that the PACKAGED path works from there — installer over installer,
+        # previous processes alive and holding their own binaries. What it does
+        # NOT prove is recovery of a STALLED migration: a runner's fresh 3.3.0
+        # has no plan to be stuck in. That half is covered by
+        # `tests/test_v340_recovery.py`, which synthesises the exact stalled
+        # shape, and by the live end-to-end recovery. Saying which is which
+        # matters — a leg that quietly proves less than its name suggests is how
+        # a gate becomes decoration.
+        #
+        # 3.4.0 is the first release whose managed engine is SUPERVISED for its
+        # whole life, so it is the first previous version that reliably has a
+        # `qdrant.exe` of its own alive at the moment the upgrade starts. That
+        # makes it the leg where path-scoped engine stopping is actually
+        # exercised rather than merely present. What it does NOT prove: that a
+        # Qdrant belonging to someone ELSE is spared — a runner has no external
+        # engine to leave alone, so that half lives in
+        # `tests/test_upgrade_quiescence.py`.
+        #
+        # 3.5.0 is the immediately preceding release and therefore the upgrade
+        # almost every existing user will actually perform. It is the closest
+        # thing to a same-shape upgrade in the matrix — same storage layout,
+        # same task registrations, same executables — which is exactly why it
+        # proves the LEAST about the failure modes above and the MOST about the
+        # ordinary path not regressing. Both claims are worth making out loud: a
+        # green n-1 leg is not evidence that a two-major-versions-old install
+        # upgrades, and the older legs are not evidence that the common case
+        # still works.
+        from: ["2.7.0", "3.0.1", "3.3.0", "3.4.0", "3.5.0"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

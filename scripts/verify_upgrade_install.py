@@ -325,7 +325,22 @@ def main(argv=None) -> int:
     # --- 2. the upgrade, over a live installation ------------------------
     rc = install_silently(new_installer, f"v{args.version} (over v{args.from_version})",
                           log_dir=work)
-    check("the upgrade installer exited 0", rc == 0, f"exit {rc}")
+    # Name the two failures that are NOT the same failure. Inno's exit 5 means
+    # Setup aborted mid-write and the installation is now mixed; exit 7 means
+    # `PrepareToInstall` refused BEFORE the first destructive write and the
+    # previous version is intact. A leg that reports only "exit 7" sends the
+    # next person looking for a half-installed tree that does not exist.
+    detail = f"exit {rc}"
+    if rc == 7:
+        quiesce_log = (LOCALAPPDATA / "RAGTools" / "logs" / "quiesce-blockers.txt")
+        blockers = (quiesce_log.read_text(encoding="utf-8", errors="replace").strip()
+                    if quiesce_log.is_file() else "(no blocker summary was written)")
+        detail = (f"exit 7 — quiescence REFUSED the upgrade before writing anything; "
+                  f"the previous version is intact. Blockers:\n{blockers}")
+    elif rc == 5:
+        detail = ("exit 5 — Setup aborted DURING the write; the installation may be "
+                  "mixed. This is the failure quiescence exists to convert into a 7.")
+    check("the upgrade installer exited 0", rc == 0, detail)
 
     # --- 3. the machine must now belong to the new release ---------------
     print("\n--- the machine after the upgrade ---", flush=True)
