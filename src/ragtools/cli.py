@@ -1677,6 +1677,74 @@ def upgrade(
         console.print("Restart the service for the new configuration to take effect.")
 
 
+@app.command()
+def recover(
+    retry: bool = typer.Option(
+        False, "--retry",
+        help="Give an unresolved rebuild a fresh attempt budget and drive it."),
+):
+    """Show — and optionally re-drive — a rebuild that did not finish.
+
+    A rebuild that ends with failures leaves a durable marker naming the projects
+    it could not finish. The service re-drives them on its own, every few
+    minutes, re-testing the blocker each time; this command is for seeing that,
+    and for the one case the automatic retry deliberately will not cover — a
+    project that has spent its bounded attempt budget, which needs somebody who
+    knows the cause was fixed to say so.
+
+    **Restarting the service is not the remedy and never was.** The start path
+    re-drives an interrupted rebuild with no fresh budget, so a restart returned
+    the same banner with a newer timestamp.
+    """
+    settings = _get_settings()
+    if not _probe_service(settings):
+        console.print("[yellow]The service is not running.[/yellow] "
+                      "It owns the store, so recovery runs there — start it with "
+                      "`rag service start`.")
+        raise typer.Exit(2)
+
+    import httpx
+
+    try:
+        if retry:
+            response = httpx.post(f"{_service_url(settings)}/api/recovery/retry",
+                                  timeout=30.0)
+        else:
+            response = httpx.get(f"{_service_url(settings)}/api/recovery",
+                                 timeout=10.0)
+        response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Could not reach the service:[/red] {exc}")
+        raise typer.Exit(1)
+
+    body = response.json()
+    if body.get("status") == "clear":
+        console.print("[green]No rebuild is unresolved on this installation.[/green]")
+        return
+    if retry:
+        console.print(f"[green]Retrying via the service[/green] — "
+                      f"{body.get('state') or 'recovery started'}")
+        console.print("  Progress: `rag recover`, /health, or the admin panel. "
+                      "Completed work is not repeated.")
+        return
+
+    console.print(f"  plan:    {body.get('plan')}")
+    console.print(f"  state:   {body.get('state')}")
+    recorded = body.get("blocked_reason_recorded")
+    if recorded:
+        console.print(f"  blocked (as recorded): {recorded}")
+    check = body.get("precondition") or {}
+    if check:
+        verdict = "clear" if check.get("ok") else (check.get("reason") or "blocked")
+        ago = check.get("retested_seconds_ago")
+        when = f" ({ago:.0f}s ago)" if isinstance(ago, (int, float)) else ""
+        console.print(f"  re-tested{when}: {verdict}")
+    for unit in body.get("attempts_exhausted") or []:
+        console.print(f"  [yellow]exhausted[/yellow]: {unit.get('kind')} "
+                      f"{unit.get('id')} after {unit.get('attempts')} attempts")
+    console.print(f"  remedy:  {body.get('remedy')}")
+
+
 # --- Storage commands ---
 #
 # The storage engine and the collection layout were readable everywhere and
@@ -1841,6 +1909,92 @@ def storage_reclaim(
                 console.print(f"[green]dropped[/green] {name}")
             except Exception as exc:  # noqa: BLE001
                 console.print(f"[red]could not drop {name}:[/red] {exc}")
+    finally:
+        owner.close()
+
+
+@storage_app.command("reap")
+def storage_reap(
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually delete. Default is a dry run."),
+    grace_hours: float = typer.Option(
+        24.0, "--grace-hours",
+        help="How long a collection must have been seen orphaned first."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+):
+    """Report — and only with --apply, drop — orphaned generation collections.
+
+    A rebuild builds into `proj_<uuid>_g<n>` and swaps to it once the replacement
+    is verified, dropping the superseded collection last. A crash between those
+    steps, or a drop that fails, leaves a generation nobody points at. `rag
+    storage reclaim` cannot see them: it works from the collections the registry
+    currently points AT.
+
+    Deliberately a dry run by default. Reaping is the one destructive addition in
+    this release, and the collection shape it looks for — `proj_` plus 32 hex —
+    is exactly what another installation on a shared engine produces. So nothing
+    is deleted on a name: the sweep names every candidate AND every exclusion,
+    and only a collection this installation's registry can account for, whose
+    project is unambiguous, that is nobody's active pointer, that no unresolved
+    rebuild references, and that has sat orphaned past the grace period is ever
+    a candidate.
+    """
+    from ragtools import generation_reaper
+    from ragtools.service.owner import QdrantOwner
+
+    settings = _get_settings()
+    if _probe_service(settings):
+        console.print("[yellow]Stop the service first[/yellow] — it owns the store.")
+        raise typer.Exit(1)
+
+    owner = QdrantOwner(settings)
+    try:
+        report = generation_reaper.reap(
+            owner, apply=False, grace_seconds=grace_hours * 3600.0)
+
+        if not report.allowed:
+            console.print(f"[red]Refusing:[/red] {report.refusal}")
+            for note in report.notes:
+                console.print(f"  note:    {note}")
+            raise typer.Exit(1)
+
+        for cand in report.excluded:
+            console.print(f"  keep:    {cand.describe()}")
+        for cand in report.candidates:
+            console.print(f"  orphan:  {cand.describe()}")
+        for note in report.notes:
+            console.print(f"  note:    {note}")
+
+        if not report.candidates:
+            console.print("[green]Nothing to reap.[/green]")
+            return
+        if not apply:
+            console.print(
+                f"[yellow]Dry run:[/yellow] {len(report.candidates)} "
+                f"collection(s) would be dropped. Re-run with --apply.")
+            return
+
+        if not yes and not typer.confirm(
+                f"Permanently delete {len(report.candidates)} collection(s)?",
+                default=False):
+            console.print("Unchanged.")
+            raise typer.Exit(1)
+
+        # Re-swept rather than acting on the list printed above: between the
+        # report and the confirmation a rebuild can start, and a stale candidate
+        # list is exactly how a live staging collection gets deleted.
+        applied = generation_reaper.reap(
+            owner, apply=True, grace_seconds=grace_hours * 3600.0)
+        if not applied.allowed:
+            console.print(f"[red]Refusing:[/red] {applied.refusal}")
+            raise typer.Exit(1)
+        for name in applied.deleted:
+            console.print(f"[green]dropped[/green] {name}")
+        for name, error in applied.failures:
+            console.print(f"[red]could not drop {name}:[/red] {error}")
+        for cand in applied.excluded:
+            if generation_reaper.AUDIT_WRITE_FAILED in cand.exclusions:
+                console.print(f"[red]not dropped[/red] {cand.describe()}")
     finally:
         owner.close()
 

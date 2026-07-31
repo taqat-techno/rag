@@ -219,12 +219,22 @@ def migration_remedy(settings) -> str:
     engine is down too, so building a client raises — ``storage_url`` is only ever
     set in-process at service startup and is never persisted. Telling every user
     to run a command that cannot work is worse than telling them nothing.
+
+    **It no longer offers a restart.** A restart re-runs ``run_pending`` without
+    a reset, so a plan whose units have spent their automatic attempts comes back
+    in exactly the state it went down in — the advice was not merely unnecessary,
+    it did not work. What does work is the bounded automatic retry the service
+    already performs on a timer, and ``--resume`` for the one case that retry
+    deliberately will not cover: a unit whose attempts are exhausted, which needs
+    somebody to say the cause was fixed.
     """
     backend = (getattr(settings, "storage_backend", "embedded") or "embedded").lower()
     if backend == "embedded":
-        return "rag upgrade --resume"
-    return ("rag upgrade --resume (forwarded to the service), or restart the "
-            "service — it resumes automatically on start")
+        return ("rag upgrade --resume — the service also retries automatically "
+                "every few minutes while attempts remain")
+    return ("rag upgrade --resume (forwarded to the service). The service "
+            "retries automatically every few minutes while attempts remain; "
+            "nothing needs restarting")
 
 
 def get_owner() -> QdrantOwner:

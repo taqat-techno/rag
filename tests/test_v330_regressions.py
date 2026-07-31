@@ -192,7 +192,12 @@ def test_the_remedy_differs_by_backend():
     embedded = migration_remedy(types.SimpleNamespace(storage_backend="embedded"))
     managed = migration_remedy(types.SimpleNamespace(storage_backend="managed"))
     assert embedded != managed
-    assert "restart the service" in managed
+    # The managed remedy used to end "or restart the service — it resumes
+    # automatically on start", which was false: the start path resumes with no
+    # fresh attempt budget, so an exhausted plan came back exactly as it went
+    # down. It now names the forwarding command, which does work (WP-R05).
+    assert "forwarded to the service" in managed
+    assert "restart the service" not in managed
 
 
 def test_the_service_exposes_a_resume_endpoint():
