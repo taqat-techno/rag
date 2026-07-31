@@ -23,7 +23,42 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from qdrant_client import QdrantClient
+
+
+#: The HTTP connection pool, stated rather than inherited.
+#:
+#: qdrant-client's default is not neutral. When the host is ``localhost`` or
+#: ``127.0.0.1`` — which is EVERY managed engine and almost every external one
+#: here — ``QdrantRemote.__init__`` substitutes
+#: ``Limits(max_connections=None, max_keepalive_connections=0)``, disabling
+#: keep-alive on the theory that a local hop is cheap. The consequence is that
+#: every request opens a brand-new TCP socket and closes it, and on Windows each
+#: of those sits in TIME_WAIT for minutes against a dynamic range only 16,384
+#: wide. A 17-minute rebuild issuing an upsert per batch and a delete per batch
+#: walks that range and then cannot connect:
+#:
+#:     [WinError 10048] Only one usage of each socket address ... is permitted
+#:
+#: So the value that matters here is ``max_keepalive_connections`` being above
+#: zero at all: a reused connection costs no port. ``max_connections`` bounds
+#: the burst — the inherited default is effectively unbounded (2**63-1) — and
+#: ``keepalive_expiry`` must outlast the gap between two upserts, which is one
+#: encode of a batch, not milliseconds.
+#:
+#: Raising the OS port range instead is not a fix: it is per-machine, needs
+#: administrator rights, is not portable off Windows, and only moves the wall.
+#:
+#: A connection the server has already closed is still possible (Qdrant's own
+#: idle timeout is shorter than this one). httpcore drops those on checkout, and
+#: the race that slips through raises ``RemoteProtocolError`` — which
+#: :func:`ragtools.transport.is_retryable` allow-lists for exactly this reason.
+_HTTP_LIMITS = httpx.Limits(
+    max_connections=32,
+    max_keepalive_connections=32,
+    keepalive_expiry=30.0,
+)
 
 
 @dataclass(frozen=True)
@@ -130,10 +165,15 @@ class ExternalBackend(StorageBackend):
 
     def client(self) -> QdrantClient:
         if self._client is None:
-            self._client = QdrantClient(url=self._url, api_key=self._api_key)
+            self._client = QdrantClient(
+                url=self._url, api_key=self._api_key, limits=_HTTP_LIMITS,
+            )
         return self._client
 
     def close(self) -> None:
+        # ``close()`` releases the httpx pool — and with it every socket still
+        # held open by keep-alive. Skipping it leaves them to the garbage
+        # collector, which is the one thing keep-alive must not depend on.
         if self._client is not None:
             try:
                 self._client.close()
@@ -170,7 +210,11 @@ class ManagedBackend(StorageBackend):
 
     def client(self) -> QdrantClient:
         if self._client is None:
-            self._client = QdrantClient(url=self._url, api_key=self._api_key)
+            # The managed engine is ALWAYS on 127.0.0.1, so this is the backend
+            # the inherited keep-alive-disabling default hits every time.
+            self._client = QdrantClient(
+                url=self._url, api_key=self._api_key, limits=_HTTP_LIMITS,
+            )
         return self._client
 
     def close(self) -> None:

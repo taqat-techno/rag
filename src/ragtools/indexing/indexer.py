@@ -30,6 +30,7 @@ from ragtools.indexing.scanner import (
 )
 from ragtools.indexing.state import IndexState
 from ragtools.models import Chunk
+from ragtools.transport import retry_call
 
 if TYPE_CHECKING:
     from ragtools.ignore import IgnoreRules
@@ -150,20 +151,93 @@ def chunks_to_points(chunks: list[Chunk], embeddings, file_hash: str) -> list[Po
     return points
 
 
+#: Estimated request-body bytes per upsert request. A point ceiling alone does
+#: not bound the REQUEST: 100 points of ordinary prose is about a megabyte, but
+#: 100 points holding whole vendored source classes is many times that. Size
+#: matters more now that a failed batch is RESENT — a retry of a 40 MB body
+#: pays the whole cost again, and a body that large is exactly the one whose
+#: write is slow enough to meet a timeout in the first place.
+#:
+#: Estimated rather than measured: serialising every batch a second time just
+#: to learn its length would cost more than the bound saves, and both variable
+#: parts of a point are known without serialising it.
+_UPSERT_BATCH_BYTES = 2 * 1024 * 1024
+
+#: A 384-dim vector renders as JSON text, not as floats — roughly 20 characters
+#: per dimension once a sign, a decimal point and an exponent are counted.
+_VECTOR_JSON_BYTES_PER_DIM = 20
+
+#: Flat allowance for the payload's fixed fields (paths, headings, symbol
+#: lists, hashes). Deliberately generous: over-estimating splits a batch one
+#: point early, under-estimating is how the ceiling stops being one.
+_POINT_OVERHEAD_BYTES = 512
+
+
+def _point_bytes(point) -> int:
+    """Estimated wire size of one point. See :data:`_UPSERT_BATCH_BYTES`."""
+    vector = getattr(point, "vector", None)
+    dims = len(vector) if isinstance(vector, (list, tuple)) else 0
+    payload = getattr(point, "payload", None) or {}
+    text = payload.get("text") or ""
+    return dims * _VECTOR_JSON_BYTES_PER_DIM + len(text) + _POINT_OVERHEAD_BYTES
+
+
+def _upsert_batches(points, batch_size: int, max_bytes: int):
+    """Split ``points`` by whichever ceiling — count or bytes — is reached first.
+
+    A single point larger than ``max_bytes`` is still emitted, alone: refusing
+    it would drop content, and looping to make it fit would never terminate.
+    """
+    batch: list = []
+    size = 0
+    for point in points:
+        cost = _point_bytes(point)
+        if batch and (len(batch) >= batch_size or size + cost > max_bytes):
+            yield batch
+            batch, size = [], 0
+        batch.append(point)
+        size += cost
+    if batch:
+        yield batch
+
+
 def upsert_points(
     client: QdrantClient,
     collection_name: str,
     points: list[PointStruct],
     batch_size: int = 100,
+    *,
+    max_bytes: int = _UPSERT_BATCH_BYTES,
+    sleep=None,
 ) -> int:
-    """Upsert points into Qdrant in batches.
+    """Upsert points into Qdrant in batches, retrying transient failures.
+
+    A 17-minute rebuild died here on a single ``WinError 10048`` — ephemeral
+    port exhaustion, the same failure class ``_DELETE_BATCH`` below was written
+    for. Batching the deletes stopped this path PROVOKING it; it never made the
+    path survive one, and the ports are shared with every other process on the
+    machine, so it cannot. :func:`ragtools.transport.retry_call` is what makes
+    the error cost a retry instead of the run.
+
+    Re-sending a batch is safe by construction and needs no bookkeeping: a point
+    id is ``sha256(project::path::index)`` (``chunking.common.make_chunk_id``),
+    so a resent batch overwrites exactly the ids it wrote before. There is no
+    window in which a retry duplicates a vector.
+
+    Args:
+        sleep: injected by tests so the retry schedule costs no wall-clock.
+            Nothing in production passes it.
 
     Returns: total number of points upserted.
     """
+    extra = {} if sleep is None else {"sleep": sleep}
     total = 0
-    for i in range(0, len(points), batch_size):
-        batch = points[i : i + batch_size]
-        client.upsert(collection_name=collection_name, points=batch)
+    for batch in _upsert_batches(points, batch_size, max_bytes):
+        retry_call(
+            lambda b=batch: client.upsert(collection_name=collection_name, points=b),
+            describe=f"upsert {len(batch)} points into {collection_name!r}",
+            **extra,
+        )
         total += len(batch)
     return total
 
