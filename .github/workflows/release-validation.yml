@@ -82,21 +82,38 @@ jobs:
     # `macos-13` runner came to hold the whole v3.5.0 validation run open.
     #
     # Best-effort is not unwatched. This leg still runs and still reports an
-    # explicit result — pass, fail, or unsupported (a retired runner label fails
-    # the job immediately, which is the honest answer). It simply cannot fail
-    # the workflow, and its short timeout means it cannot stall it either. The
-    # day a real Intel artifact is built and published, move it back into the
-    # blocking matrix above — not before.
-    name: suite (macos-13, Intel — best-effort)
-    runs-on: macos-13
+    # explicit verdict — pass, fail, or unsupported. The day a real Intel
+    # artifact is built and published, move it back into the blocking matrix
+    # above — not before.
+    #
+    # TWO CORRECTIONS, both paid for in evidence.
+    #
+    # 1. The label. This job said `runs-on: macos-13`, and the comment above it
+    #    asserted that "a retired runner label fails the job immediately, which
+    #    is the honest answer". That is false, and it is the sentence that cost
+    #    two runs. `macos-13` was retired from GitHub-hosted runners; a job
+    #    requesting a label that no longer exists is not rejected, it QUEUES —
+    #    on run 30653097391 and again on 30666102565, for 15+ hours each, with
+    #    `runner_name` empty the whole time, while `macos-14` legs in the same
+    #    matrix were allocated in under ten seconds. The current Intel labels
+    #    are `macos-15-intel` and `macos-26-intel`.
+    #
+    # 2. `timeout-minutes` does not bound this. It bounds EXECUTION, and this
+    #    job never began executing. Nothing in a workflow file can bound queue
+    #    time, which is why the structural fix below matters more than either
+    #    the label or the timeout: `gate` no longer waits on this job at all.
+    #    A leg that cannot fail the release must also not be able to delay it.
+    name: suite (macOS Intel — best-effort)
+    runs-on: macos-15-intel
     continue-on-error: true
     timeout-minutes: 30          # deliberately below the blocking legs' 45
     outputs:
-      # The gate reads THIS, not `needs.suite-macos-intel.result`. A job with
-      # `continue-on-error: true` reports success to `needs` even when it
-      # failed, so the result field cannot tell pass from fail here — and a
-      # best-effort leg that always renders as "PASS" is worse than no leg at
-      # all. An absent verdict means the job never got far enough to record one.
+      # Kept for anyone who wants to consume it, but NOT read by `gate` any
+      # more. A job with `continue-on-error: true` reports success to `needs`
+      # even when it failed, so the result field cannot tell pass from fail —
+      # and a best-effort leg that always renders as "PASS" is worse than no leg
+      # at all. The verdict below is the honest signal; it is published to the
+      # run summary so it is visible without another job having to block on it.
       verdict: ${{ steps.verdict.outputs.verdict }}
     steps:
       - uses: actions/checkout@v4
@@ -108,15 +125,22 @@ jobs:
       - name: Full suite
         id: pytest
         run: python -m pytest -q
-      - name: Record an explicit verdict for the gate
+      - name: Record an explicit verdict and publish it to the run summary
         if: always()
         id: verdict
         run: |
           if [ "${{ steps.pytest.outcome }}" = "success" ]; then
-            echo "verdict=pass" >> "$GITHUB_OUTPUT"
+            v=pass
+          elif [ "${{ steps.pytest.outcome }}" = "skipped" ]; then
+            # The suite never ran: the runner or the toolchain was unavailable.
+            # That is `unsupported`, not `fail` — calling it a failure would
+            # blame the code for an infrastructure gap.
+            v=unsupported
           else
-            echo "verdict=fail" >> "$GITHUB_OUTPUT"
+            v=fail
           fi
+          echo "verdict=$v" >> "$GITHUB_OUTPUT"
+          echo "macOS Intel (best-effort): **$v**" >> "$GITHUB_STEP_SUMMARY"
 
   linux-adapter:
     name: Linux adapter against real systemd
@@ -447,7 +471,20 @@ jobs:
 
   gate:
     name: release gate
-    needs: [suite, suite-macos-intel, linux-adapter, macos-adapter, clean-install,
+    # `suite-macos-intel` is DELIBERATELY ABSENT from this list.
+    #
+    # It was here, and that is the whole incident. A best-effort leg cannot fail
+    # the release — but while it sat in `needs` it could still DELAY it without
+    # limit, because `needs` waits on queue time as well as run time and nothing
+    # bounds queue time. Twice, a job requesting a retired runner label queued
+    # for 15+ hours; both times the gate could not conclude, and GitHub seals a
+    # run's job logs until the run completes, so an unstartable best-effort leg
+    # sealed the diagnosis of a genuinely FAILED blocking leg.
+    #
+    # The rule this encodes: a job that cannot block the release must not be
+    # able to block the gate either. `tests/test_workflow_contract.py` asserts
+    # it, so re-adding it here fails the suite rather than a future release.
+    needs: [suite, linux-adapter, macos-adapter, clean-install,
             windows-autostart, bundle-contract, real-upgrade, upgrade-rehearsal,
             storage-backends, posix-upgrade]
     # Not the default (`needs` all succeeded): a gate that only runs when
@@ -479,8 +516,10 @@ jobs:
             bundle-contract ${{ needs.bundle-contract.result }}
             real-upgrade ${{ needs.real-upgrade.result }}
             upgrade-rehearsal ${{ needs.upgrade-rehearsal.result }}
-          # BEST-EFFORT. Reported out loud, never decisive.
-          INTEL_VERDICT: ${{ needs.suite-macos-intel.outputs.verdict }}
+          # BEST-EFFORT. Named out loud, never waited on, never decisive.
+          # Deliberately NOT read from `needs.suite-macos-intel.outputs` — that
+          # expression is what put the job in `needs` and let it hold the gate
+          # open. The leg publishes its own verdict to the run summary instead.
         run: |
           set -uo pipefail
           blocked=0
@@ -497,17 +536,13 @@ jobs:
           done <<< "$BLOCKING"
 
           echo ""
-          echo "BEST-EFFORT legs - informational, cannot block a release"
-          case "${INTEL_VERDICT:-}" in
-            pass) intel="PASS" ;;
-            fail) intel="FAIL" ;;
-            # No verdict recorded: the runner was never allocated, the label has
-            # been retired, or the leg hit its timeout. All three are "we do not
-            # know", and none of them is a pass.
-            *)    intel="UNSUPPORTED" ;;
-          esac
-          printf '  %-12s %-22s (%s)\n' "$intel" "suite-macos-intel" \
+          echo "BEST-EFFORT legs - informational, cannot block OR delay a release"
+          printf '  %-12s %-22s (%s)\n' "SEE JOB" "suite-macos-intel" \
             "macOS Intel x86_64: best-effort, no Intel artifact is built or published"
+          echo "    Its verdict (pass | fail | unsupported) is published to the run"
+          echo "    summary by the job itself. This gate does not wait on it: a leg"
+          echo "    that cannot fail the release must not be able to delay it, and"
+          echo "    nothing in a workflow file can bound a job's QUEUE time."
 
           echo ""
           echo "STILL OUTSTANDING and NOT covered by this workflow at all:"
