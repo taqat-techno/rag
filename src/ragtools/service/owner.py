@@ -337,6 +337,11 @@ class QdrantOwner:
         self._frameworks = None
         self._capabilities = None
         self._router = self._build_router(settings)
+        # Is the registry we just opened the one this index was built against?
+        # Asked BEFORE anything writes: a registry that cannot be vouched for
+        # must not mint identities or swap pointers, and the answer is also what
+        # /health reports. Never fatal — see `_reconcile_registry_integrity`.
+        self._reconcile_registry_integrity()
         self._ensured_collections: set[str] = set()
 
         for name in self._router.all_collections():
@@ -1056,7 +1061,16 @@ class QdrantOwner:
         return self._registry
 
     def _check_index_identity(self, state) -> tuple[bool, list[str]]:
-        """Whether ``state``'s file hashes may be trusted for skipping."""
+        """Whether ``state``'s file hashes may be trusted for skipping.
+
+        STORE-WIDE only: engine, layout, legacy collection name, model,
+        dimension. A change to any of those moves every project's vectors at
+        once, so the whole state DB stops describing this store.
+
+        Where a project's own mapping moved, ask :meth:`_untrusted_projects`.
+        Folding that into this answer is what made adding one project re-embed
+        the corpus.
+        """
         from ragtools.index_identity import current_identity, reconcile
 
         try:
@@ -1067,26 +1081,99 @@ class QdrantOwner:
             logger.exception("index-identity check failed; assuming trustworthy")
             return True, []
 
-    def _stamp_index_identity(self) -> None:
-        """Record the current store on the state DB, after a run has written it.
+    def _untrusted_projects(self, state) -> dict[str, list[str]]:
+        """``project_id -> changed fields`` for projects that must be re-indexed.
 
-        The registry goes in too, so the stamp records which collection each
-        project's chunks went to — not merely which layout was configured. That
-        is what makes a later registry loss visible: everything else about the
-        store is invariant to it.
+        The per-project half of R06. Only a project whose OWN recorded mapping
+        (uuid, collection, generation, embedding identity) differs appears here;
+        a project that merely appeared alongside does not, which is the entire
+        difference between this and the registry-wide fingerprint.
+
+        An empty dict on failure, matching :meth:`_check_index_identity`: the
+        guard narrows a re-index, and a guard that cannot run must not widen one.
         """
-        from ragtools.index_identity import current_identity, stamp
+        from ragtools.index_identity import current_project_identities, untrusted_projects
 
         try:
+            live = current_project_identities(self._settings, self._encoder.dimension,
+                                              registry=self._identity_registry())
+            return untrusted_projects(state, live)
+        except Exception:  # noqa: BLE001 — never block indexing on the guard
+            logger.exception("per-project identity check failed; assuming trustworthy")
+            return {}
+
+    def _stamp_index_identity(self, projects=None) -> None:
+        """Record the current store on the state DB, after a run has written it.
+
+        Two stamps, written together:
+
+        * the store-wide identity, including the registry fingerprint — the
+          GLOBAL integrity signal that notices a lost or restored registry;
+        * one row per project, so a later change can be localised to the project
+          it actually affects instead of invalidating every project's hashes.
+
+        They are written together on purpose: a fingerprint with no per-project
+        rows is exactly the ambiguous state that has to be answered
+        conservatively (see ``index_identity.reconcile``), so leaving one behind
+        would re-create the blast radius this refinement removes.
+
+        ``projects`` limits the per-project rows to the ones this run actually
+        covered; ``None`` means all of them, which is right for an unscoped run
+        and for a rebuild. A SCOPED run must not stamp its neighbours: recording
+        project B's current mapping because project A was indexed is how a
+        project that still needs re-indexing comes to look finished — the same
+        "confidently empty" shape, one project wide.
+        """
+        from ragtools.index_identity import (
+            current_identity, current_project_identities, stamp, stamp_projects,
+        )
+
+        try:
+            registry = self._identity_registry()
             state = IndexState(self._settings.state_db)
             try:
                 stamp(state, current_identity(self._settings,
                                               self._encoder.dimension,
-                                              registry=self._identity_registry()))
+                                              registry=registry))
+                live = current_project_identities(
+                    self._settings, self._encoder.dimension, registry=registry)
+                if projects is not None:
+                    wanted = {p for p in projects if p}
+                    live = {k: v for k, v in live.items() if k in wanted}
+                stamp_projects(state, live)
+                # The mapping has just been proven against real writes, so a
+                # hold armed at boot can now clear. Without this an install that
+                # recovered stays locked out of swaps until it is restarted.
+                self._reconcile_registry_integrity(state)
             finally:
                 state.close()
         except Exception:  # noqa: BLE001
             logger.exception("could not record the index identity")
+
+    def _reconcile_registry_integrity(self, state=None):
+        """Re-derive registry integrity and arm/release the write hold.
+
+        Non-fatal by construction: a reporting-and-guarding pass must never be
+        the reason the service will not boot. A failure here leaves the hold as
+        it was, which is the conservative side of the trade.
+        """
+        from ragtools import registry_integrity
+
+        registry = self._identity_registry()
+        if registry is None:
+            return None
+        owned = state is None
+        try:
+            if owned:
+                state = IndexState(self._settings.state_db)
+            try:
+                return registry_integrity.reconcile_startup(state, registry)
+            finally:
+                if owned:
+                    state.close()
+        except Exception:  # noqa: BLE001
+            logger.exception("registry-integrity reconciliation failed")
+            return None
 
     def _collections_for_path(self, state, relative_path: str) -> list[str]:
         """Which collection(s) hold a tracked path's points.
@@ -1487,7 +1574,9 @@ class QdrantOwner:
         log_activity("success", "indexer",
                      f"Full index: {stats['files_indexed']} files, {stats['chunks_indexed']} chunks")
         # The state DB now describes this store (engine + collection layout).
-        self._stamp_index_identity()
+        # Scoped to what ran: a single-project full index proves that project's
+        # mapping and says nothing about anyone else's.
+        self._stamp_index_identity(None if project_id is None else [project_id])
         # Surface a scale warning into logs (and via /api/status) if applicable.
         self._emit_scale_warning_after_index(log_activity)
         return stats
@@ -1543,6 +1632,21 @@ class QdrantOwner:
             _log("warning", "indexer",
                  f"Storage changed ({explain(changed)}) — full re-index required")
 
+        # Per project, and ONLY the ones whose own mapping moved. A project
+        # added alongside these does not appear here, so it costs its own index
+        # run and nothing else — the whole point of separating this from the
+        # registry-wide fingerprint.
+        stale_projects = {} if not trustworthy else self._untrusted_projects(read_state)
+        if stale_projects:
+            from ragtools.index_identity import explain_project
+            from ragtools.service.activity import log_activity as _log
+            for pid, fields in sorted(stale_projects.items()):
+                reason = explain_project(pid, fields)
+                logger.warning("Re-indexing one project: %s", reason)
+                _log("warning", "indexer",
+                     f"Re-indexing '{pid}' only — {reason}. Other projects are "
+                     f"unaffected and keep their index.")
+
         stats = {"indexed": 0, "skipped": 0, "deleted": 0, "chunks_indexed": 0,
                  "projects": set()}
         total_files = len(files)
@@ -1567,9 +1671,12 @@ class QdrantOwner:
                 _tick(n, total_files, "chunk")
                 relative_path = self._resolve_relative_path(pid, file_path)
                 current_hash = IndexState.hash_file(file_path)
-                # `trustworthy` is False when the state DB describes a different
-                # store: the hash may match while the vectors do not exist.
-                if trustworthy and not read_state.file_changed(relative_path, current_hash):
+                # Two independent reasons a matching hash may not mean "already
+                # in the store": the STORE changed (`trustworthy` False — every
+                # project), or THIS PROJECT's collection changed (`stale_projects`
+                # — that project alone). Both mean re-index; neither means delete.
+                if (trustworthy and pid not in stale_projects
+                        and not read_state.file_changed(relative_path, current_hash)):
                     stats["skipped"] += 1
                     continue
                 yield pid, relative_path, current_hash, file_path
@@ -1596,8 +1703,9 @@ class QdrantOwner:
                      f"Incremental: {stats['indexed']} indexed, {stats['skipped']} skipped, {stats['deleted']} deleted")
         # Only now — after the vectors are actually written — does the state DB
         # describe this store. Stamping earlier would let an interrupted
-        # migration look complete on the next run.
-        self._stamp_index_identity()
+        # migration look complete on the next run, and stamping projects this
+        # run did not touch would do the same thing one project at a time.
+        self._stamp_index_identity(None if project_id is None else [project_id])
         self._emit_scale_warning_after_index(log_activity)
         return stats
 
@@ -2673,6 +2781,12 @@ class QdrantOwner:
                 for r in records:
                     state.remove(r["file_path"])
                     deleted_files += 1
+                # The project's recorded mapping goes with its file rows. A
+                # DELIBERATE removal must not later read as a registry that lost
+                # a project — that is the rollback signal, and a routine removal
+                # firing it would block swaps for an install with nothing wrong.
+                from ragtools.index_identity import forget_project
+                forget_project(state, project_id)
                 state.close()
 
             self._invalidate_map_cache()

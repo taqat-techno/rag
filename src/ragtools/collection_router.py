@@ -33,7 +33,10 @@ Plan: docs/planning/RAG_COLLECTION_ARCHITECTURE_IMPLEMENTATION_PLAN.md (W1)
 
 from __future__ import annotations
 
+import logging
 from typing import Iterable, Optional
+
+logger = logging.getLogger("ragtools.collection_router")
 
 STRATEGY_SHARED = "shared"
 STRATEGY_PER_PROJECT = "per_project"
@@ -294,6 +297,12 @@ def build_router(settings):
     data_dir = Path(settings.data_dir)
     registry = ProjectRegistry(str(data_dir / "registry.db"))
     frameworks = FrameworkRegistry(str(data_dir / "frameworks.db"))
+    # BEFORE the sync, never after. If registry.db was lost, this constructor
+    # just recreated it EMPTY and the sync below would mint a fresh uuid4 per
+    # project — N brand-new empty collections beside the N that still hold the
+    # data. Arming the hold here is what makes that refusal possible at all;
+    # asking afterwards would only describe the damage.
+    _guard_registry(settings, registry)
     # Mirror the live TOML projects. Idempotent, and it preserves UUID +
     # collection across rename and path move.
     sync_projects_from_config(settings.projects, registry)
@@ -302,6 +311,35 @@ def build_router(settings):
         registry,
         frameworks,
     )
+
+
+def _guard_registry(settings, registry) -> None:
+    """Arm or clear the registry's write hold from the recorded mapping (R06).
+
+    Reads only. The state DB is opened ONLY if it already exists: a factory must
+    not bring a database into being as a side effect, and a state DB that does
+    not exist records no mapping — which is ``unknown``, which arms nothing.
+
+    Never fatal. This decides whether *identity-creating writes* are safe, and
+    failing to decide must not stop the router from being built; the hold simply
+    stays as it was.
+    """
+    from pathlib import Path
+
+    state_db = getattr(settings, "state_db", None)
+    if not state_db or not Path(state_db).exists():
+        return
+    try:
+        from ragtools import registry_integrity
+        from ragtools.indexing.state import IndexState
+
+        state = IndexState(str(state_db))
+        try:
+            registry_integrity.reconcile_startup(state, registry)
+        finally:
+            state.close()
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.exception("registry-integrity guard could not run")
 
 
 def _dedupe(names: Iterable[str]) -> list[str]:

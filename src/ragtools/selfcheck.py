@@ -372,10 +372,11 @@ def check_index_identity() -> Check:
             # No ``registry=`` on purpose. Opening one here would CREATE
             # registry.db and sync it from config — a write, from a read-only
             # health check, against a file the running service holds. The
-            # fingerprint is therefore "unknown", which `differences` treats as
-            # unknown rather than different, so doctor never contradicts the
-            # service: it reports every other field, and the registry check is
-            # the service's to make while it holds the registry open.
+            # fingerprint is therefore "unknown", which `registry_changed`
+            # treats as unknown rather than different, so doctor never
+            # contradicts the service: it reports every other field, and the
+            # registry's integrity is the service's to judge while it holds the
+            # registry open (see `registry_integrity`, surfaced on /health).
             identity = current_identity(settings, Encoder(settings.embedding_model).dimension)
             trustworthy, changed = reconcile(state, identity)
         finally:

@@ -207,6 +207,23 @@ def health():
     except Exception:  # noqa: BLE001
         pass
 
+    # A registry that cannot be vouched for. The collections still hold the
+    # vectors, but nothing can prove whose they are — so project→collection
+    # pointer swaps and collection reaping are refused until it is reconciled,
+    # and that refusal has to be visible. Read from the cached verdict the owner
+    # computed at boot; /health stays lock-free and opens no database.
+    registry_integrity = None
+    try:
+        from ragtools import registry_integrity as _integrity
+
+        status = _integrity.last_status()
+        if status is not None:
+            registry_integrity = status.state
+            if status.degraded:
+                issues.append("registry_integrity_unresolved")
+    except Exception:  # noqa: BLE001 — reporting must never break liveness
+        registry_integrity = None
+
     # A configuration that could not be brought to the current schema is a real
     # degradation: the product is running on fallback defaults rather than on
     # what the file says, and nothing else would ever mention it. Silence here
@@ -299,6 +316,11 @@ def health():
         # the source.
         "storage_backend": getattr(owner.settings, "storage_backend", "embedded"),
         "collection_strategy": owner.router.strategy,
+        # Whether the live project→collection mapping is the one this index was
+        # built against. `None` = not established (shared layout, or no
+        # reconciliation has run yet); "ok"/"extended"/"repointed" are sound;
+        # anything else is why `registry_integrity_unresolved` is in `issues`.
+        "registry_integrity": registry_integrity,
         # What the schema migration did on this boot, so "am I actually running
         # a v3 configuration?" is answerable without reading the file.
         "config_version": getattr(owner.settings, "config_version", None),

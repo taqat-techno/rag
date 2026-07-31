@@ -38,10 +38,17 @@ holds each project's vectors, so losing it loses the index just as thoroughly as
 losing the state DB — the collections survive, but nothing knows whose they are.
 
 This is SUPPORTING, not the fix. A restored registry is only *correct* because
-`index_identity.registry_fingerprint` first NOTICES that the live mapping is not
-the one the state DB was written against; without that, a wrong registry is
+the registry fingerprint first NOTICES that the live mapping is not the one the
+state DB was written against; without that, a wrong registry is
 indistinguishable from a right one and the restore would be a coin flip nobody
 knew they were tossing.
+
+That fingerprint is a GLOBAL integrity signal and nothing else — it answers "is
+this the same registry?", never "may this project's file hashes be trusted?".
+Restoring a backup therefore has an exact success criterion rather than a
+statistical one: `registry_integrity.verify_restored_mapping` compares the
+restored `project_id -> collection_name` mapping against the recorded one, per
+project, and names every entry it disagrees about.
 """
 
 from __future__ import annotations
