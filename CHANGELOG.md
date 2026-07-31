@@ -13,6 +13,87 @@ _Nothing yet._
 
 ---
 
+## [3.5.0] — 2026-07-31
+
+A rebuild could not fail without destroying data, and the product could not
+tell you when it had. On the installed machine a full rebuild dropped all 15
+collections, deleted the state DB, then died at project 14 of 15 on a single
+transient socket error. One project lost 41,832 points and got nothing back;
+another kept 1,442 of ~35,000 files and rendered as healthy. `/health` said
+`degraded: false, issues: []` for the next twelve hours.
+
+### The rebuild builds before it drops
+
+Each project is its own unit: index into a staging collection, verify it, swap
+the registry pointer, and only then drop the predecessor. Nothing a project is
+serving is touched until its replacement is proven, so a failure leaves that
+project exactly as it was. One project failing no longer decides anything for
+the others, a run with any failure reports `completed_with_failures` instead of
+green, and the failure marker survives the run rather than being cleared in a
+`finally`.
+
+The swap is a single `UPDATE` in the registry. Qdrant aliases were evaluated
+and rejected: the embedded backend is the product default and implements them
+as an in-memory dict with a deferred save, so they are least atomic exactly
+where it matters most, and Qdrant has no rename.
+
+### The transport kept a socket per request
+
+The error that killed the rebuild was `WinError 10048`, and the arithmetic
+never explained it — a few hundred upsert batches cannot exhaust a
+16,384-port range. `qdrant-client` disables HTTP keep-alive for localhost, so
+it was never batches: every request, including scrolls, counts and health
+probes, opened a fresh TCP connection and closed it into TIME_WAIT. Explicit
+`httpx.Limits` restore pooling and remove the mechanism. Retry with jittered
+backoff covers the rest, on an explicit allow-list — a blanket retry hides
+real failures more effectively than no retry at all. Retrying is safe because
+chunk ids are deterministic, so a re-upserted batch overwrites the same ids.
+
+### The Semantic Map shows every project
+
+The map spent one global point budget in registry order and `break`-ed out of
+the collection loop when it ran dry, so 13 of 15 projects received zero
+queries while the footer asserted "385 files across 2 projects" as fact.
+Sampling is now per project and per file, with a floor so no project is
+squeezed out by being enumerated late, and every plotted file is positioned
+from all of its chunks — previously 347 of 375 displayed files were placed
+from an incomplete mean, so the map was wrong about position, not just
+coverage. Collections that cannot be read are reported, and `?project=`
+computes that project rather than filtering a sample that never contained it.
+
+### The numbers say which question they answer
+
+"14 projects" sat above a table of 15 and both were right: one counted
+projects with indexed files, the other projects that exist. Now: configured,
+enabled, indexed and searchable are separate, and `searchable` and `chunks`
+stop being two labels for one number. Per-project status is a nine-word
+vocabulary — `no_eligible_files`, `path_missing`, `failed`, `drifted` and the
+rest — instead of `Not indexed yet` for four different causes with four
+different remedies. Unknown renders as unknown; a collection the store cannot
+count is never reported as zero.
+
+### Also
+
+- MCP `list_projects` in direct mode enumerated only the first collection.
+- Job verification counted a collection that does not exist under
+  `per_project`, so every purge raised "the vectors may still be present" on
+  drops that had succeeded.
+- `rag doctor` reported a healthy 15-collection install as broken.
+- Dev-search and the code graph queried the legacy collection and returned
+  `count: 0` for projects holding thousands of chunks.
+- Two AST boundary tests now fail the build if a `break` abandons the
+  remaining collections, or if the legacy collection setting is read outside
+  the five modules justified in owning it.
+
+### Deferred to a later release
+
+Durable parent/child rebuild jobs with resume, federated multi-project search
+in the UI, the `file_state` composite primary key, registry-loss recovery, and
+the Linux arm64 managed-engine asset. The safety fixes above do not depend on
+them.
+
+---
+
 ## [3.4.0] — 2026-07-30
 
 v3.3.0's fixes landed and the stalled machine did not recover. The engine
