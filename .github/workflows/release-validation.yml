@@ -25,6 +25,15 @@ on:
       - "src/ragtools/platform/**"
       - "src/ragtools/upgrade/**"
       - "scripts/**"
+      # The installer and its quiescence script were NOT listed here, and that
+      # is not a small omission: every packaged-upgrade leg in this file exists
+      # to validate `installer.iss`, and a pull request that rewrote it would
+      # have run none of them. The upgrade protocol moved from
+      # `CurStepChanged(ssInstall)` to `PrepareToInstall()` without a single
+      # real-upgrade job being triggered by that change.
+      - "installer.iss"
+      - "installer/**"
+      - "winget/**"
       - ".github/workflows/release-validation.yml"
 
 jobs:
