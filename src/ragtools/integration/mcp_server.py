@@ -150,12 +150,15 @@ def _initialize() -> None:
                 _mode = "proxy"
                 # Share the session id between the core tools and the ops
                 # tools so audit-log entries from both carry the same id.
-                from ragtools.integration.mcp_common import MCP_SESSION_HEADER, _new_session_id
+                from ragtools.integration.mcp_common import _new_session_id, proxy_headers
                 _session_id = _new_session_id() if _session_id is None else _session_id
                 _http_client = httpx.Client(
                     base_url=f"http://{_settings.service_host}:{_settings.service_port}",
                     timeout=httpx.Timeout(5.0, read=120.0),
-                    headers={MCP_SESSION_HEADER: _session_id},
+                    # Carries the client-profile id when one is configured, so
+                    # the service re-checks authorization for itself rather than
+                    # trusting that this process already did.
+                    headers=proxy_headers(_session_id),
                 )
                 _init_error = None
                 logger.info("MCP initialized in PROXY mode (service at %s:%d)",
@@ -962,6 +965,13 @@ def add_project_ignore_rule(project: str, pattern: str) -> dict:
         project: Project ID.
         pattern: Gitignore-style pattern.
     """
+    # The capability check comes FIRST. Through v3.5.0 this tool (and its
+    # `remove` twin) enforced only the cooldown — a rate limit is not an
+    # authorization decision, so a retrieval-only client could shrink another
+    # client's index one pattern at a time, at a polite pace.
+    _cap = _ops_capability_error("add_project_ignore_rule")
+    if _cap is not None:
+        return _cap
     gate = _cooldown_guard("add_project_ignore_rule")
     if gate is not None:
         return gate
@@ -985,6 +995,9 @@ def remove_project_ignore_rule(project: str, pattern: str) -> dict:
         project: Project ID.
         pattern: Pattern to remove (exact match).
     """
+    _cap = _ops_capability_error("remove_project_ignore_rule")
+    if _cap is not None:
+        return _cap
     gate = _cooldown_guard("remove_project_ignore_rule")
     if gate is not None:
         return gate

@@ -41,6 +41,23 @@ OPERATION_CONFLICT = "OPERATION_CONFLICT"
 STORAGE_UNAVAILABLE = "STORAGE_UNAVAILABLE"
 MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
 UNKNOWN_PROJECT = "UNKNOWN_PROJECT"
+CAPABILITY_DENIED = "CAPABILITY_DENIED"
+
+#: A refusal is not one kind of thing, and collapsing them all onto 409 tells the
+#: caller to retry when retrying can never work. "You may not" is 403 and is
+#: permanent for this caller; "you did not confirm" is 428 and is fixed by
+#: sending the token; "not right now" is 409 and is fixed by waiting.
+_REFUSAL_STATUS: dict[str, int] = {
+    "capability_denied": 403,
+    "destructive_forbidden": 403,
+    "profile_unknown": 403,
+    "confirm_required": 428,
+}
+
+
+def refusal_status(code: str) -> int:
+    """The HTTP status for an :class:`OperationRefused` code. Default 409."""
+    return _REFUSAL_STATUS.get(code or "", 409)
 
 
 def _engine_snapshot() -> dict | None:
@@ -106,6 +123,7 @@ def install_domain_handlers(app) -> None:
     from fastapi import Request
     from fastapi.responses import JSONResponse
 
+    from ragtools.authz import CapabilityDenied
     from ragtools.collection_router import UnknownProject
     from ragtools.embedding.encoder import ModelUnavailable
     from ragtools.service.destructive import OperationRefused
@@ -121,10 +139,28 @@ def install_domain_handlers(app) -> None:
 
     @app.exception_handler(OperationRefused)
     async def _refused(request: Request, exc: OperationRefused):
-        return JSONResponse(status_code=409, content={
-            "error": getattr(exc, "code", None) or OPERATION_CONFLICT,
+        code = getattr(exc, "code", None) or OPERATION_CONFLICT
+        status = refusal_status(getattr(exc, "code", ""))
+        if status == 403:
+            logger.warning("%s %s refused: %s", request.method, request.url.path, code)
+        return JSONResponse(status_code=status, content={
+            "error": code,
             "message": str(exc),
             "engine": _engine_snapshot(),
+        })
+
+    @app.exception_handler(CapabilityDenied)
+    async def _capability(request: Request, exc: CapabilityDenied):
+        """Registered by TYPE, like every other domain condition.
+
+        ``CapabilityDenied`` is a ``PermissionError``, and an unhandled one
+        reaches the blanket handler as ``500 Internal Server Error`` — the exact
+        shape ``MigrationInProgress`` used to have on ``/api/search``.
+        """
+        logger.warning("%s %s denied: %s", request.method, request.url.path, exc)
+        return JSONResponse(status_code=403, content={
+            "error": CAPABILITY_DENIED,
+            "message": str(exc),
         })
 
     @app.exception_handler(StorageWentAway)

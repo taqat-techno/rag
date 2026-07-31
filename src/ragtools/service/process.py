@@ -205,9 +205,22 @@ def stop_service(settings: Settings) -> bool:
 
     url = f"http://{settings.service_host}:{settings.service_port}"
 
-    # Try graceful shutdown via API
+    # Try graceful shutdown via API. `/api/shutdown` requires ``confirm`` to be
+    # the running process's own instance id, published by ``/identity`` — so a
+    # deliberate stop reads it first and a blind or replayed POST cannot produce
+    # it. Failing to read it is not fatal: the force-kill path below is what
+    # stops a service too broken to answer.
+    confirm = ""
     try:
-        r = httpx.post(f"{url}/api/shutdown", timeout=5.0)
+        ident = httpx.get(f"{url}/identity", timeout=5.0)
+        if ident.status_code == 200:
+            confirm = str(ident.json().get("instance_id") or "")
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        r = httpx.post(f"{url}/api/shutdown", params={"confirm": confirm},
+                       timeout=5.0)
         if r.status_code == 200:
             # Poll once per 500 ms — faster feedback than 1s and still cheap.
             deadline = time.monotonic() + _GRACEFUL_SHUTDOWN_WAIT_SECONDS
