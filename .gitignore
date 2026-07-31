@@ -52,3 +52,6 @@ final-*.png
 .qdrant-initialized
 *.toml.bak
 .playwright-mcp/
+
+# Large raw CI logs stay local; commit the trimmed extract instead.
+.claude/evidence/**/*-full.log
