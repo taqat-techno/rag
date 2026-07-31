@@ -137,8 +137,14 @@ def test_an_interrupted_rebuild_leaves_a_marker(tmp_path):
 # --- every door uses the same gate ---------------------------------------
 
 
+#: Both spellings of the gate. ``guarded`` (v3.5.1) is ``destructive_operation``
+#: plus the capability and confirmation checks, and it is what the HTTP doors now
+#: use; the raw lock is still correct for a caller that has already authorized.
+_GATE_NAMES = {"destructive_operation", "guarded"}
+
+
 def _calls_rebuild_under_guard(path: Path, func_name: str) -> bool:
-    """Does ``func_name`` reach owner.rebuild() inside a destructive_operation?"""
+    """Does ``func_name`` reach owner.rebuild() inside the destructive gate?"""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -151,7 +157,7 @@ def _calls_rebuild_under_guard(path: Path, func_name: str) -> bool:
             for item in inner.items:
                 call = item.context_expr
                 if (isinstance(call, ast.Call)
-                        and getattr(call.func, "attr", "") == "destructive_operation"):
+                        and getattr(call.func, "attr", "") in _GATE_NAMES):
                     # rebuild() must be INSIDE this with-block
                     for deeper in ast.walk(inner):
                         if (isinstance(deeper, ast.Call)

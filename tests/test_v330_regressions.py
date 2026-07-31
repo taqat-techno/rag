@@ -217,7 +217,11 @@ def test_the_offline_rebuild_refuses_on_a_managed_installation():
     live engine untouched."""
     source = (SRC / "cli.py").read_text(encoding="utf-8")
     idx = source.index("def rebuild()")
-    body = source[idx:idx + 2600]
+    # The WHOLE function, not a fixed character budget: a 2600-char
+    # window silently stopped containing the rmtree the moment the
+    # offline branch grew a guard, and a test that cannot find what it
+    # is ordering is not passing.
+    body = source[idx:source.index("\n@app.command()", idx)]
     guard_at = body.index('backend != "embedded"')
     rmtree_at = body.index("shutil.rmtree(qdrant_path)")
     assert guard_at < rmtree_at, (

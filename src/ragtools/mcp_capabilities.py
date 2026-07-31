@@ -83,17 +83,25 @@ _SPECS: tuple[ToolSpec, ...] = (
     _ro("get_project_ignore_rules", "project_management"),
     _ro("preview_ignore_effect", "project_management"),
     _write("add_project", "project_management", idempotent=False),
+    _write("update_project", "project_management", idempotent=True),
+    # Removing a project drops its collection AND its config entry. Nothing
+    # brings either back, which is the same standard `delete_collection` is
+    # held to — so it carries the same modifier and a profile granted
+    # "Manage projects" still cannot delete one without the destructive opt-in.
+    _write("delete_project", "project_management", idempotent=True, destructive=True),
     _write("set_project_mode", "project_management", idempotent=True),
     _write("add_project_ignore_rule", "project_management", idempotent=False),
     _write("remove_project_ignore_rule", "project_management", idempotent=True),
     # indexing — rebuild is recoverable, so not destructive (B30 example)
     _write("run_index", "indexing", idempotent=True),
     _write("reindex_project", "indexing", idempotent=True),
+    _write("rebuild_index", "indexing", idempotent=True),
     # framework_management — the shared-dependency catalog and its links.
     # set_project_dependencies REPLACES a project's list, so it is idempotent:
     # sending the same list twice lands in the same state.
     _ro("list_dependencies", "framework_management"),
     _write("add_dependency", "framework_management", idempotent=False),
+    _write("update_dependency", "framework_management", idempotent=True),
     _write("set_project_dependencies", "framework_management", idempotent=True),
     _write("remove_dependency", "framework_management", idempotent=True),
     _ro("list_frameworks", "framework_management"),
@@ -108,10 +116,13 @@ _SPECS: tuple[ToolSpec, ...] = (
     _write("snapshot_collection", "collection_management", idempotent=False),
     _write("restore_collection", "collection_management", idempotent=False, destructive=True),
     _write("delete_collection", "collection_management", idempotent=True, destructive=True),
-    # configuration — read-only
+    # configuration — reads, plus the settings write the admin panel performs.
+    # No MCP tool exposes `update_config`; it is here because the HTTP endpoint
+    # is authorized against the same vocabulary, so one table answers for both.
     _ro("get_config", "configuration"),
     _ro("get_ignore_rules", "configuration"),
     _ro("get_paths", "configuration"),
+    _write("update_config", "configuration", idempotent=True),
     # service_operations — read-only diagnostics
     _ro("service_status", "service_operations"),
     _ro("recent_activity", "service_operations"),
@@ -119,6 +130,10 @@ _SPECS: tuple[ToolSpec, ...] = (
     _ro("crash_history", "service_operations"),
     _ro("system_health", "service_operations"),
     _ro("list_indexed_paths", "service_operations"),
+    # service_control — stopping the service. Not destructive to the index, so
+    # it is not behind the destructive modifier; it is behind its OWN group plus
+    # an unconditional confirmation contract (see service/destructive.py).
+    _write("shutdown_service", "service_control", idempotent=True),
     # profile_administration — owner-only, read views
     _ro("list_client_profiles", "profile_administration"),
     _ro("client_profile_status", "profile_administration"),

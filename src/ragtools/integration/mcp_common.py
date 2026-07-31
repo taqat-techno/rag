@@ -34,6 +34,7 @@ Rationale:
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import time
 from datetime import datetime, timezone
@@ -51,6 +52,24 @@ logger = logging.getLogger("ragtools.mcp")
 # specific MCP session (useful when the user has two Claude Code windows
 # talking to the same service).
 MCP_SESSION_HEADER = "X-MCP-Session"
+
+# Client-profile header. When this MCP process was spawned for a NAMED client
+# (``RAG_CLIENT_PROFILE``) every proxied request carries the id, so the SERVICE
+# re-checks the same capability the MCP process already checked. In-process
+# checking only binds a well-behaved client; the service is what actually
+# performs the write, so the service is where the decision has to be re-made.
+# Absent the header the caller is the owner — which is what the admin panel, the
+# CLI and a single-owner MCP process are.
+MCP_PROFILE_HEADER = "X-Client-Profile"
+
+
+def proxy_headers(session_id: str) -> dict:
+    """Headers stamped on every proxied request: session id, and profile if set."""
+    headers = {MCP_SESSION_HEADER: session_id}
+    profile = (os.environ.get("RAG_CLIENT_PROFILE") or "").strip()
+    if profile:
+        headers[MCP_PROFILE_HEADER] = profile
+    return headers
 
 
 def _new_session_id() -> str:
@@ -154,7 +173,7 @@ class McpState:
                     self.http = httpx.Client(
                         base_url=f"http://{self.settings.service_host}:{self.settings.service_port}",
                         timeout=httpx.Timeout(5.0, read=60.0),
-                        headers={MCP_SESSION_HEADER: self.session_id},
+                        headers=proxy_headers(self.session_id),
                     )
                     logger.info("MCP ops: PROXY mode, session=%s, service at %s",
                                 self.session_id, url)

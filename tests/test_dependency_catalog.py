@@ -650,10 +650,14 @@ def test_saving_a_form_without_the_selector_does_not_clear_links(tmp_path, monke
                         dependencies=[DependencyConfig(
                             id="odoo", path=str(proj / "platform" / "odoo"))])
     calls = []
+    # ``*_`` absorbs the ``request`` the UI now forwards so the service resolves
+    # the caller's profile itself (v3.5.1 WP-R09). The assertions below are
+    # unchanged — what is being pinned is still WHICH dependency list reaches
+    # the writer, not the arity of the call.
     monkeypatch.setattr("ragtools.service.routes.project_update",
-                        lambda pid, req: {"status": "updated"})
+                        lambda pid, req, *_: {"status": "updated"})
     monkeypatch.setattr("ragtools.service.routes.project_dependencies_set",
-                        lambda pid, req: calls.append(req.dependencies))
+                        lambda pid, req, *_: calls.append(req.dependencies))
     monkeypatch.setattr(pages, "get_settings", lambda: settings)
 
     pages.ui_projects_save("alpha", name="A", path=str(proj), ignore_patterns="",

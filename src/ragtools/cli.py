@@ -562,6 +562,25 @@ def doctor(
     console.print(table)
 
 
+class _OfflineRebuildOwner:
+    """The minimum ``blocking_reason`` needs when there is no service.
+
+    Deliberately not a real :class:`~ragtools.service.owner.QdrantOwner`:
+    constructing one opens the embedded store this branch is about to delete,
+    which is both wasteful and a lock we would then have to drop. Reachability
+    is not the question offline — the store is a directory on this disk — so it
+    answers yes, and the migration check (the one that matters here) runs
+    against the real settings.
+    """
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.indexing = False
+
+    def storage_reachable(self):
+        return True, "embedded store on local disk"
+
+
 @app.command()
 def rebuild():
     """Drop all data and rebuild index from scratch."""
@@ -605,6 +624,20 @@ def rebuild():
                 f"  storage_backend is '{backend}', so the index lives in a server "
                 f"this command cannot start.\n"
                 f"  Start the service (`rag service start`) and run this again.")
+            raise typer.Exit(2)
+
+        # The fourth door into a rebuild, and it goes through the same gate. The
+        # store is a local directory this command is about to delete, so
+        # reachability is not in question — a parked migration is. Rebuilding
+        # underneath one destroys the work it has already done and orphans its
+        # plan, and nothing here would have noticed.
+        from ragtools.service import destructive
+
+        try:
+            destructive.assert_allowed(
+                _OfflineRebuildOwner(settings), operation="rebuild")
+        except destructive.OperationRefused as refused:
+            console.print(f"[yellow]Rebuild refused:[/yellow] {refused.reason}")
             raise typer.Exit(2)
 
         qdrant_path = Path(settings.qdrant_path)
@@ -1767,6 +1800,18 @@ def storage_reclaim(
 
     owner = QdrantOwner(settings)
     try:
+        # The same preconditions every other collection-dropping door proves.
+        # The CLI is a surface, not an exemption: an offline reclaim can drop the
+        # previous layout's collections while a PARKED migration still owns
+        # them — exactly the state `blocking_reason` refuses.
+        from ragtools.service import destructive
+
+        try:
+            destructive.assert_allowed(owner, operation="reclaim")
+        except destructive.OperationRefused as refused:
+            console.print(f"[red]Refusing:[/red] {refused.reason}")
+            raise typer.Exit(2)
+
         # Allow-list, for the reason spelled out in `relayout.obsolete_collections`:
         # `existing - current` on a shared engine is another installation's whole
         # index, and this command deletes what it computes.

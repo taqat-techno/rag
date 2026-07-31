@@ -691,29 +691,39 @@ def ui_search(
 
 
 @page_router.post("/ui/index", response_class=HTMLResponse)
-def ui_index(full: bool = Query(False)):
-    """Run index and return results fragment."""
+def ui_index(full: bool = Query(False), request: Request = None):
+    """Run index and return results fragment.
+
+    Guarded like every other index write, and a refusal is rendered as a fragment
+    the user can read — htmx does not swap a 4xx, so a status code alone would
+    leave the button looking like it did nothing.
+    """
+    from ragtools.service import destructive
+
     owner = get_owner()
+    try:
+        with destructive.guarded(owner, "index", request=request):
+            stats = owner.run_full_index() if full else owner.run_incremental_index()
+    except destructive.OperationRefused as refused:
+        return (f'<div class="flash flash-error">Indexing not started: '
+                f'{escape(refused.reason)}</div>')
     if full:
-        stats = owner.run_full_index()
         return f"""
         <div class="flash flash-success">
             Full index complete: {stats['files_indexed']} files, {stats['chunks_indexed']} chunks,
             projects: {', '.join(stats['projects']) or 'none'}
         </div>
         """
-    else:
-        stats = owner.run_incremental_index()
-        return f"""
-        <div class="flash flash-success">
-            Incremental index: {stats['indexed']} indexed, {stats['skipped']} skipped,
-            {stats['deleted']} deleted, {stats['chunks_indexed']} chunks
-        </div>
-        """
+    return f"""
+    <div class="flash flash-success">
+        Incremental index: {stats['indexed']} indexed, {stats['skipped']} skipped,
+        {stats['deleted']} deleted, {stats['chunks_indexed']} chunks
+    </div>
+    """
 
 
 @page_router.post("/ui/rebuild", response_class=HTMLResponse)
-def ui_rebuild():
+def ui_rebuild(request: Request = None):
     """Rebuild and return results fragment.
 
     Guarded and handled. This route used to call ``owner.rebuild()`` bare: any
@@ -731,7 +741,8 @@ def ui_rebuild():
 
     owner = get_owner()
     try:
-        with destructive.destructive_operation(owner, operation="rebuild"):
+        with destructive.guarded(owner, "rebuild", request=request,
+                                 subject="rebuild"):
             stats = owner.rebuild()
     except destructive.OperationRefused as refused:
         return (f'<div class="flash flash-error">Rebuild not started: '
@@ -965,6 +976,7 @@ def ui_projects_add(
     ignore_patterns: str = Form(""),
     mode: str = Form("docs"),
     dependency_paths: str = Form(""),
+    request: Request = None,
 ):
     """Add a new project via UI form."""
     try:
@@ -975,7 +987,7 @@ def ui_projects_add(
         req = ProjectCreateRequest(id=id.strip().lower(), name=name.strip(), path=path.strip(),
                                    ignore_patterns=patterns, mode=mode,
                                    dependency_paths=deps)
-        project_create(req)
+        project_create(req, request)
         return _invalidating(_render_projects_list())
     except Exception as e:
         detail = getattr(e, "detail", str(e))
@@ -1184,6 +1196,7 @@ def ui_dependencies_add(
     id: str = Form(""),
     name: str = Form(""),
     path: str = Form(""),
+    request: Request = None,
 ):
     """Add a catalog entry via the UI form."""
     try:
@@ -1192,7 +1205,7 @@ def ui_dependencies_add(
             id=(_form_text(id) or "").strip().lower(),
             name=(_form_text(name) or "").strip(),
             path=(_form_text(path) or "").strip(),
-        ))
+        ), request)
         return _invalidating(ui_dependencies_list(), resources=("projects", "status"))
     except Exception as e:  # noqa: BLE001
         detail = getattr(e, "detail", str(e))
@@ -1201,13 +1214,13 @@ def ui_dependencies_add(
 
 
 @page_router.delete("/ui/dependencies/{dependency_id}/remove", response_class=HTMLResponse)
-def ui_dependencies_remove(dependency_id: str):
+def ui_dependencies_remove(dependency_id: str, request: Request = None):
     """Remove a catalog entry, unlinking it from every project that used it."""
     try:
         from ragtools.service.routes import dependency_delete
         # cascade: the confirm dialog already named the affected projects, so a
         # second refusal here would be a dead end rather than a safeguard.
-        dependency_delete(dependency_id, cascade=True)
+        dependency_delete(dependency_id, cascade=True, request=request)
         return _invalidating(ui_dependencies_list(), resources=("projects", "status"))
     except Exception as e:  # noqa: BLE001
         detail = getattr(e, "detail", str(e))
@@ -1395,6 +1408,7 @@ def ui_projects_save(
     mode: str = Form("docs"),
     dependencies: list[str] = Form(None),
     deps_present: str = Form(""),
+    request: Request = None,
 ):
     """Save edited project via UI form."""
     try:
@@ -1405,7 +1419,7 @@ def ui_projects_save(
         patterns = [line.strip() for line in ignore_patterns.splitlines() if line.strip()]
         req = ProjectUpdateRequest(name=name.strip() or None, path=path.strip() or None,
                                    ignore_patterns=patterns, mode=mode)
-        project_update(project_id, req)
+        project_update(project_id, req, request)
 
         # Unchecked boxes submit NOTHING, so "no dependencies key" is
         # ambiguous: it means either "none selected" or "this form has no
@@ -1414,7 +1428,8 @@ def ui_projects_save(
         if _form_text(deps_present):
             selected = [d for d in (dependencies or []) if d]
             project_dependencies_set(
-                project_id, ProjectDependencyLinkRequest(dependencies=selected))
+                project_id, ProjectDependencyLinkRequest(dependencies=selected),
+                request)
         return _invalidating(_render_projects_list())
     except Exception as e:
         detail = getattr(e, "detail", str(e))
@@ -1422,11 +1437,11 @@ def ui_projects_save(
 
 
 @page_router.post("/ui/projects/{project_id}/toggle", response_class=HTMLResponse)
-def ui_projects_toggle(project_id: str):
+def ui_projects_toggle(project_id: str, request: Request = None):
     """Toggle project enabled/disabled via UI."""
     try:
         from ragtools.service.routes import project_toggle
-        project_toggle(project_id)
+        project_toggle(project_id, request)
         return _invalidating(_render_projects_list())
     except Exception as e:
         detail = getattr(e, "detail", str(e))
@@ -1434,42 +1449,41 @@ def ui_projects_toggle(project_id: str):
 
 
 @page_router.delete("/ui/projects/{project_id}/remove", response_class=HTMLResponse)
-def ui_projects_remove(project_id: str):
-    """Remove a project via UI. Deletes data in background to avoid timeout."""
-    import threading
+def ui_projects_remove(project_id: str, request: Request = None):
+    """Remove a project via UI. Delegates to the guarded API handler.
+
+    This used to remove the project from the config immediately and then delete
+    the indexed data from a ``threading.Timer`` whose failures went nowhere the
+    user could see. Three things were wrong with that, and all three were
+    invisible:
+
+    * the response had already been sent, so a failed delete rendered exactly
+      like a successful one — the row disappeared either way;
+    * the config was written FIRST, so a failed delete left vectors belonging to
+      a project that no longer existed, unreachable and un-deletable through the
+      UI that had just orphaned them;
+    * nothing checked whether storage was even reachable before starting.
+
+    Doing the delete inline through :func:`ragtools.service.routes.project_delete`
+    fixes all three at once: one gate, one order (data then config), and a
+    failure the user reads as a failure.
+    """
+    from ragtools.service import destructive
 
     try:
-        from ragtools.service.routes import _restart_watcher_if_running
-        from ragtools.service.activity import log_activity
+        from ragtools.service.routes import project_delete
 
-        settings = get_settings()
-        project = next((p for p in settings.projects if p.id == project_id), None)
-        if not project:
-            return f'<div class="flash flash-error">Project not found</div>' + _render_projects_list()
-
-        # Remove from config immediately (fast)
-        updated = [p for p in settings.projects if p.id != project_id]
-        _save_projects_to_toml(updated)
-        get_owner().update_projects(updated)
-        log_activity("info", "config", f"Project removed: {project_id}")
-        _restart_watcher_if_running()
-
-        # Delete indexed data in background (slow for large projects)
-        def _bg_delete(pid):
-            try:
-                owner = get_owner()
-                result = owner.delete_project_data(pid)
-                files = result.get("files_deleted", 0)
-                log_activity("warning", "config", f"Project data cleaned: {pid} ({files} files deleted)")
-            except Exception as e:
-                log_activity("error", "config", f"Failed to clean project data {pid}: {e}")
-
-        threading.Timer(1.0, _bg_delete, args=[project_id]).start()
-
+        project_delete(project_id, request)
         return _invalidating(_render_projects_list())
+    except destructive.OperationRefused as refused:
+        return (f'<div class="flash flash-error">Project not removed: '
+                f'{escape(refused.reason)}</div>') + _render_projects_list()
     except Exception as e:
         detail = getattr(e, "detail", str(e))
-        return f'<div class="flash flash-error">{escape(str(detail))}</div>' + _render_projects_list()
+        logger.exception("project remove failed: %s", project_id)
+        return (f'<div class="flash flash-error">Could not remove '
+                f'{escape(project_id)}: {escape(str(detail))}</div>'
+                ) + _render_projects_list()
 
 
 # --- Activity log fragment ---
@@ -1610,6 +1624,7 @@ def ui_config_save(
     startup_open_browser: str = Form(None),
     startup_delay: int = Form(None),
     desktop_notifications: str = Form(None),
+    request: Request = None,
 ):
     """Save general settings via the UI."""
     try:
@@ -1652,7 +1667,7 @@ def ui_config_save(
         if payload:
             from ragtools.service.routes import update_config, ConfigUpdateRequest
             req = ConfigUpdateRequest(**payload)
-            result = update_config(req)
+            result = update_config(req, request)
             saved_keys = result["updated"]
             restart = result["restart_required"]
         else:
