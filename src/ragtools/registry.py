@@ -68,6 +68,9 @@ class ProjectRecord:
     collection_name: str
     created_at: str
     archived: bool = False
+    #: Which rebuild generation ``collection_name`` refers to. Generation 0 is
+    #: the name a v3.4 install already has, so upgrading moves no data.
+    generation: int = 0
 
 
 class ProjectRegistry:
@@ -89,11 +92,28 @@ class ProjectRegistry:
                 mode            TEXT NOT NULL DEFAULT 'docs',
                 collection_name TEXT NOT NULL,
                 created_at      TEXT,
-                archived        INTEGER NOT NULL DEFAULT 0
+                archived        INTEGER NOT NULL DEFAULT 0,
+                generation      INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+        self._add_missing_columns()
         self._conn.commit()
+
+    def _add_missing_columns(self) -> None:
+        """Bring a registry written by an older version up to this schema.
+
+        ``CREATE TABLE IF NOT EXISTS`` does NOT add a column to a table that
+        already exists, so a v3.4 registry would open without ``generation``
+        and every read would raise. Same trap, same fix as
+        ``relayout._add_retry_columns``.
+        """
+        have = {r[1] for r in self._conn.execute("PRAGMA table_info(projects)")}
+        if "generation" not in have:
+            # DEFAULT 0: an upgraded project keeps reading the collection it
+            # already has. The upgrade must never repoint anything by itself.
+            self._conn.execute(
+                "ALTER TABLE projects ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
 
     # -- reads ----------------------------------------------------------
 
@@ -207,6 +227,33 @@ class ProjectRegistry:
 
     # -- lifecycle ------------------------------------------------------
 
+    def set_active_collection(self, project_uuid: str, collection_name: str,
+                              *, generation: int) -> ProjectRecord:
+        """Point a project at a different collection. THE SWAP PRIMITIVE.
+
+        One UPDATE, so it either happened or it did not — there is no state in
+        which the project half-points at a replacement. That is the property a
+        safe rebuild needs and the reason this is done here rather than with a
+        Qdrant alias: the embedded backend (the product default) implements
+        aliases as an in-memory dict with a deferred save, and Qdrant has no
+        rename at all.
+
+        The caller must have VERIFIED the new collection first. Nothing here
+        can tell whether the replacement is any good; this only makes the
+        handover atomic once it is.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE projects SET collection_name = ?, generation = ? WHERE uuid = ?",
+                (collection_name, int(generation), project_uuid),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"no project with uuid {project_uuid!r}")
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM projects WHERE uuid = ?", (project_uuid,)).fetchone()
+        return self._record(row)
+
     def close(self) -> None:
         """Release the SQLite connection. Idempotent.
 
@@ -247,6 +294,7 @@ class ProjectRegistry:
             collection_name=row["collection_name"],
             created_at=row["created_at"],
             archived=bool(row["archived"]),
+            generation=int(row["generation"] if "generation" in row.keys() else 0),
         )
 
 
