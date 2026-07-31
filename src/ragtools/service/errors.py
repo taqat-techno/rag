@@ -29,11 +29,18 @@ logger = logging.getLogger("ragtools.service")
 #: down, come back" — storage gone, engine restarting, model missing. Neither is
 #: a 500: a 500 says the server has no idea what happened, and in every case
 #: here it knows exactly.
+#:
+#: 404 for "you named something that does not exist" — the caller's input, not
+#: the server's failure. ``UnknownProject`` is raised deliberately by the
+#: collection router (falling back to the shared collection would be a
+#: cross-project read), so it is a designed refusal reaching the wire, and
+#: ``/api/map/points?project=<typo>`` answered 500 for it.
 MIGRATION_IN_PROGRESS = "MIGRATION_IN_PROGRESS"
 MIGRATION_BLOCKED = "MIGRATION_BLOCKED"
 OPERATION_CONFLICT = "OPERATION_CONFLICT"
 STORAGE_UNAVAILABLE = "STORAGE_UNAVAILABLE"
 MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
+UNKNOWN_PROJECT = "UNKNOWN_PROJECT"
 
 
 def _engine_snapshot() -> dict | None:
@@ -96,6 +103,7 @@ def install_domain_handlers(app) -> None:
     from fastapi import Request
     from fastapi.responses import JSONResponse
 
+    from ragtools.collection_router import UnknownProject
     from ragtools.embedding.encoder import ModelUnavailable
     from ragtools.service.destructive import OperationRefused
     from ragtools.service.owner import StorageWentAway
@@ -126,6 +134,18 @@ def install_domain_handlers(app) -> None:
                                 "remediation": "the service restarts the engine "
                                                "automatically; watch /health",
                             })
+
+    @app.exception_handler(UnknownProject)
+    async def _unknown_project(request: Request, exc: UnknownProject):
+        # ``UnknownProject`` subclasses KeyError, so ``str(exc)`` is the repr of
+        # the message. Unwrap it — the refusal explains itself, and a caller
+        # reading escaped quotes learns nothing.
+        message = exc.args[0] if exc.args else "unknown project"
+        return JSONResponse(status_code=404, content={
+            "error": UNKNOWN_PROJECT,
+            "message": str(message),
+            "remediation": "check the project id against /api/projects",
+        })
 
     @app.exception_handler(ModelUnavailable)
     async def _model(request: Request, exc: ModelUnavailable):
