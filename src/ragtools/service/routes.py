@@ -2124,6 +2124,10 @@ def map_points(project: Optional[str] = Query(None, description="Scope to one pr
     global sample. Filtering was why ``?project=rag`` answered ``count: 0`` for
     a project holding 1,716 chunks — a filter cannot recover data the sampler
     never fetched.
+
+    ``space`` names the vector space the projection was built in. Every entry
+    in ``excluded`` is measured against it, so a reason like "dimension 16 (map
+    uses 8)" is only checkable when the map says which 8 it means.
     """
     owner = get_owner()
     result = owner.get_map_points(project_id=project)
@@ -2133,6 +2137,7 @@ def map_points(project: Optional[str] = Query(None, description="Scope to one pr
         "count": len(points),
         "coverage": result.get("coverage", {}),
         "excluded": result.get("excluded", []),
+        "space": result.get("space"),
         "cache": result.get("cache", {}),
     }
 
@@ -2147,6 +2152,7 @@ def map_recompute():
         "count": len(result.get("points", [])),
         "coverage": result.get("coverage", {}),
         "excluded": result.get("excluded", []),
+        "space": result.get("space"),
     }
 
 
