@@ -209,6 +209,29 @@ def build_default_tasks(owner, *, runtime=None) -> list[Task]:
 
         resume_stalled_migration()
 
+    def _reap_generations():
+        # DRY RUN UNLESS SOMEBODY SAID OTHERWISE. The sweep runs either way, and
+        # that is the point: it records the first time each orphan was SEEN, so
+        # the grace period is a real clock rather than something that starts the
+        # day an operator enables deletion. With `reap_generations` off — the
+        # shipped default — nothing is deleted and the report is a log line and
+        # `/api/storage/orphans`.
+        from ragtools import generation_reaper
+
+        grace = getattr(owner.settings, "reap_grace_hours", None)
+        report = generation_reaper.reap(
+            owner,
+            apply=generation_reaper.auto_reap_enabled(owner.settings),
+            grace_seconds=None if grace is None else float(grace) * 3600.0)
+        if not report.allowed:
+            # A refusal is a fact about the registry, already surfaced on
+            # /health as `registry_integrity_unresolved`. Raising here would
+            # report it a second time as a broken maintenance task.
+            logger.info("generation reap not run: %s", report.refusal)
+            return
+        if report.candidates or report.deleted:
+            logger.info("generation reap: %s", report.describe())
+
     def _refresh_frameworks():
         # Framework corpora are not watcher-refreshed: they are keyed by build
         # identity, so a refresh is a deliberate, periodic act rather than a
@@ -227,6 +250,9 @@ def build_default_tasks(owner, *, runtime=None) -> list[Task]:
              description="resume a migration whose blocker has lifted"),
         Task("count-reconciliation", DAY, _reconcile_counts, LOCK_INDEX,
              description="state DB and Qdrant agree on chunk counts"),
+        Task("generation-reap", DAY, _reap_generations, LOCK_INDEX,
+             description="report (and, if enabled, drop) orphaned generation "
+                         "collections"),
         Task("framework-refresh", WEEK, _refresh_frameworks, LOCK_INDEX,
              description="re-import declared dependency corpora"),
     ]

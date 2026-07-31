@@ -763,6 +763,55 @@ def migration_resume():
     })
 
 
+@router.get("/api/storage/orphans")
+def storage_orphans(grace_hours: float = 24.0):
+    """Which generation collections are orphaned, and why the rest are not.
+
+    Read-only and dry-run by construction — it cannot delete, whatever the
+    configuration says. The counterpart that can is ``POST /api/storage/reap``,
+    which is a separate, explicit act for the same reason ``rag storage reclaim``
+    is separate from a layout change.
+
+    A refusal (an unresolved registry, an unreachable engine) is reported in the
+    body rather than raised: the moment somebody needs this endpoint is the
+    moment the thing it reports on is already broken, and a 500 then is useless.
+    """
+    from ragtools import generation_reaper
+
+    owner = get_owner()
+    report = generation_reaper.reap(owner, apply=False,
+                                    grace_seconds=grace_hours * 3600.0)
+    body = report.to_dict()
+    body["auto_reap_enabled"] = generation_reaper.auto_reap_enabled(owner.settings)
+    body["audit"] = generation_reaper.audit_log(owner.settings, limit=25)
+    return body
+
+
+@router.post("/api/storage/reap")
+def storage_reap(grace_hours: float = 24.0):
+    """Drop the orphaned generation collections the sweep can account for.
+
+    Destructive, and therefore refused with **409 Conflict** — never 500 — when
+    the registry cannot be vouched for, the store is unreachable, an indexing run
+    or a migration owns the index, or another destructive operation holds the
+    lock. The sweep is re-run here rather than trusting anything a previous
+    ``/api/storage/orphans`` call reported: a candidate list ages, and acting on
+    a stale one is how a live staging collection gets deleted.
+    """
+    from ragtools import generation_reaper
+
+    owner = get_owner()
+    report = generation_reaper.reap(owner, apply=True,
+                                    grace_seconds=grace_hours * 3600.0)
+    if not report.allowed:
+        raise HTTPException(status_code=409, detail={
+            "error": "reap_refused",
+            "message": report.refusal,
+            "report": report.to_dict(),
+        })
+    return report.to_dict()
+
+
 # --- Status ---
 
 @router.get("/api/status")

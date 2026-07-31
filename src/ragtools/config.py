@@ -520,6 +520,22 @@ class Settings(BaseSettings):
     # Backups of the SQLite state DB (taken before destructive operations).
     backup_keep: int = 10
 
+    # Unattended deletion of orphaned generation collections — the staging and
+    # superseded `proj_<uuid>_g<n>` collections a rebuild leaves behind
+    # (`ragtools.generation_reaper`). OFF, and it stays off unless somebody
+    # declares otherwise: reaping is the one destructive addition in this
+    # release, and the shipped behaviour is a dry run that names every candidate
+    # and every exclusion and deletes nothing. Turning it on relaxes no safety
+    # check — it only lets the sweep act on what it already reports.
+    reap_generations: bool = False
+
+    # How long a generation collection must have been SEEN orphaned before it is
+    # considered settled. Measured from this installation's first sighting, not
+    # from any property of the collection — Qdrant does not say when a collection
+    # was created, and inventing an age is how an in-flight staging collection
+    # gets deleted out from under the rebuild filling it.
+    reap_grace_hours: float = 24.0
+
     # Per-tool access control for the MCP server.
     # Core tools (search_knowledge_base, list_projects, index_status) are always
     # registered regardless of this dict — they define the product. Optional

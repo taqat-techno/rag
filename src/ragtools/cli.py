@@ -1823,6 +1823,92 @@ def storage_reclaim(
         owner.close()
 
 
+@storage_app.command("reap")
+def storage_reap(
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually delete. Default is a dry run."),
+    grace_hours: float = typer.Option(
+        24.0, "--grace-hours",
+        help="How long a collection must have been seen orphaned first."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+):
+    """Report — and only with --apply, drop — orphaned generation collections.
+
+    A rebuild builds into `proj_<uuid>_g<n>` and swaps to it once the replacement
+    is verified, dropping the superseded collection last. A crash between those
+    steps, or a drop that fails, leaves a generation nobody points at. `rag
+    storage reclaim` cannot see them: it works from the collections the registry
+    currently points AT.
+
+    Deliberately a dry run by default. Reaping is the one destructive addition in
+    this release, and the collection shape it looks for — `proj_` plus 32 hex —
+    is exactly what another installation on a shared engine produces. So nothing
+    is deleted on a name: the sweep names every candidate AND every exclusion,
+    and only a collection this installation's registry can account for, whose
+    project is unambiguous, that is nobody's active pointer, that no unresolved
+    rebuild references, and that has sat orphaned past the grace period is ever
+    a candidate.
+    """
+    from ragtools import generation_reaper
+    from ragtools.service.owner import QdrantOwner
+
+    settings = _get_settings()
+    if _probe_service(settings):
+        console.print("[yellow]Stop the service first[/yellow] — it owns the store.")
+        raise typer.Exit(1)
+
+    owner = QdrantOwner(settings)
+    try:
+        report = generation_reaper.reap(
+            owner, apply=False, grace_seconds=grace_hours * 3600.0)
+
+        if not report.allowed:
+            console.print(f"[red]Refusing:[/red] {report.refusal}")
+            for note in report.notes:
+                console.print(f"  note:    {note}")
+            raise typer.Exit(1)
+
+        for cand in report.excluded:
+            console.print(f"  keep:    {cand.describe()}")
+        for cand in report.candidates:
+            console.print(f"  orphan:  {cand.describe()}")
+        for note in report.notes:
+            console.print(f"  note:    {note}")
+
+        if not report.candidates:
+            console.print("[green]Nothing to reap.[/green]")
+            return
+        if not apply:
+            console.print(
+                f"[yellow]Dry run:[/yellow] {len(report.candidates)} "
+                f"collection(s) would be dropped. Re-run with --apply.")
+            return
+
+        if not yes and not typer.confirm(
+                f"Permanently delete {len(report.candidates)} collection(s)?",
+                default=False):
+            console.print("Unchanged.")
+            raise typer.Exit(1)
+
+        # Re-swept rather than acting on the list printed above: between the
+        # report and the confirmation a rebuild can start, and a stale candidate
+        # list is exactly how a live staging collection gets deleted.
+        applied = generation_reaper.reap(
+            owner, apply=True, grace_seconds=grace_hours * 3600.0)
+        if not applied.allowed:
+            console.print(f"[red]Refusing:[/red] {applied.refusal}")
+            raise typer.Exit(1)
+        for name in applied.deleted:
+            console.print(f"[green]dropped[/green] {name}")
+        for name, error in applied.failures:
+            console.print(f"[red]could not drop {name}:[/red] {error}")
+        for cand in applied.excluded:
+            if generation_reaper.AUDIT_WRITE_FAILED in cand.exclusions:
+                console.print(f"[red]not dropped[/red] {cand.describe()}")
+    finally:
+        owner.close()
+
+
 @storage_app.command("backend")
 def storage_backend(
     backend: str = typer.Argument(..., help="embedded | managed | external"),
