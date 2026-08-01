@@ -193,3 +193,125 @@ def test_stop_is_idempotent_and_joins(store):
     w.stop()
     w.stop()
     assert not w.is_alive()
+
+
+# --- shutdown while a job is running ----------------------------------------
+#
+# `stop()` set an Event the loop only reads BETWEEN jobs, so a job already
+# inside a handler never heard it; the join then simply gave up after its
+# timeout and the caller (`app.stop_runtime`) closed the runtime store anyway.
+# On a loaded CI runner that is what happened, and the running job died on
+# `sqlite3.ProgrammingError: Cannot operate on a closed database` — twice, the
+# second time from the handler recording the first, which escaped the thread.
+
+
+def test_stopping_the_worker_ends_the_running_job_instead_of_abandoning_it(store):
+    """The drain, and it is a drain because the outcome gets WRITTEN DOWN.
+
+    The job reaching a terminal state in the store is the proof that it ended
+    while the store was still open — which is the whole property, since the
+    caller closes the store the moment `stop()` returns.
+    """
+    inside = threading.Event()
+
+    def handler(job, ctx):
+        inside.set()
+        for _ in range(20_000):        # ~100s if nothing interrupts it
+            ctx.check_cancel()
+            time.sleep(0.005)
+        return {"ran_to_completion": True}
+
+    w = JobWorker(store, {"index": handler}, poll_interval=0.01)
+    w.start()
+    job = store.submit("index", {})
+    assert inside.wait(10), "the handler never started"
+
+    began = time.time()
+    w.stop(timeout=30.0)
+    elapsed = time.time() - began
+
+    assert elapsed < 10.0, (
+        f"stop() took {elapsed:.1f}s — it waited out the join instead of "
+        "asking the running job to stop")
+    done = store.get_job(job.id)
+    assert done.state == JobState.INTERRUPTED, (
+        f"the job was left in {done.state!r} when the service shut down under "
+        "it; nothing recorded that it had ended")
+    assert "shut down" in (done.error or ""), done.error
+
+
+def test_a_user_cancel_during_a_shutdown_is_still_reported_as_cancelled(store):
+    """`interrupted` and `cancelled` mean different things to the person
+    reading the job list, so the worker must not collapse them."""
+    inside = threading.Event()
+
+    def handler(job, ctx):
+        inside.set()
+        for _ in range(20_000):
+            ctx.check_cancel()
+            time.sleep(0.005)
+        return {}
+
+    w = JobWorker(store, {"index": handler}, poll_interval=0.01)
+    w.start()
+    try:
+        job = store.submit("index", {})
+        assert inside.wait(10)
+        store.request_cancel(job.id)
+        done = _wait_for(store, job.id, JobState.TERMINAL)
+        assert done.state == JobState.CANCELLED
+    finally:
+        w.stop()
+
+
+def test_a_job_that_outlives_the_join_does_not_kill_the_worker_thread(tmp_path):
+    """The CI failure itself: a handler that cannot be interrupted in time.
+
+    Cancellation makes the ordinary case correct; it cannot make it certain,
+    because a handler is free to sit in a long uninterruptible section. So the
+    store has to survive being closed under one — and the thread has to survive
+    the store being closed.
+
+    The assertion is that NOTHING escaped the thread. An exception here kills
+    the worker and hands its traceback every frame beneath it, which is how a
+    leaked `IndexState` outlived the test that opened it and pinned `state.db`.
+    """
+    store = RuntimeStore(str(tmp_path / "runtime.db"), instance_id="test")
+    inside = threading.Event()
+    release = threading.Event()
+    reached_the_end = threading.Event()
+
+    def handler(job, ctx):
+        inside.set()
+        release.wait(30)
+        # Every store call the real index handler makes on its next tick.
+        ctx.check_cancel()
+        ctx.progress(done=1, total=1, phase="late")
+        reached_the_end.set()
+        return {"late": True}
+
+    escaped = []
+    previous_hook = threading.excepthook
+    threading.excepthook = escaped.append
+    try:
+        w = JobWorker(store, {"index": handler}, poll_interval=0.01)
+        w.start()
+        thread = w._thread                      # `stop` drops the reference
+        store.submit("index", {})
+        assert inside.wait(10), "the handler never started"
+
+        w.stop(timeout=0.1)                     # the join gives up ...
+        store.close()                           # ... and the store closes anyway
+        release.set()
+        thread.join(timeout=20)
+    finally:
+        threading.excepthook = previous_hook
+        store.close()
+
+    assert not thread.is_alive(), "the worker thread never finished"
+    assert not escaped, (
+        "an exception escaped the worker thread when the store closed under a "
+        f"running job: {[getattr(a, 'exc_value', a) for a in escaped]}")
+    # It unwound through cancellation rather than running to completion — a
+    # closed store answers "yes, stop".
+    assert not reached_the_end.is_set()

@@ -27,6 +27,7 @@ Plan: docs/planning/RAG_MODERNIZATION_MASTER_PLAN.md  (Phase 2 -> G2)
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import uuid
@@ -34,6 +35,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger("ragtools.runtime_store")
 
 SCHEMA_VERSION = 1
 
@@ -46,6 +49,23 @@ KIND_PURGE = "purge"
 #: Kinds whose success MUST be verified against the store before being reported
 #: (they destroy data). See `finish(..., verified=...)`.
 DESTRUCTIVE_KINDS = frozenset({KIND_REBUILD, KIND_PURGE, KIND_REINDEX})
+
+
+class StoreClosed(RuntimeError):
+    """Raised when NEW work is handed to a store that has been closed.
+
+    Only :meth:`RuntimeStore.submit` raises it. Everything a running job can
+    call answers instead — see :meth:`RuntimeStore.close`. Queuing is the one
+    operation where an answer would be a lie: telling a caller its job was
+    accepted, and handing back an id nothing will ever run, is worse than the
+    error.
+
+    ``RuntimeError`` is the base ON PURPOSE. Three of the four ``submit`` call
+    sites already catch ``RuntimeError`` — the one ``get_runtime()`` raises when
+    there is no store at all — and fall back to running the work on a thread.
+    "The store is closed" wants that same fallback, so it inherits the handling
+    rather than needing new handling written at every site.
+    """
 
 
 class JobState:
@@ -206,6 +226,37 @@ class RuntimeStore:
         no-op — losing a shutdown activity line is the right trade against
         raising in a thread nobody is waiting on, and a far better one than
         crashing the interpreter.
+
+        THAT REASONING WAS APPLIED TO ``_emit`` AND NOWHERE ELSE, and the job
+        worker is the other thread that legitimately outlives a shutdown. It
+        calls ``is_cancel_requested`` on every progress tick and ``finish``
+        exactly once, and both went straight at ``self.conn``::
+
+            sqlite3.ProgrammingError: Cannot operate on a closed database.
+              at is_cancel_requested   <- the running job
+              at finish                <- trying to record that it had failed
+
+        The second one escapes ``JobWorker._run``, kills the thread, and leaves
+        its traceback holding every frame beneath it — including the
+        ``IndexState`` the indexer had open. On Windows that pins ``state.db``
+        until the cyclic collector runs. It failed a release build; see
+        `tests/test_runtime_store_shutdown.py`.
+
+        So EVERY method now answers rather than raising, and each answer is
+        chosen for what its caller does with it:
+
+        * ``is_cancel_requested`` -> **True**. A closed store means the service
+          is going away, so "should this job stop?" is honestly yes, and a
+          cooperative handler unwinds through the ``Cancelled`` path it already
+          has instead of crashing on the next call.
+        * ``claim_next`` -> ``None``. Nothing new starts.
+        * ``finish`` -> ``None``, **logged at ERROR** naming the job, the
+          terminal state and the error it was carrying. A terminal state that
+          could not be recorded is not something to swallow; it is something to
+          say out loud. (The next boot's ``recover_interrupted`` is what makes
+          it good again.)
+        * writes -> no-ops; reads -> empty.
+        * ``submit`` -> raises :class:`StoreClosed`; see there.
         """
         with self._lock:
             self._closed = True
@@ -213,6 +264,11 @@ class RuntimeStore:
                 self.conn.close()
             except Exception:
                 pass
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
 
     def __enter__(self) -> "RuntimeStore":
         return self
@@ -227,6 +283,9 @@ class RuntimeStore:
         """Queue a job. With an ``idempotency_key`` matching an ACTIVE job, that
         job is returned instead of starting a second one."""
         with self._lock:
+            if self._closed:
+                raise StoreClosed(
+                    f"the runtime store is closed; job {kind!r} was not queued")
             if idempotency_key:
                 row = self.conn.execute(
                     "SELECT * FROM jobs WHERE idempotency_key = ? AND state IN (?,?)",
@@ -259,6 +318,8 @@ class RuntimeStore:
         """
         while True:
             with self._lock:
+                if self._closed:
+                    return None
                 row = self.conn.execute(
                     "SELECT * FROM jobs WHERE state = ? ORDER BY created_at, rowid LIMIT 1",
                     (JobState.QUEUED,),
@@ -292,6 +353,8 @@ class RuntimeStore:
                         phase: Optional[str] = None, emit: bool = True) -> None:
         """Record progress. Callers must THROTTLE — never one write per item."""
         with self._lock:
+            if self._closed:
+                return
             self.conn.execute(
                 "UPDATE jobs SET progress_done = ?, progress_total = COALESCE(?, progress_total), "
                 "phase = COALESCE(?, phase) WHERE id = ?",
@@ -303,11 +366,24 @@ class RuntimeStore:
                        {"job_id": job_id, "done": done, "total": total, "phase": phase})
 
     def finish(self, job_id: str, state: str, *, result: Optional[dict] = None,
-               error: Optional[str] = None, verified: Optional[bool] = None) -> Job:
-        """Move a job to a terminal state and emit `job.completed`."""
+               error: Optional[str] = None, verified: Optional[bool] = None) -> Optional[Job]:
+        """Move a job to a terminal state and emit `job.completed`.
+
+        ``None`` when the store is closed — the job DID end, but nothing could
+        be written down. That is reported here, at ERROR, because this is the
+        only place that knows both the outcome and that it was lost. See
+        :meth:`close`.
+        """
         if state not in JobState.TERMINAL:
             raise ValueError(f"{state!r} is not a terminal state")
         with self._lock:
+            if self._closed:
+                logger.error(
+                    "job %s ended as %s but the runtime store is closed, so the "
+                    "outcome was not recorded%s. It will be reported as "
+                    "'interrupted' on the next start.",
+                    job_id, state, f" (error: {error})" if error else "")
+                return None
             self.conn.execute(
                 "UPDATE jobs SET state = ?, finished_at = ?, result_json = ?, error = ?, "
                 "verified = ? WHERE id = ?",
@@ -323,16 +399,27 @@ class RuntimeStore:
 
     def request_cancel(self, job_id: str) -> None:
         with self._lock:
+            if self._closed:
+                return
             self.conn.execute("UPDATE jobs SET cancel_requested = 1 WHERE id = ?", (job_id,))
             self.conn.commit()
         self._emit("job.cancel_requested", "service", {"job_id": job_id})
 
     def is_cancel_requested(self, job_id: str) -> bool:
+        """Should the job stop? A CLOSED store answers **yes**.
+
+        This is the call a running handler makes most often, and the one that
+        crashed the worker when the store closed underneath it. Answering "yes"
+        turns a shutdown into the cancellation path the handler already
+        implements, so it unwinds instead of dying — see :meth:`close`.
+        """
         # NOTE: every connection access — reads included — is serialised. The
         # worker thread and request threads share one connection; unguarded
         # concurrent reads surface as `sqlite3.InterfaceError: bad parameter or
         # other API misuse`, which is how this was found.
         with self._lock:
+            if self._closed:
+                return True
             row = self.conn.execute(
                 "SELECT cancel_requested FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
@@ -340,6 +427,8 @@ class RuntimeStore:
 
     def get_job(self, job_id: str) -> Optional[Job]:
         with self._lock:
+            if self._closed:
+                return None
             row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._job(row) if row else None
 
@@ -351,12 +440,16 @@ class RuntimeStore:
             params = (kind,)
         sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
         with self._lock:
+            if self._closed:
+                return []
             rows = self.conn.execute(sql, params + (limit,)).fetchall()
         return [self._job(r) for r in rows]
 
     def active_jobs(self) -> list:
         """Queued or running — what the UI reconciles against on load."""
         with self._lock:
+            if self._closed:
+                return []
             rows = self.conn.execute(
                 "SELECT * FROM jobs WHERE state IN (?,?) ORDER BY created_at",
                 (JobState.QUEUED, JobState.RUNNING),
@@ -370,6 +463,8 @@ class RuntimeStore:
         during a background operation" an answerable question.
         """
         with self._lock:
+            if self._closed:
+                return []
             rows = self.conn.execute(
                 "SELECT * FROM jobs WHERE state IN (?,?) AND (instance_id IS NULL OR instance_id != ?)",
                 (JobState.QUEUED, JobState.RUNNING, self.instance_id),
@@ -419,17 +514,23 @@ class RuntimeStore:
             params += tuple(types)
         sql += " ORDER BY id LIMIT ?"
         with self._lock:
+            if self._closed:
+                return []
             rows = self.conn.execute(sql, params + (limit,)).fetchall()
         return [self._event(r) for r in rows]
 
     def latest_event_id(self) -> int:
         with self._lock:
+            if self._closed:
+                return 0
             row = self.conn.execute("SELECT MAX(id) AS m FROM events").fetchone()
         return int(row["m"] or 0)
 
     def prune_events(self, *, keep: int = 5000) -> int:
         """Bound the log. Returns how many rows were removed."""
         with self._lock:
+            if self._closed:
+                return 0
             row = self.conn.execute(
                 "SELECT id FROM events ORDER BY id DESC LIMIT 1 OFFSET ?", (keep,)
             ).fetchone()
