@@ -9,6 +9,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [3.5.1] — 2026-08-01
+
+**Upgrading from 3.3.0, 3.4.0 or 3.5.0 was unsafe. This release fixes it.**
+
+### If you are on 3.3.0, 3.4.0 or 3.5.0, read this first
+
+Installing 3.5.0 over any of those versions could fail **mid-write**, leaving a
+mixed installation: `_internal\python312.dll` deleted or unloadable, `rag.exe`
+refusing to start, the uninstall registry entry still naming the old version,
+and the service never coming back. The v3.5.0 advisory described that state.
+**It is resolved here**, and the resolution was measured rather than reasoned.
+
+**The cause.** From 3.3.0 onward the installation supervises a *native* engine
+process, `qdrant.exe`, living at `<install>\bin\`. It loads the Microsoft C
+runtime — `msvcp140.dll`, `vcruntime140.dll`, `vcruntime140_1.dll` — out of
+`<install>\_internal\`, the PyInstaller payload directory, because Windows
+resolves those from the application directory. The installer's `[InstallDelete]`
+removes `{app}\_internal` **wholesale**, met a DLL held by a process nothing was
+stopping, and `/SUPPRESSMSGBOXES` answered the resulting file-in-use prompt with
+**Abort** — exit code 5, half-deleted payload.
+
+Confirmed on a clean disposable runner by the Windows Restart Manager, which
+named the holder outright: pid 2720, `qdrant.exe`, holding its own image and all
+three runtime DLLs. 2.7.0 and 3.0.1 were never affected because they run Qdrant
+in-process; the boundary is that feature, not a coincidence of timing.
+
+**Why nothing stopped it.** `installer.iss` declares no 64-bit architecture, so
+Inno's Setup is 32-bit and its `Exec('powershell.exe', …)` resolves through
+WOW64 to the **32-bit** host. In that host `Process.Path` and `Process.Modules`
+return `$null` and `[]` for 64-bit processes — *silently*, with no exception. The
+path-scoped sweep therefore found zero owned processes and the engine was
+invisible. Ownership is now established out-of-process via `Win32_Process`,
+which is bitness-independent.
+
+### Upgrade safety
+
+* **The installer can now refuse.** Quiescence is proved in `PrepareToInstall()`,
+  which runs before any file operation. If an installation-owning process cannot
+  be stopped, Setup exits **7** having written nothing, and the previous version
+  keeps running. Exit 5 meant "your installation is now mixed"; exit 7 means
+  "nothing was touched". Those were indistinguishable before.
+* **One authoritative protocol** (`installer/quiesce.ps1`): detect, suspend the
+  scheduled tasks (disable, not merely `/end` — a `/end` leaves the trigger
+  armed), stop tray → supervisor → service children → the installation's own
+  managed engine, identify anything still holding a file *by loaded module and
+  not only by image name*, wait with a bounded budget, then **probe every
+  `.exe`/`.dll`/`.pyd` for replaceability before the first write**.
+* Scoping is preserved: a `qdrant.exe` outside this installation is never
+  touched. `storage_backend = "external"` means a server you run, and killing it
+  would be data loss in someone else's application.
+* **Supported upgrade paths, each validated against a genuine packaged
+  installer on a real machine in CI:** 2.7.0, 3.0.1, 3.3.0, 3.4.0, 3.5.0 → 3.5.1.
+
+### Safety and recovery
+
+* **A rebuild no longer loses edits.** Filesystem changes made while a rebuild
+  runs were silently dropped — the "next tick picks it up" assumption is false,
+  because the rebuild rewrites the state rows from its own scan. Changes are now
+  captured durably and replayed after each project swaps, surviving a restart.
+* **Recovery no longer requires restarting the service.** An interrupted rebuild
+  is re-driven on a maintenance tick with bounded backoff, and `/health` reports
+  the unresolved plan until it is genuinely resolved. No message anywhere now
+  offers a restart as the remedy for a recoverable failure.
+* **Destructive endpoints are gated.** Project reindex, project delete, shutdown,
+  mode changes, dependency and ignore-rule mutation, rebuild and collection
+  reclaim now pass through one authorization gate across the API, UI, CLI and
+  both MCP paths. Writes are default-closed; local access alone is not treated
+  as authorization.
+* **Orphaned generation collections are reportable and reclaimable** — dry-run by
+  default, automatic deletion off. Nothing is deleted for resembling a name.
+* **Registry durability**: losing `registry.db` is detected rather than silently
+  minting empty replacement collections, and an orphaned collection is
+  re-adopted by UUID instead of replaced.
+* **A profile lookup leaked a SQLite handle per request** on the refusal path —
+  the `raise` captured the frame into the traceback, keeping the connection
+  alive until the cyclic collector happened to run.
+
+### Correctness
+
+* **The Semantic Map no longer dies whole.** Vectors from different collections
+  were stacked into one projection with no check that they shared a vector
+  space: a differing dimension raised an uncaught `ValueError` → HTTP 500 and
+  the entire map vanished, while a same-dimension/different-model mix silently
+  produced a projection separating *encoders* rather than meaning. Collections
+  are now checked for dimension, model, normalization, metric and vector type,
+  and an incompatible one is excluded **with its reason** while the rest render.
+* **A multi-project search no longer calls your own code a vendored
+  dependency.** Result scope was derived from loop position, so every collection
+  after the first was labelled `framework`, and internal `proj_<uuid>` store
+  names leaked into user-facing output. Scope now comes from what the collection
+  *is*. This also fixed MCP direct search reading **no collections at all** under
+  the per-project layout.
+
+### Known limitations
+
+* **macOS Intel (x86_64) is best-effort.** No Intel artifact is built or
+  published. The leg runs and reports pass/fail/unsupported but cannot block or
+  delay a release.
+* The MCP client-profile header is an identity claim on an unauthenticated
+  localhost socket. It constrains a cooperating restricted client; it is not a
+  defence against a hostile local process.
+* Automatic reaping of orphaned generation collections ships **off** and has not
+  been exercised against a live engine.
+* `rag storage reap`, `rag recover`, the two new config keys and the `/health`
+  `recovery` key are not yet in the wiki.
+
+### Platform support
+
+Windows, Linux x86_64 and macOS arm64 are first-class and release-blocking.
+macOS Intel is best-effort, as above.
+
 ### The gates that would have caught the last two releases now execute
 
 The evidence was a summary line nobody read as a defect:
