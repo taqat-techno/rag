@@ -30,11 +30,16 @@ WHAT IS ACTUALLY MEASURED
 -------------------------
 Four signals, because "it did not crash" is not one:
 
-* **S0 — TCP connections opened to the engine.** Counted inside the process, by
-  wrapping ``socket.socket.connect``, so it is COMPLETE rather than sampled and
-  needs no privileges anywhere. This is connection CHURN, which is the quantity
-  that walks the ephemeral range in the first place: keep-alive off opens one
-  connection per request, keep-alive on opens a pool's worth for the whole run.
+* **S0 — TCP connections the client opens to the engine.** Counted inside the
+  process at the client's own transport, so it is COMPLETE rather than sampled
+  and needs no privileges anywhere. This is connection CHURN, which is the
+  quantity that walks the ephemeral range in the first place: keep-alive off
+  opens one connection per request, keep-alive on opens a pool's worth for the
+  whole run.
+
+  It is counted AT THE CLIENT and not at ``socket.socket.connect``. See
+  :class:`ConnectCounter` — the first version patched that class method, which
+  is process-global, and the measurement then broke the thing it was measuring.
 * **S1 — distinct client-side ephemeral ports used to reach the engine.** The
   WINDOWS exhaustion signature, and only that. Sampled, so it is a lower bound —
   the safe direction, since a lower bound that is already large is conclusive.
@@ -89,7 +94,6 @@ from __future__ import annotations
 import argparse
 import os
 import platform
-import socket
 import sys
 import threading
 import time
@@ -166,53 +170,151 @@ def control_signals(system: str) -> tuple[str, ...]:
     return CONTROL_SIGNALS.get(system) or DEFAULT_CONTROL_SIGNALS
 
 
+def connection_pools(obj, max_depth: int = 8) -> list:
+    """Every ``httpcore`` connection pool reachable from ``obj``.
+
+    A bounded walk by TYPE rather than one hard-coded attribute path: the pool
+    a ``QdrantClient`` drives sits six layers down
+    (``_client.openapi_client.client._client._transport._pool``) behind private
+    names on both sides of the boundary, and a spelled-out path is a silent zero
+    the day either side renames one of them.
+    """
+    import httpcore
+
+    found: list = []
+    seen: set[int] = set()
+    stack: list[tuple[object, int]] = [(obj, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > max_depth or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, httpcore.ConnectionPool):
+            found.append(node)
+            continue                    # never walk INTO a pool's live sockets
+        state = getattr(node, "__dict__", None)
+        if isinstance(state, dict):
+            stack.extend((v, depth + 1) for v in state.values())
+        if isinstance(node, dict):
+            stack.extend((v, depth + 1) for v in node.values())
+        elif isinstance(node, (list, tuple, set, frozenset)):
+            stack.extend((v, depth + 1) for v in node)
+    return found
+
+
+class _CountingBackend:
+    """An ``httpcore`` network backend that delegates, and counts.
+
+    The full sync ``NetworkBackend`` surface — ``connect_tcp``,
+    ``connect_unix_socket``, ``sleep`` — forwarded verbatim. It creates no
+    socket, holds no socket, and closes no socket; the stream it returns is the
+    one the real backend built.
+    """
+
+    def __init__(self, inner, port: int, counter: "ConnectCounter") -> None:
+        self._inner = inner
+        self._port = port
+        self._counter = counter
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None,
+                    socket_options=None):
+        if port == self._port:
+            self._counter.bump()
+        return self._inner.connect_tcp(
+            host, port, timeout=timeout, local_address=local_address,
+            socket_options=socket_options)
+
+    def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        return self._inner.connect_unix_socket(
+            path, timeout=timeout, socket_options=socket_options)
+
+    def sleep(self, seconds):
+        return self._inner.sleep(seconds)
+
+
 class ConnectCounter:
-    """Count TCP connections opened to one port, from inside this process.
+    """Count the TCP connections ONE CLIENT opens to the engine.
 
-    ``socket.socket`` is a Python subclass of the C ``_socket.socket``, so its
-    ``connect`` can be wrapped where the base type's cannot. httpx reaches the
-    network through ``httpcore``'s sync backend, which calls
-    ``socket.create_connection`` and therefore this method — measured on a real
-    client: keep-alive disabled, 30 requests, **30** connects; the shipped pool,
-    30 requests, **1**.
+    Counted at the client's own transport — ``httpcore``'s network backend,
+    which every connection the pool opens goes through — so it is still
+    COMPLETE rather than sampled and still needs no privileges. S1 has to infer
+    connection churn from whatever its sampler happened to catch (33 samples
+    across a 4 s run on Linux); this counts every one, and it counts the thing
+    that actually exhausts a port range.
 
-    COMPLETE, not sampled. S1 has to infer connection churn from whatever the
-    sampler happened to catch — 33 samples across a 4 s run on Linux, because
-    per-process socket enumeration there walks the whole system table. This
-    counts every one, and it counts the thing that actually exhausts a port
-    range.
+    WHY NOT ``socket.socket.connect``, WHICH IS WHAT IT DID FIRST
+    ------------------------------------------------------------
+    That is a process-global class attribute. Every socket in every thread —
+    the client under test, the engine health check, anything a library does —
+    went through one Python function taking one shared lock, swapped in and out
+    by a plain assignment while eight worker threads were connecting through it.
 
-    Scoped to the engine's port so nothing else the process does can inflate it,
-    and restored on exit so a failed load cannot leave a global patched.
+    Run 30680889672 is the receipt. The NEGATIVE CONTROL, which is the
+    keep-alive-disabled configuration and therefore opens a fresh connection for
+    every one of its 3,000 requests, failed on two of three platforms with the
+    same condition in each platform's spelling — an operation issued on a
+    handle that is no longer a socket::
+
+        windows-latest : [WinError 10038] An operation was attempted on
+                         something that is not a socket
+        macos-14       : [Errno 9] Bad file descriptor
+
+    Neither had appeared in the run before the wrapper existed, and the wrapper
+    was the only new code inside the load. It did NOT reproduce on a developer
+    Windows box at the same load, with or without an injected delay in the
+    wrapper — so the mechanism is attributed, not demonstrated, and the reason
+    to remove the patch does not rest on pinning it: **a measurement that breaks
+    the thing it measures is worse than no measurement**, and the property S0
+    was introduced for — complete, unprivileged, independent of kernel port-
+    allocation policy — is not what required a process-global patch. Only the
+    layer did.
+
+    So it is attached to the client, and ``attach`` RAISES when it can find no
+    pool to attach to. A counter that quietly counts nothing reports zero
+    connections for twenty thousand requests, which is the healthiest result
+    this gate can print.
     """
 
     def __init__(self, port: int) -> None:
         self.port = port
-        self.count = 0
+        self._count = 0
         self._lock = threading.Lock()
-        self._original = None
+        self._restore: list[tuple[object, object]] = []
+
+    def bump(self) -> None:
+        with self._lock:
+            self._count += 1
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
+    def attach(self, client) -> "ConnectCounter":
+        """Instrument every connection pool ``client`` owns. Returns self."""
+        pools = connection_pools(client)
+        if not pools:
+            raise SystemExit(
+                f"S0 could not be measured: no httpcore connection pool was "
+                f"found inside {type(client).__name__}, so nothing would be "
+                f"counted. Reporting 0 connections for a whole run is the "
+                f"healthiest number this gate can print, so it refuses instead.")
+        for pool in pools:
+            inner = pool._network_backend
+            pool._network_backend = _CountingBackend(inner, self.port, self)
+            self._restore.append((pool, inner))
+        return self
+
+    def detach(self) -> None:
+        while self._restore:
+            pool, inner = self._restore.pop()
+            pool._network_backend = inner
 
     def __enter__(self) -> "ConnectCounter":
-        counter = self
-        self._original = socket.socket.connect
-
-        def connect(sock, address):
-            try:
-                if isinstance(address, tuple) and len(address) >= 2 \
-                        and address[1] == counter.port:
-                    with counter._lock:
-                        counter.count += 1
-            except Exception:                           # noqa: BLE001
-                pass
-            return counter._original(sock, address)
-
-        socket.socket.connect = connect
         return self
 
     def __exit__(self, *_exc) -> None:
-        if self._original is not None:
-            socket.socket.connect = self._original
-            self._original = None
+        self.detach()
 
 
 @dataclass
@@ -450,8 +552,10 @@ def drive(url: str, port: int, *, requests: int, workers: int,
 
     sampler = Sampler(port=port)
     sampler.start()
-    connect_counter = ConnectCounter(port)
-    connect_counter.__enter__()
+    # AFTER the warm-up: what is being measured is the connections this RUN
+    # opens, not the pool it inherited. Attached to this client, so nothing else
+    # in the process is instrumented and nothing else can inflate the count.
+    connect_counter = ConnectCounter(port).attach(client)
 
     counter = {"n": 0}
     errors: list[BaseException] = []
@@ -494,9 +598,9 @@ def drive(url: str, port: int, *, requests: int, workers: int,
         for t in threads:
             t.join()
     finally:
-        # Restored whatever happened: a failed load must not leave the global
-        # `socket.socket.connect` wrapped for the rest of the process.
-        connect_counter.__exit__()
+        # Restored whatever happened, so the client is handed back exactly as it
+        # was found — including on the path where the load raises.
+        connect_counter.detach()
     elapsed = time.time() - started
 
     time_wait_after = time_wait_against(port)

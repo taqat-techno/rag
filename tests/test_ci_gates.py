@@ -562,23 +562,18 @@ def test_the_time_wait_signal_measures_the_run_rather_than_the_machine():
     )
 
 
-def test_the_connection_counter_separates_a_leaky_client_from_the_shipped_one():
-    """S0 against a REAL httpx client, which is what the gate drives.
+@pytest.fixture
+def loopback_http():
+    """A local HTTP/1.1 server, so S0 can be measured without an engine.
 
-    The whole point of replacing the control's signal is that the new one has to
-    discriminate where the old one could not — so this measures it rather than
-    asserting that a constant is present. Loopback only; no engine, no network.
+    HTTP/1.1 specifically, or the SERVER closes every connection and both
+    clients look equally leaky — the measurement would then be of this fixture
+    rather than of the client. A real Qdrant speaks 1.1.
     """
     import http.server
     import threading as _threading
 
-    httpx = pytest.importorskip("httpx")
-    from scripts.stress_transport import ConnectCounter
-
     class Quiet(http.server.BaseHTTPRequestHandler):
-        # HTTP/1.1, or the SERVER closes every connection and both clients look
-        # equally leaky — the measurement would then be of this fixture rather
-        # than of the client. A real Qdrant speaks 1.1.
         protocol_version = "HTTP/1.1"
 
         def do_GET(self):                               # noqa: N802
@@ -591,30 +586,39 @@ def test_the_connection_counter_separates_a_leaky_client_from_the_shipped_one():
             return
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
-    port = server.server_address[1]
     thread = _threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    original = socket.socket.connect
     try:
-        counted = {}
-        for label, limits in (
-            ("leaky", httpx.Limits(max_connections=None, max_keepalive_connections=0)),
-            ("pooled", httpx.Limits(max_connections=32, max_keepalive_connections=32)),
-        ):
-            with ConnectCounter(port) as counter:
-                with httpx.Client(limits=limits, timeout=10) as client:
-                    for _ in range(40):
-                        assert client.get(f"http://127.0.0.1:{port}/").status_code == 200
-            counted[label] = counter.count
+        yield server.server_address[1]
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=10)
 
-    assert socket.socket.connect is original, (
-        "the counter left socket.socket.connect wrapped, which would follow the "
-        "rest of the process around"
-    )
+
+def test_the_connection_counter_separates_a_leaky_client_from_the_shipped_one(
+        loopback_http):
+    """S0 against a REAL httpx client, which is what the gate drives.
+
+    The whole point of replacing the control's signal is that the new one has to
+    discriminate where the old one could not — so this measures it rather than
+    asserting that a constant is present. Loopback only; no engine, no network.
+    """
+    httpx = pytest.importorskip("httpx")
+    from scripts.stress_transport import ConnectCounter
+
+    port = loopback_http
+    counted = {}
+    for label, limits in (
+        ("leaky", httpx.Limits(max_connections=None, max_keepalive_connections=0)),
+        ("pooled", httpx.Limits(max_connections=32, max_keepalive_connections=32)),
+    ):
+        with httpx.Client(limits=limits, timeout=10) as client:
+            with ConnectCounter(port).attach(client) as counter:
+                for _ in range(40):
+                    assert client.get(f"http://127.0.0.1:{port}/").status_code == 200
+        counted[label] = counter.count
+
     assert counted["leaky"] >= 40, (
         f"a keep-alive-disabled client opened only {counted['leaky']} connection(s) "
         f"for 40 requests, so S0 cannot see the known-bad case either"
@@ -623,6 +627,73 @@ def test_the_connection_counter_separates_a_leaky_client_from_the_shipped_one():
         f"the pooled client opened {counted['pooled']} connection(s) for 40 "
         f"requests; S0 would flag the shipped configuration as leaky"
     )
+
+
+def test_the_connection_counter_never_touches_process_global_socket_state(
+        loopback_http):
+    """The measurement must not perturb what it measures.
+
+    S0's first version wrapped ``socket.socket.connect`` — a process-global
+    class attribute, swapped by assignment while eight worker threads connected
+    through it. Run 30680889672's negative control then failed on two of three
+    platforms with the same condition in each one's spelling, an operation
+    issued on a handle that is no longer a socket: ``[WinError 10038]`` on
+    windows-latest, ``[Errno 9] Bad file descriptor`` on macos-14.
+
+    Two properties, and BOTH are needed. "Restored afterwards" was already true
+    of the wrapper and did not save it; what matters is that the global is never
+    written at all, and that a second client's connections — which the global
+    patch counted, because it saw the whole process — are not attributed to this
+    one.
+    """
+    httpx = pytest.importorskip("httpx")
+    from scripts.stress_transport import ConnectCounter
+
+    port = loopback_http
+    url = f"http://127.0.0.1:{port}/"
+    no_keepalive = httpx.Limits(max_connections=None, max_keepalive_connections=0)
+    before = socket.socket.connect
+
+    with httpx.Client(limits=no_keepalive, timeout=10) as measured, \
+            httpx.Client(limits=no_keepalive, timeout=10) as bystander:
+        with ConnectCounter(port).attach(measured) as counter:
+            during = socket.socket.connect
+            for _ in range(10):
+                assert measured.get(url).status_code == 200
+            for _ in range(10):
+                assert bystander.get(url).status_code == 200
+            counted_bystander = counter.count
+
+    assert during is before, (
+        "socket.socket.connect was replaced while the load ran. That is a "
+        "process-global class attribute shared by every socket in every thread, "
+        "and instrumenting it is what broke the negative control on Windows and "
+        "macOS."
+    )
+    assert socket.socket.connect is before
+    assert 10 <= counted_bystander <= 12, (
+        f"S0 counted {counted_bystander} connection(s) while the measured client "
+        f"made 10 requests and an unrelated client on the same port made 10 "
+        f"more. The signal is supposed to be scoped to the client under test; "
+        f"a count of ~20 means it is still measuring the whole process."
+    )
+
+
+def test_a_connection_counter_that_can_measure_nothing_refuses_to_report_zero():
+    """The ``_count_points`` rule, applied to this gate.
+
+    Zero connections for a whole run is the healthiest number S0 can print, and
+    it is exactly what an attachment that silently found no pool would produce —
+    a green gate over an unmeasured run. Unknown is a refusal, never a count.
+    """
+    from scripts.stress_transport import ConnectCounter
+
+    class NotAClient:
+        pass
+
+    with pytest.raises(SystemExit) as excinfo:
+        ConnectCounter(1234).attach(NotAClient())
+    assert "S0 could not be measured" in str(excinfo.value)
 
 
 def test_the_managed_engine_gate_runs_on_all_three_first_class_platforms():
