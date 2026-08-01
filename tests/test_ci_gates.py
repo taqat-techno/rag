@@ -709,3 +709,204 @@ def test_playwright_is_a_declared_dependency():
     assert "playwright" in text, (
         "playwright is not declared anywhere in pyproject.toml, so the panel "
         "browser gate cannot be installed by any documented command")
+
+
+# --- the real-uninstall sweep must not judge a removal still in progress -----
+#
+# Run 30692207245, `packaged v3.4.0 -> this build`. Four other legs of the same
+# run, with the same script and the same installer, passed the same step:
+#
+#   [PASS] the uninstall entry is gone — None
+#   [PASS] no program files survive except the uninstaller itself — 0 entries: []
+#   [FAIL] a fresh scan finds no packaged installation — install-user: ...\RAGTools
+#
+# Two checks over ONE directory, 0.6 s apart, opposite verdicts. They were two
+# different predicates: the first iterated the directory, the second was
+# `all(name in SELF for name in iterdir())` under a bare `except OSError:
+# return False`. Anything that made the directory unreadable — on Windows, a
+# directory removed while a handle on it is still open answers `stat` from its
+# parent's entry and refuses enumeration — became "residue", reported as a bare
+# path with neither the contents nor the error.
+
+
+def _uninstall():
+    from scripts import verify_real_uninstall as vru
+
+    return vru
+
+
+def test_a_directory_holding_only_innos_stub_is_not_residue():
+    vru = _uninstall()
+    state = vru.directory_state(
+        "C:/anywhere", listdir=lambda _p: ["unins000.exe", "unins000.dat"])
+    assert state.state == vru.UNINSTALLER_ONLY
+    assert state.settled
+
+
+def test_a_directory_that_still_holds_program_files_is_residue_and_names_them():
+    """The diagnostic run 30692207245 did not have: WHICH files survived."""
+    vru = _uninstall()
+    state = vru.directory_state(
+        "C:/anywhere",
+        listdir=lambda _p: ["unins000.exe", "_internal", "rag.exe", "bin"])
+    assert state.state == vru.RESIDUE
+    assert not state.settled
+    assert set(state.entries) == {"_internal", "rag.exe", "bin"}
+    for name in ("_internal", "rag.exe", "bin"):
+        assert name in state.describe(), state.describe()
+
+
+def test_the_default_lister_reads_a_real_directory(tmp_path):
+    """The injected listers above never exercise the default one, and the
+    default one is what CI runs."""
+    vru = _uninstall()
+
+    missing = tmp_path / "never-existed"
+    assert vru.directory_state(missing).state == vru.GONE
+
+    root = tmp_path / "RAGTools"
+    root.mkdir()
+    (root / "unins000.exe").write_bytes(b"MZ")
+    (root / "unins000.dat").write_bytes(b"")
+    assert vru.directory_state(root).state == vru.UNINSTALLER_ONLY
+
+    (root / "_internal").mkdir()
+    state = vru.directory_state(root)
+    assert state.state == vru.RESIDUE
+    assert state.entries == ("_internal",)
+
+    stray = tmp_path / "service.pid"
+    stray.write_text("1234", encoding="utf-8")
+    assert vru.directory_state(stray).state == vru.RESIDUE
+
+
+def test_a_missing_directory_is_the_finished_state_not_an_error():
+    vru = _uninstall()
+
+    def _missing(_p):
+        raise FileNotFoundError(2, "The system cannot find the path specified")
+
+    state = vru.directory_state("C:/gone", listdir=_missing)
+    assert state.state == vru.GONE
+    assert state.settled
+
+
+def test_an_unreadable_directory_is_named_rather_than_called_residue():
+    """The regression, stated as behaviour.
+
+    A directory Windows has marked delete-pending is UNREADABLE, which is a
+    state of an uninstall in flight. The predicate that shipped could not say
+    that: it returned the same answer it returns for `_internal` surviving, and
+    said nothing about why.
+    """
+    vru = _uninstall()
+
+    def _delete_pending(_p):
+        raise PermissionError(13, "Access is denied")
+
+    state = vru.directory_state("C:/pending", listdir=_delete_pending)
+    assert state.state == vru.UNREADABLE
+    assert not state.settled
+    assert "PermissionError" in state.describe()
+    assert "Access is denied" in state.describe()
+
+    # THE NEGATIVE CONTROL: the predicate this replaced. It answers the same
+    # PermissionError with a bare False — indistinguishable from a directory
+    # full of program files — which is the verdict that failed the leg.
+    def shipped_predicate(lister) -> bool:
+        try:
+            return all(name.lower() in vru.SELF for name in lister("C:/pending"))
+        except OSError:
+            return False
+
+    assert shipped_predicate(_delete_pending) is False
+    assert shipped_predicate(lambda _p: ["unins000.exe"]) is True, (
+        "this control no longer models the predicate it replaced"
+    )
+
+
+def test_a_file_at_the_path_is_residue_plainly_not_something_unreadable():
+    """Legacy artifacts (``data/service.pid``) are files, and are real residue."""
+    vru = _uninstall()
+
+    def _not_a_directory(_p):
+        raise NotADirectoryError(20, "The directory name is invalid")
+
+    state = vru.directory_state("C:/x/service.pid", listdir=_not_a_directory)
+    assert state.state == vru.RESIDUE
+    assert state.entries == ("service.pid",)
+
+
+def test_the_sweep_waits_for_the_removal_to_finish_before_judging_it():
+    """Delete-pending, then gone — which is a successful uninstall, and was
+    being reported as a failed one because nothing waited."""
+    vru = _uninstall()
+    observations = iter([
+        PermissionError(13, "Access is denied"),
+        PermissionError(13, "Access is denied"),
+        FileNotFoundError(2, "The system cannot find the path specified"),
+    ])
+    slept: list[float] = []
+
+    def _listing(_p):
+        raise next(observations)
+
+    # THE PRE-FIX VERDICT, on the first of those same observations: the sweep was
+    # taken immediately and nothing waited, so a directory two polls away from
+    # being gone failed the gate.
+    def _pending(_p):
+        raise PermissionError(13, "Access is denied")
+
+    assert not vru.directory_state("C:/pending", listdir=_pending).settled
+
+    state = vru.wait_until_settled(
+        "C:/pending", listdir=_listing, sleep=slept.append,
+        now=lambda: float(len(slept)), timeout=30.0)
+    assert state.state == vru.GONE
+    assert state.settled
+    assert slept, "the waiter never waited, so it cannot have waited anything out"
+
+
+def test_the_wait_is_bounded_and_still_fails_a_directory_that_never_clears():
+    """The wait must not become a way for residue to pass by outlasting it."""
+    vru = _uninstall()
+    slept: list[float] = []
+
+    state = vru.wait_until_settled(
+        "C:/stuck", listdir=lambda _p: ["_internal", "rag.exe"],
+        sleep=slept.append, now=lambda: float(len(slept)), timeout=5.0)
+    assert state.state == vru.RESIDUE
+    assert not state.settled
+    assert "_internal" in state.describe()
+    assert len(slept) <= 6, "the bound is not bounding anything"
+
+
+def _sweep_has_its_own_predicate(source: str) -> bool:
+    """Does the sweep judge residue by something other than ``directory_state``?"""
+    body = source.split("def main(")[1] if "def main(" in source else source
+    return "_only_the_uninstaller" in body or "directory_state(" not in body
+
+
+def test_the_sweep_and_the_directory_check_cannot_disagree_again():
+    """One predicate, because the defect WAS two of them.
+
+    Structural, so it carries an executed control: the detector is shown to FIRE
+    on the shape that shipped before it is asked about the shape that does.
+    """
+    shipped_before = (
+        "def main():\n"
+        "    def _only_the_uninstaller(path):\n"
+        "        try:\n"
+        "            return all(p.name.lower() in SELF for p in path.iterdir())\n"
+        "        except OSError:\n"
+        "            return False\n"
+    )
+    assert _sweep_has_its_own_predicate(shipped_before), (
+        "the detector cannot see the pair of predicates it exists to forbid")
+
+    source = (ROOT / "scripts" / "verify_real_uninstall.py").read_text(encoding="utf-8")
+    assert not _sweep_has_its_own_predicate(source), (
+        "the sweep has its own residue predicate again; that is the pair that "
+        "returned opposite verdicts over one directory in run 30692207245")
+    assert source.count("def directory_state(") == 1
+    assert source.split("def main(")[1].count("wait_until_settled(") == 1
