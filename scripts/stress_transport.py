@@ -87,6 +87,24 @@ the control to trip EVERY signal designated for the platform it is running on.
 S1 stays exactly as strict as it is on Windows, because Windows is where the
 failure happened; S0 is designated everywhere, because it discriminates
 everywhere.
+
+AND WHY THE CONTROL'S OWN REQUEST FAILURES ARE NOT FATAL
+--------------------------------------------------------
+The control IS the v3.4 configuration. Being leaky and unreliable under churn is
+the property it exists to demonstrate, so its failed requests are corroborating
+evidence — counted, reported, and never a reason to end the run. Treating them
+as fatal meant the better the control was at being broken, the more certainly it
+took the gate with it: ``transport stress (macos-14)`` died in the control, before
+the shipped client was measured at all, in three consecutive runs.
+
+Failures in the run UNDER TEST stay fatal, because that is the thing being
+tested and it must be clean. One rule, two subjects — :func:`failure_verdict`.
+
+Tolerance alone would be a hole, so the control must also have COMPLETED
+:data:`MIN_CONTROL_COMPLETION` of its load (:func:`control_problems`). A control
+that collapsed on its first request would open one connection per request and
+trip S0 on the arithmetic while having demonstrated nothing. It may be
+unreliable; it may not be absent.
 """
 
 from __future__ import annotations
@@ -165,9 +183,58 @@ CONTROL_SIGNALS: dict[str, tuple[str, ...]] = {
 #: control", which is the state this file exists to make impossible.
 DEFAULT_CONTROL_SIGNALS: tuple[str, ...] = (SIGNAL_CONNECTS,)
 
+#: The fraction of its requested load the NEGATIVE CONTROL must actually
+#: complete for its signals to be worth reading.
+#:
+#: Required BECAUSE its request failures are tolerated. Without it, tolerance
+#: would be a hole: eight workers that each died on their first request would
+#: report eight connections for eight requests, "trip" S0 on a ratio of 1.0 and
+#: vouch for a gate that had measured nothing. Tolerating failures and requiring
+#: completion are the same rule from two sides — the control may be unreliable,
+#: it may not be absent.
+MIN_CONTROL_COMPLETION = 0.9
+
 
 def control_signals(system: str) -> tuple[str, ...]:
     return CONTROL_SIGNALS.get(system) or DEFAULT_CONTROL_SIGNALS
+
+
+def describe_error(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def failure_verdict(failures: int, first: str, *, dispatched: int,
+                    tolerated: bool) -> str:
+    """The message to die with, or ``""`` to carry on and report the number.
+
+    WHOSE failures they are decides, and that is the whole of it.
+
+    In the run UNDER TEST a failed request is the thing being tested for: the
+    v3.4 incident was one socket error ending a 17-minute rebuild, so the
+    shipped client must be clean and any failure stays fatal.
+
+    In the NEGATIVE CONTROL it is the property the control EXISTS to
+    demonstrate. That client is ``max_connections=None,
+    max_keepalive_connections=0`` — a fresh socket per request, the
+    configuration the incident ran under — and on macOS its own churn
+    intermittently produces ``[Errno 9] Bad file descriptor``, a use-after-close
+    (NOT descriptor exhaustion, which is ``EMFILE``). Errno 9 is correctly
+    absent from :data:`ragtools.transport._RETRYABLE_ERRNOS`, so it was raised on
+    the first attempt and ended the run.
+
+    It ended the run on macos-14 in THREE consecutive runs — 30676422208 (2
+    failures), 30680889672 (1) and 30692207245 (2) — under three different
+    measurement regimes, including 30676422208, at which commit the script
+    contained no client instrumentation of any kind. The condition is therefore
+    a property of the control's configuration and not of anything measuring it,
+    and treating it as fatal means the better the control is at being broken,
+    the more certainly it takes the gate with it. Two failed requests in three
+    thousand are corroborating evidence; they are reported, and counted.
+    """
+    if not failures or tolerated:
+        return ""
+    return (f"{failures} of {dispatched} request(s) failed — not retryable, or "
+            f"the retry budget was spent. First: {first}")
 
 
 def connection_pools(obj, max_depth: int = 8) -> list:
@@ -433,6 +500,7 @@ def build_client(url: str, *, keepalive: bool):
 
 @dataclass
 class Outcome:
+    #: Requests that COMPLETED. `requests + failures` is what was dispatched.
     requests: int
     seconds: float
     retries: int
@@ -444,6 +512,14 @@ class Outcome:
     time_wait_before: int | None
     time_wait_after: int | None
     sampler_error: str
+    #: Requests that raised and were tolerated rather than fatal. Always 0 for
+    #: the run under test, which does not tolerate any.
+    failures: int = 0
+    first_failure: str = ""
+
+    @property
+    def dispatched(self) -> int:
+        return self.requests + self.failures
 
     @property
     def reuse(self) -> float:
@@ -499,7 +575,10 @@ class Outcome:
             f"  {label}\n"
             f"    requests            : {self.requests} in {self.seconds:.1f}s "
             f"({self.requests / max(self.seconds, 1e-9):.0f}/s)\n"
-            f"    transport retries   : {self.retries}\n"
+            + (f"    failed requests     : {self.failures} of {self.dispatched} "
+               f"dispatched — first: {self.first_failure}\n"
+               if self.failures else "")
+            + f"    transport retries   : {self.retries}\n"
             f"    S0 connections open : {self.connects} "
             f"({self.per_connect:.1f} requests per connection)\n"
             f"    S1 distinct ports   : {self.distinct_ports} "
@@ -512,9 +591,51 @@ class Outcome:
         )
 
 
+def control_problems(control: Outcome, *, requested: int,
+                     designated: tuple[str, ...],
+                     skip: tuple[str, ...] = ()) -> list[str]:
+    """Everything wrong with the NEGATIVE CONTROL, in the gate's own words.
+
+    Two independent requirements, and each is why the other is not enough.
+
+    * It must TRIP every signal its platform designates. A measurement that
+      cannot see the known-bad case cannot vouch for the good one.
+    * It must have COMPLETED enough of its load for that trip to mean anything.
+      Its request failures are tolerated (see :func:`failure_verdict`), and
+      tolerance without this is a hole: a control that died on request one would
+      still show one connection per request and trip S0 on the arithmetic alone.
+    """
+    problems: list[str] = []
+    completion = control.requests / max(1, requested)
+    if completion < MIN_CONTROL_COMPLETION:
+        problems.append(
+            f"the NEGATIVE CONTROL completed {control.requests} of {requested} "
+            f"request(s) ({completion:.0%}, {control.failures} failed"
+            + (f", first: {control.first_failure}" if control.first_failure else "")
+            + f"). Below {MIN_CONTROL_COMPLETION:.0%} it has not applied the load "
+            f"its signals are read from, and an unmeasurable control cannot "
+            f"vouch for anything.")
+    for signal in designated:
+        if signal in skip:
+            continue
+        if not control.trips(signal):
+            problems.append(
+                f"the NEGATIVE CONTROL did not trip {signal}: "
+                f"{control.explain(signal)}. A keep-alive-disabled client MUST "
+                f"look leaky; a measurement that cannot see the known-bad case "
+                f"cannot vouch for the good one.")
+    return problems
+
+
 def drive(url: str, port: int, *, requests: int, workers: int,
-          keepalive: bool, dim: int = 8) -> Outcome:
-    """Issue ``requests`` real Qdrant operations and measure the transport."""
+          keepalive: bool, dim: int = 8,
+          tolerate_request_failures: bool = False) -> Outcome:
+    """Issue ``requests`` real Qdrant operations and measure the transport.
+
+    ``tolerate_request_failures`` is set for the NEGATIVE CONTROL and for
+    nothing else — see :func:`failure_verdict` for why the same event is fatal
+    in one run and expected in the other.
+    """
     from qdrant_client.models import Distance, PointStruct, VectorParams
 
     from ragtools import transport
@@ -557,7 +678,7 @@ def drive(url: str, port: int, *, requests: int, workers: int,
     # in the process is instrumented and nothing else can inflate the count.
     connect_counter = ConnectCounter(port).attach(client)
 
-    counter = {"n": 0}
+    counter = {"n": 0, "done": 0}
     errors: list[BaseException] = []
 
     def work(worker: int) -> None:
@@ -585,10 +706,17 @@ def drive(url: str, port: int, *, requests: int, workers: int,
                         lambda: client.query_points(
                             collection_name=collection, query=vec, limit=1),
                         sleep=counting_sleep, describe="stress.query")
+                with lock:
+                    counter["done"] += 1
             except BaseException as exc:                # noqa: BLE001
                 with lock:
                     errors.append(exc)
-                return
+                # A tolerated failure costs one request, not the worker. The
+                # control has to keep applying load for its signals to be worth
+                # reading, and a worker that retires on its first error takes an
+                # eighth of the load with it.
+                if not tolerate_request_failures:
+                    return
 
     started = time.time()
     try:
@@ -607,21 +735,24 @@ def drive(url: str, port: int, *, requests: int, workers: int,
     sampler.stop()
     final = open_sockets()
 
-    if errors:
+    first_failure = describe_error(errors[0]) if errors else ""
+    verdict = failure_verdict(len(errors), first_failure,
+                              dispatched=counter["n"],
+                              tolerated=tolerate_request_failures)
+    if verdict:
         client.close()
-        raise SystemExit(
-            f"{len(errors)} request(s) failed after the retry budget was spent. "
-            f"First: {type(errors[0]).__name__}: {errors[0]}")
+        raise SystemExit(verdict)
 
     growth = None if (final is None or baseline is None) else final - baseline
     client.close()
     return Outcome(
-        requests=counter["n"], seconds=elapsed, retries=retries,
+        requests=counter["done"], seconds=elapsed, retries=retries,
         connects=connect_counter.count,
         distinct_ports=len(sampler.ports), peak_open=sampler.peak_open,
         samples=sampler.samples, socket_growth=growth,
         time_wait_before=time_wait_before, time_wait_after=time_wait_after,
         sampler_error=sampler.error,
+        failures=len(errors), first_failure=first_failure,
     )
 
 
@@ -740,9 +871,17 @@ def main(argv=None) -> int:
             print("NEGATIVE CONTROL — keep-alive disabled, the v3.4 configuration",
                   flush=True)
             control = drive(url, args.http_port, requests=args.negative_control,
-                            workers=args.workers, keepalive=False)
+                            workers=args.workers, keepalive=False,
+                            tolerate_request_failures=True)
             print(control.describe("control (max_keepalive_connections=0)"),
                   flush=True)
+            if control.failures:
+                print(f"  note: {control.failures} of {control.dispatched} control "
+                      f"request(s) failed. EXPECTED, and reported rather than "
+                      f"fatal: this client is the v3.4 configuration and being "
+                      f"unreliable under churn is the property it is here to "
+                      f"demonstrate. Corroborating evidence, not noise.",
+                      flush=True)
 
         print("UNDER TEST — the shipped pool (ragtools.storage._HTTP_LIMITS)",
               flush=True)
@@ -763,19 +902,15 @@ def main(argv=None) -> int:
 
         if control is not None:
             # EVERY signal this platform designates, on exactly the thresholds
-            # the shipped run must clear. If a designated signal cannot see the
-            # known-bad case, the gate is not discriminating and every green run
-            # since would have been meaningless — which is why this is a failure
-            # and not a warning.
-            for signal in designated:
-                if signal == SIGNAL_PORTS and result.sampler_error:
-                    continue        # already reported above, as its own failure
-                if not control.trips(signal):
-                    failures.append(
-                        f"the NEGATIVE CONTROL did not trip {signal}: "
-                        f"{control.explain(signal)}. A keep-alive-disabled client "
-                        f"MUST look leaky; a measurement that cannot see the "
-                        f"known-bad case cannot vouch for the good one.")
+            # the shipped run must clear, PLUS the completion floor that keeps
+            # tolerated request failures from becoming a way to pass. If a
+            # designated signal cannot see the known-bad case, the gate is not
+            # discriminating and every green run since would have been
+            # meaningless — which is why this is a failure and not a warning.
+            failures.extend(control_problems(
+                control, requested=args.negative_control, designated=designated,
+                # S1 unmeasurable is already reported above, as its own failure.
+                skip=(SIGNAL_PORTS,) if result.sampler_error else ()))
 
         if result.connects > MAX_CONNECTS:
             failures.append(

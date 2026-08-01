@@ -910,3 +910,157 @@ def test_the_sweep_and_the_directory_check_cannot_disagree_again():
         "returned opposite verdicts over one directory in run 30692207245")
     assert source.count("def directory_state(") == 1
     assert source.split("def main(")[1].count("wait_until_settled(") == 1
+
+
+# --- the negative control may fail requests; that is what it is FOR ----------
+#
+# `transport stress (macos-14)` died in the NEGATIVE CONTROL in three
+# consecutive runs, always before the shipped client had been measured at all:
+#
+#   30676422208 : 2 request(s) failed ... [Errno 9] Bad file descriptor
+#   30680889672 : 1 request(s) failed ... [Errno 9] Bad file descriptor
+#   30692207245 : 2 request(s) failed ... [Errno 9] Bad file descriptor
+#
+# Three different measurement regimes — and at 335ee74, the commit run
+# 30676422208 tested, the script contained NO client instrumentation of any kind
+# (no ConnectCounter, no socket patch, only read-only psutil sampling). The
+# condition survives the presence and the absence of every measurement, so it is
+# a property of the control's own configuration: `max_connections=None,
+# max_keepalive_connections=0`, one fresh socket per request, eight threads.
+# `[Errno 9]` is use-after-close, not descriptor exhaustion (`EMFILE`), and
+# errno 9 is correctly absent from `transport._RETRYABLE_ERRNOS`.
+
+
+def test_a_failed_request_in_the_run_under_test_is_still_fatal():
+    """The thing being tested must be clean. This is the half that must NOT
+    become tolerant."""
+    from scripts.stress_transport import failure_verdict
+
+    verdict = failure_verdict(
+        1, "ResponseHandlingException: [WinError 10048]", dispatched=20000,
+        tolerated=False)
+    assert verdict, "a failed request in the shipped run stopped being fatal"
+    assert "20000" in verdict and "[WinError 10048]" in verdict
+
+
+def test_a_failed_request_in_the_negative_control_is_counted_not_fatal():
+    """The recorded macos-14 condition, asked of the policy directly."""
+    from scripts.stress_transport import failure_verdict
+
+    assert failure_verdict(
+        2, "ResponseHandlingException: [Errno 9] Bad file descriptor",
+        dispatched=3000, tolerated=True) == "", (
+        "the negative control still dies on its own request failures, which is "
+        "the configuration it exists to demonstrate")
+
+
+def test_the_recorded_macos_control_now_vouches_instead_of_ending_the_run():
+    """End to end on the numbers CI produced: 2 of 3000 failed, the rest
+    completed, and the control trips the signal macOS designates."""
+    from scripts.stress_transport import SIGNAL_CONNECTS, control_problems
+
+    macos_control = _outcome(requests=2998, connects=2998, distinct_ports=1,
+                             failures=2,
+                             first_failure="ResponseHandlingException: "
+                                           "[Errno 9] Bad file descriptor")
+    assert macos_control.trips(SIGNAL_CONNECTS)
+    assert control_problems(macos_control, requested=3000,
+                            designated=(SIGNAL_CONNECTS,)) == []
+
+
+def test_a_control_that_collapsed_cannot_vouch_even_though_it_trips_s0():
+    """The hole tolerance would open, closed.
+
+    Eight workers that each died on their first request open one connection per
+    request too. On S0 alone that is a perfect trip and a completely
+    unmeasurable control.
+    """
+    from scripts.stress_transport import SIGNAL_CONNECTS, control_problems
+
+    collapsed = _outcome(requests=8, connects=8, distinct_ports=8, failures=2992,
+                         first_failure="OSError: [Errno 9] Bad file descriptor")
+    assert collapsed.trips(SIGNAL_CONNECTS), (
+        "this test no longer models the hole it exists for: the collapsed "
+        "control is supposed to trip the signal and still be worthless")
+    problems = control_problems(collapsed, requested=3000,
+                                designated=(SIGNAL_CONNECTS,))
+    assert problems, "a control that completed 8 of 3000 requests vouched for the run"
+    assert "8 of 3000" in problems[0]
+    assert "unmeasurable" in problems[0]
+
+
+def test_the_control_must_still_trip_every_signal_its_platform_designates():
+    """Tolerating request failures must not have relaxed the rule beside it.
+    The Linux control of run 30676422208, which S1 could not see."""
+    from scripts.stress_transport import (
+        SIGNAL_CONNECTS,
+        SIGNAL_PORTS,
+        control_problems,
+    )
+
+    healthy_looking = _outcome(requests=3000, connects=1, distinct_ports=1)
+    problems = control_problems(healthy_looking, requested=3000,
+                                designated=(SIGNAL_CONNECTS, SIGNAL_PORTS))
+    assert len(problems) == 2, problems
+    assert all("did not trip" in p for p in problems)
+
+
+def _worker_retires_on_every_error(source: str) -> bool:
+    """Does the load worker's error handler leave unconditionally?
+
+    A worker that retires on its first error takes an eighth of the control's
+    load with it, so the completion floor would then fail a control that was
+    doing exactly what it is for.
+    """
+    handler = None
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == "work":
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.ExceptHandler):
+                    handler = inner
+    assert handler is not None, "the load worker no longer handles request errors"
+    leaves = [n for n in ast.walk(handler) if isinstance(n, (ast.Return, ast.Break))]
+    assert leaves, "the worker no longer stops on a FATAL failure"
+    guarded = [n for n in ast.walk(handler)
+               if isinstance(n, ast.If)
+               and any(isinstance(b, (ast.Return, ast.Break)) for b in n.body)]
+    return not guarded
+
+
+def test_a_tolerated_failure_costs_one_request_not_the_whole_worker():
+    shipped_before = (
+        "def work(worker):\n"
+        "    while True:\n"
+        "        try:\n"
+        "            pass\n"
+        "        except BaseException as exc:\n"
+        "            errors.append(exc)\n"
+        "            return\n"
+    )
+    assert _worker_retires_on_every_error(shipped_before), (
+        "the detector cannot see the unconditional retirement it exists to forbid")
+
+    source = (ROOT / "scripts" / "stress_transport.py").read_text(encoding="utf-8")
+    assert not _worker_retires_on_every_error(source), (
+        "the worker returns unconditionally on any request error, so a tolerated "
+        "failure still retires the worker that hit it")
+
+
+def test_the_outcome_separates_completed_requests_from_failed_ones():
+    """A rate computed over dispatched requests reports work that did not
+    happen — and a failure count nobody prints is a failure count nobody has."""
+    outcome = _outcome(requests=2998, failures=2,
+                       first_failure="ResponseHandlingException: "
+                                     "[Errno 9] Bad file descriptor")
+    assert outcome.dispatched == 3000
+    rendered = outcome.describe("control (max_keepalive_connections=0)")
+    assert "2 of 3000 dispatched" in rendered
+    assert "[Errno 9] Bad file descriptor" in rendered
+    assert "requests            : 2998" in rendered
+
+
+def test_a_clean_run_says_nothing_about_failures():
+    outcome = _outcome(requests=20000, connects=11)
+    assert outcome.failures == 0
+    assert outcome.dispatched == 20000
+    assert "failed requests" not in outcome.describe("shipped client")
