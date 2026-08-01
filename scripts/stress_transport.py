@@ -28,30 +28,60 @@ runners and removes an argument.
 
 WHAT IS ACTUALLY MEASURED
 -------------------------
-Three signals, because "it did not crash" is not one:
+Four signals, because "it did not crash" is not one:
 
-* **S1 — distinct client-side ephemeral ports used to reach the engine.** This
-  IS the exhaustion signal: with keep-alive the whole run fits in a pool-sized
-  handful; without it the count tracks the request count. Sampled, so it is a
-  lower bound, which is the safe direction — a lower bound that is already large
-  is conclusive.
+* **S0 — TCP connections opened to the engine.** Counted inside the process, by
+  wrapping ``socket.socket.connect``, so it is COMPLETE rather than sampled and
+  needs no privileges anywhere. This is connection CHURN, which is the quantity
+  that walks the ephemeral range in the first place: keep-alive off opens one
+  connection per request, keep-alive on opens a pool's worth for the whole run.
+* **S1 — distinct client-side ephemeral ports used to reach the engine.** The
+  WINDOWS exhaustion signature, and only that. Sampled, so it is a lower bound —
+  the safe direction, since a lower bound that is already large is conclusive.
 * **S2 — the driving process's open socket count.** Bounded pool in, bounded
   pool out. Growth here is a genuine descriptor leak rather than a port-range
   problem.
-* **S3 — TIME_WAIT sockets against the engine port, system-wide.** The most
-  direct evidence, and the least portable: enumerating other processes' sockets
-  needs privileges macOS does not grant unelevated. When it cannot be taken it
-  is reported as UNAVAILABLE and asserted on by nothing — never as ``0``, which
-  is how a measurement that was not taken starts reading as a healthy result.
+* **S3 — TIME_WAIT sockets against the engine port, system-wide, AS A DELTA
+  across the run.** The most direct evidence of the mechanism and the least
+  attributable: a TIME_WAIT socket has no owning process, so this is what the
+  whole machine did, not what this run did. Reported, asserted on by nothing,
+  and never ``0`` when it could not be taken — that is how a measurement that
+  was not taken starts reading as a healthy result.
+
+  It is a DELTA because an absolute count is not a measurement of the run.
+  Run 30676422208 printed ``S3 TIME_WAIT to port: 3035`` for BOTH the 3,000-
+  request control and the 20,000-request run under test — the same number for
+  two different workloads, because TIME_WAIT lasts ~60 s and the second reading
+  was still counting the first run's residue.
 
 AND WHY THERE IS A NEGATIVE CONTROL
 -----------------------------------
 A leak detector that cannot detect a leak passes every run and proves nothing.
 So ``--negative-control`` first drives a SHORT run through a client built the way
 ``qdrant-client`` builds one for loopback — keep-alive disabled, the v3.4
-behaviour — and REQUIRES S1 to trip. If the control does not trip, the
-measurement has no discriminating power and this script fails before it ever
-reports on the real client.
+behaviour — and REQUIRES it to look leaky. If it does not, the measurement has no
+discriminating power and this script fails before it ever reports on the real
+client.
+
+WHICH SIGNAL THE CONTROL MUST TRIP IS PER PLATFORM, AND IS DECLARED
+-------------------------------------------------------------------
+S1 is the Windows failure signature. ``[WinError 10048]`` is ephemeral-port
+exhaustion under a 16,384-wide range with a long TIME_WAIT, and on Windows the
+control produces it unmistakably: **1,743 distinct ports for 3,000 requests**.
+
+Linux does not allocate that way. On ``ubuntu-latest`` the identical
+keep-alive-disabled control produced **ONE** distinct port for 3,000 requests —
+a reuse factor of 3000x, which is what a *healthy* client looks like on the S1
+scale. So S1 cannot see the known-bad case there, and requiring the control to
+trip it fails the job on a measurement problem rather than on a leak.
+
+The answer is not a lower threshold off Windows — that would leave a control
+that still cannot see the bad case, only more quietly. It is to say which signal
+each platform's control is judged on (:data:`CONTROL_SIGNALS`), and to require
+the control to trip EVERY signal designated for the platform it is running on.
+S1 stays exactly as strict as it is on Windows, because Windows is where the
+failure happened; S0 is designated everywhere, because it discriminates
+everywhere.
 """
 
 from __future__ import annotations
@@ -59,6 +89,7 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import socket
 import sys
 import threading
 import time
@@ -92,6 +123,96 @@ MIN_REUSE_FACTOR = 20
 #: Sockets the driving process may still hold at the end, over its warm-up
 #: baseline. The pool is 32; anything beyond this is not a pool.
 MAX_SOCKET_GROWTH = 64
+
+#: New TCP connections the shipped client may open across the whole run. Same
+#: generosity as :data:`MAX_DISTINCT_PORTS` and for the same reason: the signal
+#: being tested for is three orders of magnitude away, not a few percent.
+MAX_CONNECTS = 256
+
+#: Requests per connection opened. The mirror of :data:`MIN_REUSE_FACTOR`, on a
+#: signal that is counted rather than sampled.
+MIN_REQUESTS_PER_CONNECT = 20
+
+#: The signal names, so a platform's designation and the failure message that
+#: quotes it cannot drift apart.
+SIGNAL_CONNECTS = "S0 (connections opened)"
+SIGNAL_PORTS = "S1 (distinct ephemeral ports)"
+
+#: Which signal(s) the NEGATIVE CONTROL must trip, per platform.
+#:
+#: S1 belongs to Windows and stays exactly as strict there: ``[WinError 10048]``
+#: is ephemeral-port exhaustion, the control produces 1,743 distinct ports for
+#: 3,000 requests, and that is the failure this whole gate exists for. On Linux
+#: the identical control produced ONE distinct port for 3,000 requests — the
+#: kernel reuses the local port for successive connections to the same peer — so
+#: S1 there cannot tell keep-alive from no-keep-alive at all.
+#:
+#: S0 is designated everywhere because it is the same fact one layer up:
+#: connections opened, counted completely, needing no privileges and no kernel
+#: port-allocation policy to be visible.
+CONTROL_SIGNALS: dict[str, tuple[str, ...]] = {
+    "Windows": (SIGNAL_CONNECTS, SIGNAL_PORTS),
+    "Linux": (SIGNAL_CONNECTS,),
+    "Darwin": (SIGNAL_CONNECTS,),
+}
+
+#: An unlisted platform gets the signal that works without any platform
+#: assumption. Never the empty tuple: "no designated signal" would mean "no
+#: control", which is the state this file exists to make impossible.
+DEFAULT_CONTROL_SIGNALS: tuple[str, ...] = (SIGNAL_CONNECTS,)
+
+
+def control_signals(system: str) -> tuple[str, ...]:
+    return CONTROL_SIGNALS.get(system) or DEFAULT_CONTROL_SIGNALS
+
+
+class ConnectCounter:
+    """Count TCP connections opened to one port, from inside this process.
+
+    ``socket.socket`` is a Python subclass of the C ``_socket.socket``, so its
+    ``connect`` can be wrapped where the base type's cannot. httpx reaches the
+    network through ``httpcore``'s sync backend, which calls
+    ``socket.create_connection`` and therefore this method — measured on a real
+    client: keep-alive disabled, 30 requests, **30** connects; the shipped pool,
+    30 requests, **1**.
+
+    COMPLETE, not sampled. S1 has to infer connection churn from whatever the
+    sampler happened to catch — 33 samples across a 4 s run on Linux, because
+    per-process socket enumeration there walks the whole system table. This
+    counts every one, and it counts the thing that actually exhausts a port
+    range.
+
+    Scoped to the engine's port so nothing else the process does can inflate it,
+    and restored on exit so a failed load cannot leave a global patched.
+    """
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.count = 0
+        self._lock = threading.Lock()
+        self._original = None
+
+    def __enter__(self) -> "ConnectCounter":
+        counter = self
+        self._original = socket.socket.connect
+
+        def connect(sock, address):
+            try:
+                if isinstance(address, tuple) and len(address) >= 2 \
+                        and address[1] == counter.port:
+                    with counter._lock:
+                        counter.count += 1
+            except Exception:                           # noqa: BLE001
+                pass
+            return counter._original(sock, address)
+
+        socket.socket.connect = connect
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        if self._original is not None:
+            socket.socket.connect = self._original
+            self._original = None
 
 
 @dataclass
@@ -213,26 +334,72 @@ class Outcome:
     requests: int
     seconds: float
     retries: int
+    connects: int
     distinct_ports: int
     peak_open: int
     samples: int
     socket_growth: int | None
-    time_wait: int | None
+    time_wait_before: int | None
+    time_wait_after: int | None
     sampler_error: str
 
     @property
     def reuse(self) -> float:
         return self.requests / max(1, self.distinct_ports)
 
+    @property
+    def per_connect(self) -> float:
+        """Requests served per connection OPENED. 1.0x is one per request."""
+        return self.requests / max(1, self.connects)
+
+    @property
+    def time_wait_delta(self) -> int | None:
+        """What THIS run added, not what the machine happens to be holding.
+
+        Reading the absolute count twice is what made run 30676422208 print 3035
+        for a 3,000-request control and 3035 again for a 20,000-request run: the
+        second reading was still counting the first's residue, ~60 s of it.
+        """
+        if self.time_wait_before is None or self.time_wait_after is None:
+            return None
+        return self.time_wait_after - self.time_wait_before
+
+    def trips(self, signal: str) -> bool:
+        """Does this run look leaky on ``signal``?
+
+        The control MUST answer yes and the shipped client MUST answer no, on
+        exactly the same thresholds. Two different comparisons would mean the
+        control vouched for something other than what is being asserted.
+        """
+        if signal == SIGNAL_CONNECTS:
+            return self.connects > MAX_CONNECTS or self.per_connect < MIN_REQUESTS_PER_CONNECT
+        if signal == SIGNAL_PORTS:
+            return self.distinct_ports > MAX_DISTINCT_PORTS or self.reuse < MIN_REUSE_FACTOR
+        raise ValueError(f"no such signal: {signal}")
+
+    def explain(self, signal: str) -> str:
+        if signal == SIGNAL_CONNECTS:
+            return (f"{self.connects} connection(s) opened for {self.requests} "
+                    f"request(s) ({self.per_connect:.1f} per connection), against a "
+                    f"limit of {MAX_CONNECTS} / {MIN_REQUESTS_PER_CONNECT}x")
+        return (f"{self.distinct_ports} distinct port(s), reuse {self.reuse:.1f}x, "
+                f"against a limit of {MAX_DISTINCT_PORTS} / {MIN_REUSE_FACTOR}x")
+
     def describe(self, label: str) -> str:
-        tw = "UNAVAILABLE (needs privileges this account does not have)" \
-            if self.time_wait is None else str(self.time_wait)
+        delta = self.time_wait_delta
+        if delta is None:
+            tw = "UNAVAILABLE (needs privileges this account does not have)"
+        else:
+            tw = (f"{delta:+d} across the run "
+                  f"({self.time_wait_before} -> {self.time_wait_after}, system-wide)")
         growth = "UNAVAILABLE" if self.socket_growth is None else str(self.socket_growth)
         return (
             f"  {label}\n"
             f"    requests            : {self.requests} in {self.seconds:.1f}s "
             f"({self.requests / max(self.seconds, 1e-9):.0f}/s)\n"
             f"    transport retries   : {self.retries}\n"
+            f"    S0 connections open : {self.connects} "
+            f"({self.per_connect:.1f} requests per connection)\n"
             f"    S1 distinct ports   : {self.distinct_ports} "
             f"(reuse factor {self.reuse:.1f}x, {self.samples} samples, "
             f"peak {self.peak_open} concurrent)\n"
@@ -277,9 +444,14 @@ def drive(url: str, port: int, *, requests: int, workers: int,
             PointStruct(id=1_000_000 + i, vector=[0.01 * (i + 1)] * dim,
                         payload={"warm": True})])
     baseline = open_sockets()
+    # Taken here, AFTER the warm-up and BEFORE the load, so what is reported is
+    # what this run did rather than what the machine was already holding.
+    time_wait_before = time_wait_against(port)
 
     sampler = Sampler(port=port)
     sampler.start()
+    connect_counter = ConnectCounter(port)
+    connect_counter.__enter__()
 
     counter = {"n": 0}
     errors: list[BaseException] = []
@@ -315,14 +487,19 @@ def drive(url: str, port: int, *, requests: int, workers: int,
                 return
 
     started = time.time()
-    threads = [threading.Thread(target=work, args=(w,)) for w in range(workers)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    try:
+        threads = [threading.Thread(target=work, args=(w,)) for w in range(workers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        # Restored whatever happened: a failed load must not leave the global
+        # `socket.socket.connect` wrapped for the rest of the process.
+        connect_counter.__exit__()
     elapsed = time.time() - started
 
-    time_wait = time_wait_against(port)
+    time_wait_after = time_wait_against(port)
     sampler.stop()
     final = open_sockets()
 
@@ -336,8 +513,10 @@ def drive(url: str, port: int, *, requests: int, workers: int,
     client.close()
     return Outcome(
         requests=counter["n"], seconds=elapsed, retries=retries,
+        connects=connect_counter.count,
         distinct_ports=len(sampler.ports), peak_open=sampler.peak_open,
-        samples=sampler.samples, socket_growth=growth, time_wait=time_wait,
+        samples=sampler.samples, socket_growth=growth,
+        time_wait_before=time_wait_before, time_wait_after=time_wait_after,
         sampler_error=sampler.error,
     )
 
@@ -431,12 +610,21 @@ def main(argv=None) -> int:
     print(f"platform : {platform.system()} {platform.machine()}")
     print(f"load     : {args.requests} requests across {args.workers} workers")
 
+    designated = control_signals(platform.system())
+    print(f"control  : must trip {', '.join(designated)}")
+
     blocked = sampling_is_possible()
     if blocked:
-        print(f"\nTRANSPORT STRESS: FAILED before any load was applied\n"
-              f"  * {blocked}")
-        return 1
-    print("measure  : per-process socket enumeration available")
+        if SIGNAL_PORTS in designated:
+            print(f"\nTRANSPORT STRESS: FAILED before any load was applied\n"
+                  f"  * {blocked}")
+            return 1
+        # S1 is not what this platform's control is judged on, so its absence
+        # costs a reported number, not the run. S0 needs no privileges at all.
+        print(f"measure  : S1/S2/S3 unavailable here ({blocked.splitlines()[0]}); "
+              f"not designated on {platform.system()}, so not asserted")
+    else:
+        print("measure  : per-process socket enumeration available")
     print("", flush=True)
 
     sup = start_engine(binary, root, args.http_port, args.grpc_port)
@@ -458,32 +646,50 @@ def main(argv=None) -> int:
                        workers=args.workers, keepalive=True)
         print(result.describe("shipped client"), flush=True)
 
-        if result.sampler_error:
-            failures.append(
-                f"S1 could not be measured ({result.sampler_error}); this gate "
-                f"asserts on a measurement, so an unmeasurable run fails rather "
-                f"than passing on the absence of evidence.")
-        elif result.samples < 10:
-            failures.append(
-                f"the sampler took only {result.samples} sample(s); S1 is a "
-                f"lower bound and this one is not bounded by anything.")
-
-        if control is not None and not result.sampler_error:
-            # The control must trip the SAME threshold the real run must clear.
-            # If it does not, the threshold is not discriminating and every
-            # green run since would have been meaningless.
-            tripped = (control.distinct_ports > MAX_DISTINCT_PORTS
-                       or control.reuse < MIN_REUSE_FACTOR)
-            if not tripped:
+        if SIGNAL_PORTS in designated:
+            if result.sampler_error:
                 failures.append(
-                    f"the NEGATIVE CONTROL did not trip: {control.distinct_ports} "
-                    f"distinct port(s), reuse {control.reuse:.1f}x, against a "
-                    f"limit of {MAX_DISTINCT_PORTS} / {MIN_REUSE_FACTOR}x. A "
-                    f"keep-alive-disabled client MUST look leaky; a measurement "
-                    f"that cannot see the known-bad case cannot vouch for the "
-                    f"good one.")
+                    f"S1 could not be measured ({result.sampler_error}); it is a "
+                    f"designated signal on {platform.system()}, so an unmeasurable "
+                    f"run fails rather than passing on the absence of evidence.")
+            elif result.samples < 10:
+                failures.append(
+                    f"the sampler took only {result.samples} sample(s); S1 is a "
+                    f"lower bound and this one is not bounded by anything.")
 
-        if result.distinct_ports > MAX_DISTINCT_PORTS:
+        if control is not None:
+            # EVERY signal this platform designates, on exactly the thresholds
+            # the shipped run must clear. If a designated signal cannot see the
+            # known-bad case, the gate is not discriminating and every green run
+            # since would have been meaningless — which is why this is a failure
+            # and not a warning.
+            for signal in designated:
+                if signal == SIGNAL_PORTS and result.sampler_error:
+                    continue        # already reported above, as its own failure
+                if not control.trips(signal):
+                    failures.append(
+                        f"the NEGATIVE CONTROL did not trip {signal}: "
+                        f"{control.explain(signal)}. A keep-alive-disabled client "
+                        f"MUST look leaky; a measurement that cannot see the "
+                        f"known-bad case cannot vouch for the good one.")
+
+        if result.connects > MAX_CONNECTS:
+            failures.append(
+                f"S0: {result.connects} connection(s) opened for "
+                f"{result.requests} requests (limit {MAX_CONNECTS}). The "
+                f"connection pool is not being reused — this is the churn that "
+                f"exhausted the {EPHEMERAL_RANGE}-wide range in v3.4.")
+        elif result.per_connect < MIN_REQUESTS_PER_CONNECT:
+            failures.append(
+                f"S0: {result.per_connect:.1f} request(s) per connection is below "
+                f"the {MIN_REQUESTS_PER_CONNECT}x floor.")
+
+        if SIGNAL_PORTS not in designated:
+            print(f"  note: S1 is not a designated signal on {platform.system()} "
+                  f"— the control there produces ~1 distinct port for 3,000 "
+                  f"keep-alive-disabled requests, so it cannot discriminate. "
+                  f"Reported, not asserted.", flush=True)
+        elif result.distinct_ports > MAX_DISTINCT_PORTS:
             failures.append(
                 f"S1: {result.distinct_ports} distinct ephemeral ports for "
                 f"{result.requests} requests (limit {MAX_DISTINCT_PORTS}). The "
@@ -503,7 +709,7 @@ def main(argv=None) -> int:
                 f"more socket(s) than its warmed-up baseline (limit "
                 f"{MAX_SOCKET_GROWTH}). A bounded pool does not grow.")
 
-        if result.time_wait is None:
+        if result.time_wait_delta is None:
             print("  note: S3 was not measurable on this runner; not asserted.",
                   flush=True)
     finally:

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import ast
 import re
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -431,6 +432,197 @@ def test_the_stress_gate_runs_on_all_three_first_class_platforms():
     job = _load(RELEASE_VALIDATION)["jobs"]["transport-stress"]
     labels = set((job.get("strategy") or {}).get("matrix", {}).get("os") or [])
     assert {"ubuntu-latest", "macos-14", "windows-latest"} <= labels, labels
+
+
+# --- the stress gate's negative control has to work on every platform --------
+#
+# Run 30676422208, all three legs red, and the script was right to refuse:
+#
+#   NEGATIVE CONTROL — keep-alive disabled, the v3.4 configuration
+#     control (max_keepalive_connections=0)
+#       requests          : 3000 in 4.0s
+#       S1 distinct ports : 1 (reuse factor 3000.0x, 33 samples)
+#   * the NEGATIVE CONTROL did not trip: 1 distinct port(s), reuse 3000.0x,
+#     against a limit of 256 / 20x.
+#
+# On Windows the identical control produces 1,743 distinct ports for 3,000
+# requests. On Linux it produces ONE, because the kernel reuses the local port
+# for successive connections to the same peer — so S1 there reads a
+# keep-alive-DISABLED client as the healthiest possible result. The rule the
+# script states is right and stays: a control that cannot see the known-bad case
+# invalidates the run. What was wrong was asserting a Windows-shaped signal on a
+# platform that does not produce it.
+
+#: The runner label -> ``platform.system()`` the script sees there.
+_MATRIX_SYSTEMS = {
+    "ubuntu-latest": "Linux",
+    "macos-14": "Darwin",
+    "windows-latest": "Windows",
+}
+
+
+def _outcome(**kwargs):
+    from scripts.stress_transport import Outcome
+
+    base = dict(requests=0, seconds=1.0, retries=0, connects=0, distinct_ports=0,
+                peak_open=1, samples=100, socket_growth=0,
+                time_wait_before=None, time_wait_after=None, sampler_error="")
+    base.update(kwargs)
+    return Outcome(**base)
+
+
+def test_every_platform_the_stress_gate_runs_on_has_a_designated_control_signal():
+    """A platform with no designated signal is a platform with no control."""
+    from scripts.stress_transport import control_signals
+
+    job = _load(RELEASE_VALIDATION)["jobs"]["transport-stress"]
+    labels = (job.get("strategy") or {}).get("matrix", {}).get("os") or []
+    assert labels, "the stress gate has no matrix at all"
+    for label in labels:
+        system = _MATRIX_SYSTEMS.get(label)
+        assert system, f"the matrix runs on {label} and nothing maps it to a platform"
+        assert control_signals(system), (
+            f"{label} ({system}) has no signal its negative control is judged on"
+        )
+
+
+def test_the_recorded_negative_control_trips_every_signal_its_platform_designates():
+    """The measurement, not the threshold — asked of the numbers CI actually
+    produced. The Linux control that failed run 30676422208 must now trip, and
+    the Windows one must still trip on the signal it always did."""
+    from scripts.stress_transport import (
+        SIGNAL_CONNECTS,
+        SIGNAL_PORTS,
+        control_signals,
+    )
+
+    # Recorded: ubuntu-latest, keep-alive disabled, 3000 requests.
+    linux_control = _outcome(requests=3000, connects=3000, distinct_ports=1)
+    # Recorded: windows-latest, keep-alive disabled, 3000 requests.
+    windows_control = _outcome(requests=3000, connects=3000, distinct_ports=1743)
+
+    for system, control in (("Linux", linux_control), ("Darwin", linux_control),
+                            ("Windows", windows_control)):
+        for signal in control_signals(system):
+            assert control.trips(signal), (
+                f"on {system} the keep-alive-disabled control does not trip "
+                f"{signal}: {control.explain(signal)}. A measurement that cannot "
+                f"see the known-bad case cannot vouch for the good one."
+            )
+
+    assert not linux_control.trips(SIGNAL_PORTS), (
+        "this test has stopped modelling the recorded failure: S1 is supposed to "
+        "be blind to the Linux control, which is exactly why it is not designated "
+        "there"
+    )
+    assert SIGNAL_PORTS in control_signals("Windows"), (
+        "S1 is the WINDOWS failure signature — [WinError 10048] is ephemeral-port "
+        "exhaustion — and dropping it there would remove the only signal taken "
+        "where the incident actually happened"
+    )
+    assert SIGNAL_CONNECTS in control_signals("Windows"), (
+        "the Windows control must trip the cross-platform signal too, or the two "
+        "platforms are judged by unrelated measurements"
+    )
+
+
+def test_the_shipped_client_still_has_to_clear_every_designated_signal():
+    """The control tripping is only half of it: the same thresholds must pass the
+    real client, or the gate would be red everywhere."""
+    from scripts.stress_transport import control_signals
+
+    # Recorded: ubuntu-latest, the shipped pool, 20,000 requests, 11 ports.
+    shipped = _outcome(requests=20000, connects=11, distinct_ports=11)
+    for system in ("Linux", "Darwin", "Windows"):
+        for signal in control_signals(system):
+            assert not shipped.trips(signal), (
+                f"the shipped client fails {signal} on {system}: "
+                f"{shipped.explain(signal)}"
+            )
+
+
+def test_the_time_wait_signal_measures_the_run_rather_than_the_machine():
+    """S3 printed 3035 for a 3,000-request control AND for a 20,000-request run
+    in the same job. An identical number for two different workloads is not a
+    measurement of either — TIME_WAIT lasts about a minute, so the second reading
+    was still counting the first run's residue."""
+    residue = _outcome(requests=20000, time_wait_before=3035, time_wait_after=3035)
+    assert residue.time_wait_delta == 0, (
+        "S3 still reports an absolute system-wide count, so a run that opened "
+        "almost no connections is credited with everything the machine happened "
+        "to be holding"
+    )
+    churned = _outcome(requests=3000, time_wait_before=35, time_wait_after=3035)
+    assert churned.time_wait_delta == 3000
+
+    unavailable = _outcome(time_wait_before=None, time_wait_after=12)
+    assert unavailable.time_wait_delta is None, (
+        "a delta that could not be taken must be None, never 0 — that is how a "
+        "measurement that was not taken starts reading as a healthy result"
+    )
+
+
+def test_the_connection_counter_separates_a_leaky_client_from_the_shipped_one():
+    """S0 against a REAL httpx client, which is what the gate drives.
+
+    The whole point of replacing the control's signal is that the new one has to
+    discriminate where the old one could not — so this measures it rather than
+    asserting that a constant is present. Loopback only; no engine, no network.
+    """
+    import http.server
+    import threading as _threading
+
+    httpx = pytest.importorskip("httpx")
+    from scripts.stress_transport import ConnectCounter
+
+    class Quiet(http.server.BaseHTTPRequestHandler):
+        # HTTP/1.1, or the SERVER closes every connection and both clients look
+        # equally leaky — the measurement would then be of this fixture rather
+        # than of the client. A real Qdrant speaks 1.1.
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):                               # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *_args):                  # noqa: D102
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
+    port = server.server_address[1]
+    thread = _threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    original = socket.socket.connect
+    try:
+        counted = {}
+        for label, limits in (
+            ("leaky", httpx.Limits(max_connections=None, max_keepalive_connections=0)),
+            ("pooled", httpx.Limits(max_connections=32, max_keepalive_connections=32)),
+        ):
+            with ConnectCounter(port) as counter:
+                with httpx.Client(limits=limits, timeout=10) as client:
+                    for _ in range(40):
+                        assert client.get(f"http://127.0.0.1:{port}/").status_code == 200
+            counted[label] = counter.count
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)
+
+    assert socket.socket.connect is original, (
+        "the counter left socket.socket.connect wrapped, which would follow the "
+        "rest of the process around"
+    )
+    assert counted["leaky"] >= 40, (
+        f"a keep-alive-disabled client opened only {counted['leaky']} connection(s) "
+        f"for 40 requests, so S0 cannot see the known-bad case either"
+    )
+    assert counted["pooled"] <= 4, (
+        f"the pooled client opened {counted['pooled']} connection(s) for 40 "
+        f"requests; S0 would flag the shipped configuration as leaky"
+    )
 
 
 def test_the_managed_engine_gate_runs_on_all_three_first_class_platforms():

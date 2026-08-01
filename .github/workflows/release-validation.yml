@@ -725,12 +725,22 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - name: 20,000 requests against a real engine, measuring the socket signal
         # Past the 16,384-wide range the incident walked, and asserting on a
-        # MEASUREMENT — distinct client-side ephemeral ports, socket growth —
-        # not on the absence of a crash. It runs a negative control first: a
-        # client built the way qdrant-client builds one for loopback (keep-alive
-        # off, the v3.4 configuration) MUST trip the same threshold the real
-        # run has to clear. Observed on Windows 2026-08-01: control 1,743
-        # distinct ports for 3,000 requests; shipped client 8 for 20,000.
+        # MEASUREMENT — connections opened, distinct client-side ephemeral
+        # ports, socket growth — not on the absence of a crash. It runs a
+        # negative control first: a client built the way qdrant-client builds
+        # one for loopback (keep-alive off, the v3.4 configuration) MUST look
+        # leaky on every signal this platform designates, or the gate has no
+        # discriminating power and fails before reporting on the real client.
+        #
+        # WHICH signal is per platform and is declared in the script.
+        # Windows keeps S1 (distinct ephemeral ports) at exactly its old
+        # strictness — [WinError 10048] is ephemeral-port exhaustion and the
+        # control there produces 1,743 ports for 3,000 requests. Linux
+        # allocates differently: the identical control produced ONE port for
+        # 3,000 requests, so S1 cannot see the known-bad case there, which is
+        # what turned all three legs of run 30676422208 red. S0 (connections
+        # opened, counted inside the process) discriminates everywhere and is
+        # designated on all three.
         shell: bash
         run: >
           python scripts/stress_transport.py
