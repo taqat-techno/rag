@@ -1009,10 +1009,12 @@ def projects_configured():
     if state_path.exists():
         from ragtools.indexing.state import IndexState
         state = IndexState(settings.state_db)
-        for project in settings.projects:
-            records = state.get_all_for_project(project.id)
-            index_data[project.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
-        state.close()
+        try:
+            for project in settings.projects:
+                records = state.get_all_for_project(project.id)
+                index_data[project.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
+        finally:
+            state.close()
 
     try:
         states = {row["id"]: row for row in get_owner().get_status_projects()}
