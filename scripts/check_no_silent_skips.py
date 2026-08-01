@@ -200,6 +200,25 @@ _FULL_SUITE = Suite(
 
         # -- platform facts: the test asserts a property of ONE platform -------
         ApprovedSkip(
+            nodeid=("tests/test_installer_quiescence_contract.py::"
+                    "test_a_scheduled_task_that_is_not_registered_is_reported_not_thrown"),
+            reasons=("Windows PowerShell is the interpreter under test",),
+            justification=(
+                "it EXECUTES the real `Get-TaskState` from `installer/quiesce.ps1` "
+                "under Windows PowerShell and asks it for a task no machine has "
+                "registered. The defect it guards is a property of that "
+                "interpreter and of nothing else: under "
+                "`$ErrorActionPreference = 'Stop'` a native command's stderr "
+                "becomes a TERMINATING error the moment stream 2 is redirected, "
+                "so `schtasks /query` announcing an absent task aborted the whole "
+                "quiescence protocol before a single process was stopped. There "
+                "is no schtasks, no Windows PowerShell and no such semantics off "
+                "Windows, so no job can lift this. The source-level half of the "
+                "same rule — "
+                "test_no_native_command_can_turn_its_own_stderr_into_a_terminating_error"
+                " — runs on every platform"),
+        ),
+        ApprovedSkip(
             nodeid="tests/test_engine_lifecycle.py::test_the_console_child_gets_no_window_and_is_never_detached",
             reasons=("console flags are Windows-only",),
             justification=(
