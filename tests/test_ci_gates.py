@@ -298,7 +298,7 @@ def _gate_lists() -> dict[str, set[str]]:
     for step in steps:
         env.update(step.get("env") or {})
     lists: dict[str, set[str]] = {}
-    for key in ("BLOCKING", "TAG_ONLY"):
+    for key in ("BLOCKING", "NON_TAG_ONLY"):
         block = env.get(key, "")
         lists[key] = {
             m.group(1) for m in
@@ -320,7 +320,7 @@ def test_every_job_is_visible_to_the_release_gate():
     gate = jobs["gate"]
     needs = set(gate.get("needs") or [])
     lists = _gate_lists()
-    evaluated = lists["BLOCKING"] | lists["TAG_ONLY"]
+    evaluated = lists["BLOCKING"] | lists["NON_TAG_ONLY"]
 
     for name, job in jobs.items():
         if name == "gate":
@@ -334,10 +334,10 @@ def test_every_job_is_visible_to_the_release_gate():
             continue
         assert name in needs, (
             f"{name} is release-blocking but the gate does not wait on it. Add "
-            f"it to `gate.needs` AND to BLOCKING (or TAG_ONLY).")
+            f"it to `gate.needs` AND to BLOCKING (or NON_TAG_ONLY).")
         assert name in evaluated, (
             f"{name} is in the gate's `needs` but in neither BLOCKING nor "
-            f"TAG_ONLY, so the gate waits for it and then ignores its result. "
+            f"NON_TAG_ONLY, so the gate waits for it and then ignores its result. "
             f"That is worse than not waiting at all.")
 
 
@@ -353,19 +353,26 @@ def test_the_gate_evaluates_nothing_it_does_not_wait_on():
                 f"its result will be read before it is known")
 
 
-def test_the_tag_only_leg_is_conditioned_on_a_tag():
-    """The winget check must not run — and must not fail — on a pre-release PR.
+def test_the_non_tag_leg_is_excluded_on_a_tag():
+    """The winget check must not run — and must not fail — on a tag push.
 
-    The manifest cannot legitimately be correct before the installer it
-    describes exists, so a check that ran there would be permanently red, and a
-    permanently red check is one people learn to ignore.
+    v3.5.1 established this the expensive way. The manifest carries the
+    installer's SHA-256 and the installer is built BY the tag, so requiring the
+    committed manifest to describe that build asks a file to contain the hash of
+    something that did not exist when it was committed. It failed, correctly,
+    and took the release gate red with it.
+
+    The invariant the job actually defends — the manifest's hash matches the
+    artifact at its own URL — holds on every ordinary commit, and is untrue only
+    in the window between publishing a release and updating the manifest. So it
+    must be excluded on tags and required everywhere else.
     """
     jobs = _load(RELEASE_VALIDATION)["jobs"]
-    for name in _gate_lists()["TAG_ONLY"]:
+    for name in _gate_lists()["NON_TAG_ONLY"]:
         condition = str(jobs[name].get("if") or "")
-        assert "refs/tags/" in condition, (
-            f"{name} is evaluated as tag-only but its `if:` does not restrict "
-            f"it to a tag push: {condition!r}")
+        assert "refs/tags/" in condition and "!" in condition, (
+            f"{name} is evaluated as non-tag-only but its `if:` does not "
+            f"exclude tag pushes: {condition!r}")
 
 
 # --- the defect itself, asserted directly ------------------------------------
