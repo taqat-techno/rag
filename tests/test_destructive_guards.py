@@ -592,12 +592,16 @@ def _seed_profile(profile: ClientProfile) -> None:
     these tests go through the real store rather than patching the resolver —
     on a build that ignores the header they simply succeed, which is the defect
     stated as an outcome instead of an ``AttributeError``.
+
+    Closed explicitly, like every other store in this suite: the ``client``
+    fixture's data directory is a ``TemporaryDirectory``, and Windows cannot
+    remove a file something still holds open.
     """
     from ragtools.profile_store import ProfileStore
 
     settings = app_module._settings
-    store = ProfileStore(str(Path(settings.data_dir) / "profiles.db"))
-    store.add(profile)
+    with ProfileStore(str(Path(settings.data_dir) / "profiles.db")) as store:
+        store.add(profile)
 
 
 _RESTRICTED_WRITES = [
@@ -688,6 +692,57 @@ def test_an_unknown_client_profile_fails_closed(client):
     assert r.status_code == 403, (
         f"an unknown client profile was served as the owner (got {r.status_code})")
     assert "ghost-client" in r.text
+
+
+def test_resolving_a_client_profile_leaves_no_open_store(tmp_path, monkeypatch):
+    """The refusal path must not leave ``profiles.db`` open.
+
+    ``request_profile`` runs on EVERY request that carries the header, so an
+    unclosed :class:`ProfileStore` is one SQLite handle per request. Refcounting
+    hid that until this exact path: ``raise`` while ``store`` is still a live
+    local puts the frame in the exception's traceback, and the handle then
+    outlives the request for as long as anything holds the exception — which
+    starlette does while it renders the response, in a traceback/frame cycle
+    only the CYCLIC collector frees, on no schedule.
+
+    POSIX lets an open file be unlinked, so it showed up nowhere until Windows:
+    ``PermissionError: [WinError 32]`` removing this module's ``TemporaryDirectory``,
+    reported as a teardown ERROR against a test that had passed, green on the
+    other two runners.
+
+    Asserted on the CONNECTION and not on "the file can be deleted", because the
+    latter is vacuously true on Linux and macOS — which is how it survived.
+    """
+    import sqlite3
+
+    import ragtools.service.app as service_app
+    from ragtools.profile_store import ProfileStore
+
+    opened: list[ProfileStore] = []
+    original_init = ProfileStore.__init__
+
+    def recording_init(self, db_path):
+        original_init(self, db_path)
+        opened.append(self)
+
+    monkeypatch.setattr(ProfileStore, "__init__", recording_init)
+    monkeypatch.setattr(
+        service_app, "get_settings",
+        lambda: Settings(data_dir=str(tmp_path / "data"),
+                         state_db=str(tmp_path / "state.db")))
+
+    request = types.SimpleNamespace(headers={_PROFILE_HEADER: "ghost-client"})
+    with pytest.raises(destructive.OperationRefused) as excinfo:
+        destructive.request_profile(request)
+    held = excinfo.value            # exactly what starlette holds while rendering
+
+    assert opened, (
+        "the resolver never opened the profile store, so this test proves "
+        "nothing about closing it")
+    for store in opened:
+        with pytest.raises(sqlite3.ProgrammingError):
+            store.list()
+    assert held is not None
 
 
 def test_no_header_still_means_the_owner(client):

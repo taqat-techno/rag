@@ -222,6 +222,20 @@ def request_profile(request):
     not know **fails closed** — it never degrades to owner, for the same reason
     ``mcp_authz.resolve_active_profile`` refuses: a named client that silently
     becomes the owner is the worst possible outcome of a typo.
+
+    The store is opened in a ``with``, and that is load-bearing rather than
+    tidy. This function is called on EVERY request that carries the header, so
+    an unclosed :class:`~ragtools.profile_store.ProfileStore` is one SQLite
+    handle on ``profiles.db`` per request. It used to be left to refcounting,
+    which works right up until the refusal path: ``raise`` while ``store`` is
+    still a live local attaches this frame to the exception's traceback, and the
+    handle then survives for as long as anything holds the exception — a
+    traceback/frame cycle the CYCLIC collector frees, on no schedule.
+
+    POSIX hides it (an open file can still be unlinked). Windows cannot, so it
+    surfaced as ``PermissionError: [WinError 32]`` removing a test's temp
+    directory — a teardown ERROR on ``windows-latest``, on a test that passed,
+    green on the other two runners.
     """
     if request is None:
         return owner_profile()
@@ -241,8 +255,8 @@ def request_profile(request):
         from ragtools.profile_store import ProfileStore
         from ragtools.service.app import get_settings
 
-        store = ProfileStore(str(_P(get_settings().data_dir) / "profiles.db"))
-        profile = store.get(pid)
+        with ProfileStore(str(_P(get_settings().data_dir) / "profiles.db")) as store:
+            profile = store.get(pid)
     except Exception as exc:  # noqa: BLE001
         raise OperationRefused(
             f"the client profile {pid!r} could not be resolved ({exc}); refusing "
