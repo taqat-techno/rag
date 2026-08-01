@@ -1638,74 +1638,86 @@ class QdrantOwner:
         _tick(0, 0, "scan")
         files = self._scan_files(project_id)
 
-        # Open a read-only state connection for change detection
+        # Open a read-only state connection for change detection.
+        #
+        # THE `try` STARTS ON THE NEXT LINE, and that is the fix, not a style
+        # point. It used to start sixty lines below, at `_stream_index`, so
+        # everything in between — the identity check, the staleness scan, and
+        # the progress tick that talks to the job store — could raise and leave
+        # this handle open. Nothing closes it then: the exception's traceback
+        # holds this frame, which holds `read_state`, until the CYCLIC collector
+        # runs, on no schedule.
+        #
+        # POSIX lets an open file be unlinked, so it cost nothing visible there.
+        # On Windows it pins `state.db`, and a release build failed at
+        # `TemporaryDirectory` cleanup with `WinError 32` — the file could not be
+        # deleted because this connection still had it open.
         read_state = IndexState(self._settings.state_db)
-
-        # Does this state DB describe the store we are about to write to? After
-        # a storage-engine or collection-layout change it describes the PREVIOUS
-        # one, and trusting its hashes skips every file against an empty store.
-        trustworthy, changed = self._check_index_identity(read_state)
-        if not trustworthy:
-            from ragtools.index_identity import explain
-            logger.warning(
-                "Index state does not describe the current store (%s) — "
-                "re-indexing instead of skipping unchanged files",
-                explain(changed),
-            )
-            from ragtools.service.activity import log_activity as _log
-            _log("warning", "indexer",
-                 f"Storage changed ({explain(changed)}) — full re-index required")
-
-        # Per project, and ONLY the ones whose own mapping moved. A project
-        # added alongside these does not appear here, so it costs its own index
-        # run and nothing else — the whole point of separating this from the
-        # registry-wide fingerprint.
-        stale_projects = {} if not trustworthy else self._untrusted_projects(read_state)
-        if stale_projects:
-            from ragtools.index_identity import explain_project
-            from ragtools.service.activity import log_activity as _log
-            for pid, fields in sorted(stale_projects.items()):
-                reason = explain_project(pid, fields)
-                logger.warning("Re-indexing one project: %s", reason)
-                _log("warning", "indexer",
-                     f"Re-indexing '{pid}' only — {reason}. Other projects are "
-                     f"unaffected and keep their index.")
-
-        stats = {"indexed": 0, "skipped": 0, "deleted": 0, "chunks_indexed": 0,
-                 "projects": set()}
-        total_files = len(files)
-        _tick(0, total_files, "scan")
-
-        # Deletion detection needs the full set of live paths up front. This is
-        # the one thing that cannot stream — but it is cheap: path resolution
-        # only, no file reads.
-        current_paths = {self._resolve_relative_path(pid, fp) for pid, fp in files}
-        self._purge_missing(current_paths, project_id, stats)
-
-        def _work():
-            """Yield only the files that need indexing, hashing lazily.
-
-            A generator so each file is read and hashed when its window comes
-            up. Materialising this (the old `pending` list of every chunk of
-            every file) cost 2.46 GB on a 38k-file project.
-            """
-            for n, (pid, file_path) in enumerate(files, start=1):
-                # Reported per file (the callback throttles itself). Without it
-                # a forced full re-index sat at 0/None for twenty minutes.
-                _tick(n, total_files, "chunk")
-                relative_path = self._resolve_relative_path(pid, file_path)
-                current_hash = IndexState.hash_file(file_path)
-                # Two independent reasons a matching hash may not mean "already
-                # in the store": the STORE changed (`trustworthy` False — every
-                # project), or THIS PROJECT's collection changed (`stale_projects`
-                # — that project alone). Both mean re-index; neither means delete.
-                if (trustworthy and pid not in stale_projects
-                        and not read_state.file_changed(relative_path, current_hash)):
-                    stats["skipped"] += 1
-                    continue
-                yield pid, relative_path, current_hash, file_path
-
         try:
+            # Does this state DB describe the store we are about to write to? After
+            # a storage-engine or collection-layout change it describes the PREVIOUS
+            # one, and trusting its hashes skips every file against an empty store.
+            trustworthy, changed = self._check_index_identity(read_state)
+            if not trustworthy:
+                from ragtools.index_identity import explain
+                logger.warning(
+                    "Index state does not describe the current store (%s) — "
+                    "re-indexing instead of skipping unchanged files",
+                    explain(changed),
+                )
+                from ragtools.service.activity import log_activity as _log
+                _log("warning", "indexer",
+                     f"Storage changed ({explain(changed)}) — full re-index required")
+
+            # Per project, and ONLY the ones whose own mapping moved. A project
+            # added alongside these does not appear here, so it costs its own index
+            # run and nothing else — the whole point of separating this from the
+            # registry-wide fingerprint.
+            stale_projects = {} if not trustworthy else self._untrusted_projects(read_state)
+            if stale_projects:
+                from ragtools.index_identity import explain_project
+                from ragtools.service.activity import log_activity as _log
+                for pid, fields in sorted(stale_projects.items()):
+                    reason = explain_project(pid, fields)
+                    logger.warning("Re-indexing one project: %s", reason)
+                    _log("warning", "indexer",
+                         f"Re-indexing '{pid}' only — {reason}. Other projects are "
+                         f"unaffected and keep their index.")
+
+            stats = {"indexed": 0, "skipped": 0, "deleted": 0, "chunks_indexed": 0,
+                     "projects": set()}
+            total_files = len(files)
+            _tick(0, total_files, "scan")
+
+            # Deletion detection needs the full set of live paths up front. This is
+            # the one thing that cannot stream — but it is cheap: path resolution
+            # only, no file reads.
+            current_paths = {self._resolve_relative_path(pid, fp) for pid, fp in files}
+            self._purge_missing(current_paths, project_id, stats)
+
+            def _work():
+                """Yield only the files that need indexing, hashing lazily.
+
+                A generator so each file is read and hashed when its window comes
+                up. Materialising this (the old `pending` list of every chunk of
+                every file) cost 2.46 GB on a 38k-file project.
+                """
+                for n, (pid, file_path) in enumerate(files, start=1):
+                    # Reported per file (the callback throttles itself). Without it
+                    # a forced full re-index sat at 0/None for twenty minutes.
+                    _tick(n, total_files, "chunk")
+                    relative_path = self._resolve_relative_path(pid, file_path)
+                    current_hash = IndexState.hash_file(file_path)
+                    # Two independent reasons a matching hash may not mean "already
+                    # in the store": the STORE changed (`trustworthy` False — every
+                    # project), or THIS PROJECT's collection changed (`stale_projects`
+                    # — that project alone). Both mean re-index; neither means delete.
+                    if (trustworthy and pid not in stale_projects
+                            and not read_state.file_changed(relative_path, current_hash)):
+                        stats["skipped"] += 1
+                        continue
+                    yield pid, relative_path, current_hash, file_path
+
             emptied = self._stream_index(_work(), total_files, _tick, stats, "indexed")
         finally:
             read_state.close()
@@ -2552,8 +2564,10 @@ class QdrantOwner:
         state_path = Path(self._settings.state_db)
         if state_path.exists():
             state = IndexState(self._settings.state_db)
-            summary = state.get_summary()
-            state.close()
+            try:
+                summary = state.get_summary()
+            finally:
+                state.close()
         else:
             summary = {"total_files": 0, "total_chunks": 0, "projects": [], "last_indexed": None}
 
@@ -2732,16 +2746,18 @@ class QdrantOwner:
                 return []
 
             state = IndexState(self._settings.state_db)
-            summary = state.get_summary()
-            projects = []
-            for pid in summary["projects"]:
-                records = state.get_all_for_project(pid)
-                projects.append({
-                    "project_id": pid,
-                    "files": len(records),
-                    "chunks": sum(r["chunk_count"] for r in records),
-                })
-            state.close()
+            try:
+                summary = state.get_summary()
+                projects = []
+                for pid in summary["projects"]:
+                    records = state.get_all_for_project(pid)
+                    projects.append({
+                        "project_id": pid,
+                        "files": len(records),
+                        "chunks": sum(r["chunk_count"] for r in records),
+                    })
+            finally:
+                state.close()
             return projects
 
     #: How long an eligibility scan is trusted. The filesystem walk is the whole
@@ -3070,17 +3086,19 @@ class QdrantOwner:
             state_path = Path(self._settings.state_db)
             if state_path.exists():
                 state = IndexState(self._settings.state_db)
-                records = state.get_all_for_project(project_id)
-                for r in records:
-                    state.remove(r["file_path"])
-                    deleted_files += 1
-                # The project's recorded mapping goes with its file rows. A
-                # DELIBERATE removal must not later read as a registry that lost
-                # a project — that is the rollback signal, and a routine removal
-                # firing it would block swaps for an install with nothing wrong.
-                from ragtools.index_identity import forget_project
-                forget_project(state, project_id)
-                state.close()
+                try:
+                    records = state.get_all_for_project(project_id)
+                    for r in records:
+                        state.remove(r["file_path"])
+                        deleted_files += 1
+                    # The project's recorded mapping goes with its file rows. A
+                    # DELIBERATE removal must not later read as a registry that lost
+                    # a project — that is the rollback signal, and a routine removal
+                    # firing it would block swaps for an install with nothing wrong.
+                    from ragtools.index_identity import forget_project
+                    forget_project(state, project_id)
+                finally:
+                    state.close()
 
             self._invalidate_map_cache()
 

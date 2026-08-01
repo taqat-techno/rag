@@ -143,7 +143,14 @@ def run_watch(
 
 
 def _run_incremental(settings: Settings, ignore_rules: IgnoreRules) -> None:
-    """Run incremental indexing, opening and closing Qdrant within this call."""
+    """Run incremental indexing, opening and closing Qdrant within this call.
+
+    The `finally` is load-bearing: this runs once per watcher tick, and the
+    `except` below deliberately swallows the error and keeps watching. Without
+    it, a single failing tick leaked the state and registry SQLite handles for
+    the life of the process — one more pair every time it failed again.
+    """
+    state = router = None
     try:
         from ragtools.embedding.encoder import Encoder
         from ragtools.indexing.indexer import (
@@ -228,9 +235,6 @@ def _run_incremental(settings: Settings, ignore_rules: IgnoreRules) -> None:
             indexed += 1
             chunks += count
 
-        state.close()
-        router.close()   # release the registry SQLite handles too
-
         # Close Qdrant client to release the lock
         del client
 
@@ -244,6 +248,13 @@ def _run_incremental(settings: Settings, ignore_rules: IgnoreRules) -> None:
 
     except Exception as e:
         console.print(f"  [red]Indexing error: {e}[/red]")
+    finally:
+        for handle in (state, router):   # router owns the registry handles
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:  # noqa: BLE001 — teardown must not mask the error
+                    pass
 
 
 def _short_path(full_path: str, root: str) -> str:

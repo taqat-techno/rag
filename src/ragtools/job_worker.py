@@ -110,6 +110,14 @@ class JobWorker:
         self._poll = poll_interval
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        #: The job the worker thread is inside RIGHT NOW, or None. Read by
+        #: `stop` from another thread, so it is guarded.
+        self._current: Optional[str] = None
+        #: The job `stop` asked to end, so `_run` can tell "the service shut
+        #: down under me" from "a user cancelled me" — different states, and
+        #: the UI means different things by them.
+        self._interrupted: Optional[str] = None
+        self._state_lock = threading.Lock()
 
     # -- lifecycle ------------------------------------------------------
 
@@ -120,16 +128,50 @@ class JobWorker:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        with self._state_lock:
+            self._interrupted = None
         self._thread = threading.Thread(target=self._loop, name="rag-job-worker", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Idempotent. Does not abort a running handler — it asks the loop to
-        exit after the current job."""
+        """Idempotent. Asks the loop to exit AND asks the running job to stop.
+
+        It used to only do the first, which meant "stop" was a request the
+        running job never heard: the loop checks ``_stop`` between jobs, so a
+        job already in a handler ran on regardless, and the join simply gave up
+        after ``timeout``. Its caller (:func:`ragtools.service.app.stop_runtime`)
+        then closed the runtime store out from under it — a release build died
+        exactly there.
+
+        Requesting cancellation is what makes the drain real: a cooperative
+        handler observes it at its next ``ctx.check_cancel()`` and unwinds
+        through a path that finishes the job **while the store is still open**,
+        so the outcome is recorded instead of lost. A handler that cannot be
+        interrupted still cannot be, which is why the store also has to survive
+        being closed under one — see :meth:`RuntimeStore.close`.
+
+        A thread still alive after ``timeout`` is REPORTED, naming the job. It
+        was silent, and silence is how "the store closed under a running job"
+        stayed invisible until Windows refused to delete the file.
+        """
         self._stop.set()
+        with self._state_lock:
+            job_id = self._current
+            self._interrupted = job_id
+        if job_id is not None:
+            try:
+                self._store.request_cancel(job_id)
+            except Exception:  # noqa: BLE001 — teardown must not raise
+                logger.exception("could not ask job %s to stop", job_id)
         t = self._thread
         if t and t.is_alive():
             t.join(timeout=timeout)
+            if t.is_alive():
+                with self._state_lock:
+                    still = self._current
+                logger.warning(
+                    "job worker did not stop within %.1fs; job %s is still "
+                    "running and its store is about to be closed", timeout, still)
         self._thread = None
 
     def is_alive(self) -> bool:
@@ -152,10 +194,12 @@ class JobWorker:
     def _run(self, job) -> None:
         handler = self._handlers.get(job.kind)
         if handler is None:
-            self._store.finish(job.id, JobState.FAILED,
-                               error=f"no handler registered for job kind {job.kind!r}")
+            self._finish(job, JobState.FAILED,
+                         error=f"no handler registered for job kind {job.kind!r}")
             return
 
+        with self._state_lock:
+            self._current = job.id
         ctx = JobContext(self._store, job.id)
         try:
             result = handler(job, ctx)
@@ -164,11 +208,47 @@ class JobWorker:
             # Throttling may have dropped the last tick; the terminal progress
             # value must always be accurate.
             ctx.finalize_progress()
-            self._store.finish(job.id, JobState.SUCCEEDED, result=result,
-                               verified=ctx.verified)
+            self._finish(job, JobState.SUCCEEDED, result=result,
+                         verified=ctx.verified)
         except Cancelled:
-            self._store.finish(job.id, JobState.CANCELLED,
-                               result={"note": "cancelled by request"})
+            with self._state_lock:
+                by_shutdown = self._interrupted == job.id
+            if by_shutdown:
+                # NOT "cancelled": nobody asked for this job to stop, the
+                # service went away underneath it. `interrupted` is the state
+                # `recover_interrupted` already uses for exactly this, so the
+                # UI does not have to learn a new word for it.
+                self._finish(job, JobState.INTERRUPTED,
+                             error="the service shut down while this job was running")
+            else:
+                self._finish(job, JobState.CANCELLED,
+                             result={"note": "cancelled by request"})
         except Exception as exc:            # noqa: BLE001 — must never lose the job
             logger.exception("job %s (%s) failed", job.id, job.kind)
-            self._store.finish(job.id, JobState.FAILED, error=f"{type(exc).__name__}: {exc}")
+            self._finish(job, JobState.FAILED, error=f"{type(exc).__name__}: {exc}")
+        finally:
+            with self._state_lock:
+                self._current = None
+
+    def _finish(self, job, state: str, **fields) -> None:
+        """Record the terminal state, and REPORT it if that is impossible.
+
+        The store no longer raises when it has been closed, but it is not the
+        only way recording can fail (a full disk, a corrupt file), and this
+        runs on a daemon thread with nobody to catch anything. An exception
+        escaping here kills the worker and hands its traceback every frame
+        beneath it — which is how a leaked `IndexState` handle outlived the
+        test that opened it and pinned `state.db` on Windows.
+
+        Logging is not swallowing: the job, its kind, the state it reached and
+        the error it was carrying all reach the log. What must not happen is
+        the failure to *write down* an outcome becoming a second, louder
+        failure that destroys the thread.
+        """
+        try:
+            self._store.finish(job.id, state, **fields)
+        except Exception:  # noqa: BLE001 — see docstring
+            logger.exception(
+                "job %s (%s) ended as %s but the outcome could not be "
+                "recorded%s", job.id, job.kind, state,
+                f": {fields['error']}" if fields.get("error") else "")

@@ -70,10 +70,12 @@ def _load_index_stats(settings) -> dict:
     index_data = {}
     if state_path.exists():
         state = IndexState(settings.state_db)
-        for p in settings.projects:
-            records = state.get_all_for_project(p.id)
-            index_data[p.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
-        state.close()
+        try:
+            for p in settings.projects:
+                records = state.get_all_for_project(p.id)
+                index_data[p.id] = {"files": len(records), "chunks": sum(r["chunk_count"] for r in records)}
+        finally:
+            state.close()
     return index_data
 
 

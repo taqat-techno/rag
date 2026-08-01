@@ -231,3 +231,59 @@ def test_status_counts_projects_configured_apart_from_projects_indexed(tmp_path)
         assert status["projects_searchable"] == 2, status
     finally:
         owner.close()
+
+
+# --- the state handle an interrupted incremental index used to leak ----------
+
+
+def test_an_incremental_index_that_raises_closes_its_state_handle(tmp_path, monkeypatch):
+    """`read_state` was opened sixty lines above the `try` that closed it.
+
+    Everything in between could raise — the identity check, the staleness scan,
+    and the progress tick that talks to the job store — and nothing then closed
+    the connection. The exception's traceback holds the frame, the frame holds
+    `read_state`, and only the CYCLIC collector frees that, on no schedule. A
+    release build failed at `TemporaryDirectory` cleanup with `WinError 32`
+    because of it.
+
+    NEGATIVE CONTROL: asserts the CONNECTION is closed, not that the file can be
+    deleted. The latter is vacuously true on Linux and macOS, which is how this
+    survived. Verified to FAIL against the pre-fix `_run_incremental_index_locked`.
+    """
+    import sqlite3
+
+    from ragtools.service import owner as owner_module
+
+    owner, _settings = _drift_fixture(tmp_path, "shared")
+    opened = []
+    real_state = owner_module.IndexState
+
+    class _Spy(real_state):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            opened.append(self)
+
+    monkeypatch.setattr(owner_module, "IndexState", _Spy)
+
+    def _boom(self, state):
+        raise RuntimeError("storage went away mid-index")
+
+    monkeypatch.setattr(owner_module.QdrantOwner, "_check_index_identity", _boom)
+
+    try:
+        with pytest.raises(RuntimeError, match="storage went away"):
+            owner.run_incremental_index()
+
+        assert opened, "the incremental index opened no state handle at all"
+        still_open = []
+        for state in opened:
+            try:
+                state.conn.execute("SELECT 1")
+                still_open.append(state.db_path)
+            except sqlite3.ProgrammingError:
+                pass            # closed, which is the point
+        assert not still_open, (
+            "an interrupted incremental index left the state DB open, so on "
+            f"Windows the file cannot be deleted or replaced: {still_open}")
+    finally:
+        owner.close()

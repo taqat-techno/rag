@@ -23,6 +23,16 @@ from ragtools.service.owner import QdrantOwner
 
 @pytest.fixture
 def client():
+    """The temp directory is cleaned STRICTLY — no ``ignore_errors``.
+
+    That is the point of the fixture, not an incidental. A release build failed
+    here with ``PermissionError: [WinError 32] ... state.db``: the injected-owner
+    lifespan branch never closes the owner, so the fixture has to, and a job
+    still running at teardown had a second `IndexState` open on the same file.
+    Windows refuses to unlink an open file; POSIX does not, which is why two of
+    three runners saw nothing. Suppressing the error would hide exactly the
+    class of leak this is here to catch.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         settings = Settings(
             content_root=str(Path(tmp)),
@@ -30,7 +40,8 @@ def client():
             state_db=str(Path(tmp) / "state.db"),
             projects=[ProjectConfig(id="proj-a", path=str(Path(tmp)))],
         )
-        app_module._owner = QdrantOwner(settings=settings, client=Settings.get_memory_client())
+        owner = QdrantOwner(settings=settings, client=Settings.get_memory_client())
+        app_module._owner = owner
         app_module._settings = settings
         try:
             with TestClient(create_app(), raise_server_exceptions=True) as tc:
@@ -38,6 +49,10 @@ def client():
         finally:
             app_module._owner = None
             app_module._settings = None
+            # AFTER the lifespan shutdown, which drains the job worker: closing
+            # the owner while a job still holds it would trade one handle leak
+            # for a use-after-close.
+            owner.close()
 
 
 def _await_terminal(client, job_id, timeout=15.0):
