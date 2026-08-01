@@ -112,24 +112,67 @@ That sequence accounts for every observed symptom, including the otherwise odd
 one: the Inno log contains **exactly one line**, because Setup died in the
 delete phase before it had written anything else.
 
+## 5a. ANSWERED — the lock owner, measured
+
+**Measured 2026-08-01**, run `30676422208`, job `packaged v3.3.0 -> this build`, via the
+Windows Restart Manager and an independent psutil module sweep. Both name one process:
+
+```
+bin\qdrant.exe: HELD BY 1 process(es)
+  {"pid": 2720, "app_name": "qdrant", "app_type_name": "RmConsole", "restartable": false}
+
+processes whose image OR a loaded module lies under <install> (1):
+  {"pid": 2720, "ppid": 816, "name": "qdrant.exe",
+   "exe": "...\Programs\RAGTools\bin\qdrant.exe",
+   "cmdline": ["...\bin\qdrant.exe", "--config-path", "...\RAGTools\data\qdrant-config.yaml"],
+   "holds": [{"kind": "exe",    "path": "...\bin\qdrant.exe"},
+             {"kind": "module", "path": "...\bin\qdrant.exe"},
+             {"kind": "module", "path": "...\_internal\msvcp140.dll"},
+             {"kind": "module", "path": "...\_internal\vcruntime140_1.dll"},
+             {"kind": "module", "path": "...\_internal\vcruntime140.dll"}],
+   "classification": {"role": "managed_qdrant", "confidence": "high"}}
+```
+
+**Q1 — which PID retains a file under the installation:** pid 2720.
+**Q2 — what it is:** the managed Qdrant engine. Not the tray, not the supervisor, not an
+MCP server — those are stopped by the existing image-name kill. This one is a *native*
+process the upgrade lifecycle was never written to account for.
+
+**The mechanism, in one sentence.** `qdrant.exe` lives at `<install>\bin\` and loads the
+**MSVC runtime out of `<install>\_internal\`** — the PyInstaller payload directory —
+because the loader resolves `msvcp140.dll` / `vcruntime140.dll` / `vcruntime140_1.dll`
+from the application directory. `[InstallDelete]` removes `{app}\_internal` *wholesale*.
+So the delete meets a DLL held by a process nothing in the installer was stopping, raises
+the file-in-use Abort/Retry/Ignore box, and `/SUPPRESSMSGBOXES` answers **Abort** — exit 5,
+`_internal` half-deleted, `python312.dll` gone.
+
+**Q6 and Q7 now follow mechanically rather than by correlation.** v3.0.1 is `embedded`:
+Qdrant is in-process Python, there is no native child, nothing outside `rag.exe`/`ragw.exe`
+holds `_internal`, and stopping those two is sufficient — so it passes. v3.3.0 introduced
+the supervised managed engine, and with it the first installation-owned process the kill
+does not target. The boundary is not a coincidence of timing; it is the feature.
+
+Confirmed independently by the same run's outcome pattern: with the quiescence gate in
+place, **2.7.0 and 3.0.1 pass and 3.3.0 / 3.4.0 / 3.5.0 refuse**, and the refusal names
+exactly those four files.
+
 ## 6. What is NOT yet proven
 
-These remain open until `scripts/diagnose_upgrade_lock.py` runs in the
-instrumented CI leg. They are listed so nothing here is mistaken for a finished
-answer:
+Superseded in part by §5a. Remaining state, honestly:
 
-1. the exact PID(s) retaining `_internal\python312.dll` — **undetermined**;
-2. what those processes are (tray / supervisor / service / engine / MCP) — **undetermined**;
-3. which shutdown actions actually executed, from the installer's own log — **undetermined** (the 1-line log tells us when it died, not what it did);
-4. whether shutdown was requested but not awaited — **undetermined**;
-5. whether Task Scheduler restarted a process inside the install window — **undetermined**;
-8. whether the first destructive write preceded proof of quiescence — *strongly indicated* by §5, not yet measured;
-9. whether rollback restores a byte-consistent, runnable v3.3.0 — **undetermined**;
-10. whether user data is unchanged — **undetermined** (the post-upgrade service never answered, so nothing read it).
+1. **ANSWERED** — pid 2720, the managed Qdrant engine (§5a).
+2. **ANSWERED** — `managed_qdrant`, high confidence, by image + path + loaded modules (§5a).
+3. which shutdown actions the *v3.5.0* installer executed, from its own log — **undetermined**, and likely to stay so: that log was one line because Setup died in the delete phase before writing more. The equivalent question for the *current* installer is answered by the structured quiescence verdict.
+4. whether shutdown was requested but not awaited — **undetermined for v3.5.0**; for the current build the verdict records every phase with its outcome and duration.
+5. whether Task Scheduler restarted a process inside the install window — **not observed**. The sampler recorded no process appearing during the window. Absence of an observation at a 0.31 s sampling interval is weaker than a proof, and is reported as `none_observed`, not as `no`.
+8. whether the first destructive write preceded proof of quiescence — **ANSWERED for v3.5.0: yes**, necessarily. `ForceKillRagProcesses` logged survivors and returned; `[InstallDelete]` ran next. There was no code path that could refuse. That is the defect WP-R02 removes.
+9. whether rollback restores a byte-consistent, runnable v3.3.0 — **partially**. The refusal path leaves the previous installation untouched and *demonstrably* runnable: the same job records `[PASS] the service answers after the upgrade — status=ready version=3.3.0`. Rollback *after* a partial write is implemented and unit-tested but has not been exercised against a real half-written tree.
+10. whether user data is unchanged — **not measured under the v3.5.0 failure**, because the post-upgrade service never answered and nothing read it. Under the current build the refusal writes nothing at all, so the question does not arise on that path.
 
-**No item above may be quoted as a finding until measured.** The reproduction
-establishes the failure and its version boundary; it does not establish the lock
-owner.
+**Nothing above is quoted as a finding unless it is marked ANSWERED.** Items 3, 4 and 10
+are properties of a failure mode this release removes; they are recorded as open rather
+than quietly dropped, because "we fixed it so the question no longer matters" is not the
+same as "we know the answer".
 
 ## 7. Consequence for the release
 
