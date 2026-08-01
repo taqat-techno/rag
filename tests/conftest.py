@@ -34,6 +34,25 @@ def pytest_configure(config):
                   "RAG_QDRANT_BINARY", "RAG_STORAGE_URL"):
         os.environ.pop(leaky, None)
 
+    # NO CLI ASSERTION MAY DEPEND ON HOW WIDE THE RUNNER'S TERMINAL IS.
+    #
+    # Every command in this project prints through `rich.Console`, and Typer
+    # renders `--help` through Rich too — both of which WRAP to the terminal
+    # width. On GitHub Actions Typer forces terminal mode, so the help panel is
+    # laid out against the runner's real width rather than Rich's stable
+    # non-tty default, and the width is not the same on the Windows, Linux and
+    # macOS runners. That is not a hypothetical: `--apply` sat inside the
+    # captured `rag storage reap --help` on `windows-latest` and was wrapped out
+    # of it on the other two, failing a help screen that was perfectly correct.
+    #
+    # `COLUMNS` is read by Rich at every size lookup and OVERRIDES the detected
+    # terminal size, so pinning it here makes every rendered line identical on
+    # all three platforms. Wide, so nothing this suite asserts on is broken
+    # across a line boundary. (A test whose subject really is the wrapping can
+    # still monkeypatch it back.)
+    os.environ["COLUMNS"] = "200"
+    os.environ["LINES"] = "50"
+
 
 @pytest.fixture(autouse=True)
 def isolate_config(tmp_path, monkeypatch):

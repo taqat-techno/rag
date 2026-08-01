@@ -676,11 +676,38 @@ def test_the_periodic_sweep_reclaims_once_it_is_switched_on(install):
 
 
 def test_the_cli_offers_a_reap_command():
-    """`rag storage reap` is how an operator asks offline, next to `reclaim`."""
+    """`rag storage reap` is how an operator asks offline, next to `reclaim`.
+
+    Asserted against the PARSER, never against the rendered help screen.
+
+    Typer lays `--help` out with Rich, which wraps to the terminal width — and
+    on GitHub Actions Typer additionally FORCES terminal mode, so the panel is
+    sized to whatever the runner's terminal happens to be rather than to a
+    stable default. `--apply` survived that on `windows-latest` and was wrapped
+    out of the captured text on `ubuntu-latest` and `macos-latest`, failing a
+    help screen that was perfectly correct. The claim being made here — "the
+    command exists and it takes `--apply`" — is a property of the command object
+    and of the argument parser, and neither of those has a width or an ANSI
+    escape in it.
+    """
+    from typer.main import get_command
     from typer.testing import CliRunner
 
     from ragtools.cli import app
 
-    result = CliRunner().invoke(app, ["storage", "reap", "--help"])
-    assert result.exit_code == 0, result.output
-    assert "--apply" in result.output
+    storage = get_command(app).commands["storage"]
+    assert "reap" in storage.commands, (
+        "`rag storage reap` does not exist, so an operator has no way to ask for "
+        "the sweep offline — only the periodic one, which is off by default")
+
+    declared = {opt for param in storage.commands["reap"].params for opt in param.opts}
+    assert "--apply" in declared, (
+        "`rag storage reap` declares no --apply, so the dry run has no "
+        f"counterpart and nothing can ever be reaped. It declares: {sorted(declared)}")
+
+    # And the parser really accepts it. A declared option the command rejected
+    # would satisfy the assertion above and still fail the operator; an unknown
+    # option makes Click exit 2 before `--help` is ever reached.
+    result = CliRunner().invoke(app, ["storage", "reap", "--apply", "--help"])
+    assert result.exit_code == 0, (
+        f"`rag storage reap --apply` is not accepted by the parser: {result.output}")
