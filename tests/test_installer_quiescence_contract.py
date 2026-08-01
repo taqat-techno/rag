@@ -32,6 +32,8 @@ platform; nothing here needs Windows.
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -39,6 +41,10 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "installer.iss"
 QUIESCE = ROOT / "installer" / "quiesce.ps1"
+
+#: A task path no machine can have registered. Used to ask the REAL
+#: `Get-TaskState` the question that broke the 3.5.1 upgrade.
+UNREGISTERED_TASK = r"\RAGToolsQuiescenceProbe\NoSuchTask"
 
 #: Sections whose entries Inno executes as file operations. Both run AFTER
 #: `PrepareToInstall`, which is the ordering guarantee this module exists to
@@ -160,6 +166,33 @@ def ps_braced_block(script: str, opener: str) -> str:
             depth -= 1
         i += 1
     return script[start:i - 1]
+
+
+def declarations_and_functions(script: str) -> str:
+    """`quiesce.ps1` with its `param()` block and its main body removed.
+
+    What is left is the error preference, the `$Script:` declarations and every
+    function — definitions only, so loading it EXECUTES NOTHING. The `param()`
+    block goes because its parameters are `Mandatory`, and a mandatory parameter
+    with no value makes PowerShell prompt, which in a test run means hang. The
+    main body goes because it stops processes.
+
+    Deliberately the real file rather than a paraphrase of it: a copy of
+    `Get-TaskState` maintained in this test could be fixed here and left broken
+    there, which is the failure mode the whole module exists to prevent.
+    """
+    start = script.index("$ErrorActionPreference")
+    end = script.index("if ($Mode -eq 'Restore')")
+    return script[start:end]
+
+
+def run_powershell(body: str, tmp_path: Path) -> subprocess.CompletedProcess:
+    probe = tmp_path / "probe.ps1"
+    probe.write_text(body, encoding="utf-8")
+    return subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive",
+         "-ExecutionPolicy", "Bypass", "-File", str(probe)],
+        capture_output=True, text=True, timeout=180)
 
 
 def invoked_phases(script: str) -> list[str]:
@@ -593,6 +626,180 @@ def test_the_protocol_cannot_modify_the_installation_it_is_judging():
         assert "Remove-Item" not in line, (
             f"quiesce.ps1 deletes something: {line.strip()}"
         )
+
+
+# ==========================================================================
+# The 3.5.1 defect: a task that is merely not registered aborted the protocol
+# ==========================================================================
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="Windows PowerShell is the interpreter under test")
+def test_a_scheduled_task_that_is_not_registered_is_reported_not_thrown(tmp_path):
+    """THE defect that made every 3.5.1 upgrade refuse, asked of the real script.
+
+    In Windows PowerShell, what a native command writes to stderr becomes an
+    ErrorRecord the moment a redirection operator is applied to stream 2 — and
+    under ``$ErrorActionPreference = 'Stop'``, which this script sets on its
+    first line, that ErrorRecord is TERMINATING. ``schtasks /query`` announces an
+    absent task on stderr, and an absent task is the NORMAL case for at least one
+    of ``$Script:OwnedTasks`` on every release the matrix upgrades from:
+    ``\\RAGTools Watchdog`` is v2's and v3 removes it, while a v2 machine has
+    neither ``\\RAGTools\\Service`` nor ``\\RAGTools\\Tray``.
+
+    So ``Get-TaskState`` could never return ``'Missing'``: it threw, the phase
+    dispatcher rethrew, and the protocol aborted at ``disable_tasks`` — before
+    ``stop_tray``, before the supervisor stop, before the proven
+    ``taskkill /F /IM ... /T``, before the engine stop. Setup then refused with
+    exit 7 having correctly written nothing, which is why the safety half looked
+    healthy while the previous version was still serving with every one of its
+    processes alive.
+
+    Executed, not grepped. The interpreter's behaviour is the thing that was
+    wrong, and no amount of reading the source reveals it.
+    """
+    body = declarations_and_functions(quiesce_source()) + f"""
+try {{
+    $state = Get-TaskState -Name '{UNREGISTERED_TASK}'
+    Write-Output "STATE=$state"
+}}
+catch {{
+    Write-Output "THREW=$($_.Exception.GetType().Name): $($_.Exception.Message)"
+}}
+"""
+    result = run_powershell(body, tmp_path)
+    output = (result.stdout or "") + (result.stderr or "")
+
+    assert "THREW=" not in output, (
+        "Get-TaskState THROWS for a scheduled task that is simply not "
+        f"registered:\n  {output.strip()}\n"
+        "Under $ErrorActionPreference = 'Stop', a redirection applied to a "
+        "native command's stderr makes that stderr terminating. disable_tasks "
+        "therefore aborts the whole protocol before a single process is stopped, "
+        "and the upgrade refuses with the previous version still running."
+    )
+    assert "STATE=Missing" in output, (
+        f"an unregistered task is not reported as Missing: {output.strip()!r}"
+    )
+
+
+def test_no_native_command_can_turn_its_own_stderr_into_a_terminating_error():
+    """The general form of the defect above, as a property of the source.
+
+    ``$ErrorActionPreference = 'Stop'`` is deliberate and stays. What must not
+    happen again is a raw native invocation that redirects stream 2 while it is
+    in force — so every native command that needs its output read goes through
+    ``Invoke-Native``, which neutralises the preference around that one call.
+    """
+    script = quiesce_code()
+
+    helper = re.search(r"function Invoke-Native\b.*?\n\}", script, re.DOTALL)
+    assert helper, (
+        "quiesce.ps1 has no guarded native-command helper, so a native command's "
+        "stderr is once again free to abort the protocol"
+    )
+    assert "$ErrorActionPreference = 'Continue'" in helper.group(0), (
+        "Invoke-Native does not neutralise the error preference, which is the "
+        "only thing that stops native stderr being terminating"
+    )
+
+    offenders = [line.strip() for line in script.splitlines()
+                 if re.search(r"^\s*(?:\$\w+\s*=\s*)?&\s*[\"'$]", line)
+                 and re.search(r"\b2>(?:&1|\$null)", line)]
+    assert not offenders, (
+        "a native command is invoked with its stderr redirected while "
+        "$ErrorActionPreference = 'Stop' is in force, which makes that stderr a "
+        f"TERMINATING error: {offenders}. Use Invoke-Native."
+    )
+
+
+def test_a_preparatory_phase_that_fails_does_not_skip_every_stop():
+    """One dispatcher, two kinds of phase, and the distinction is declared.
+
+    A phase that only HELPS reach quiescence failing proves nothing — and must
+    not be able to skip the phases that do the stopping and the proving. Only a
+    phase whose failure could make the script wrongly conclude quiescence aborts
+    it: `detect_installation` (an error read as "nothing installed" would let
+    Setup delete a live installation) and the two that decide.
+    """
+    script = quiesce_code()
+
+    decisive = ps_array(script, "DecisivePhases")
+    declared = ps_array(script, "Phases")
+    assert decisive, "quiesce.ps1 no longer distinguishes decisive from advisory phases"
+    assert set(decisive) <= set(declared), (
+        f"a decisive phase is not in the protocol at all: {decisive}"
+    )
+    for required in ("detect_installation", "verify_clear", "probe_replaceable"):
+        assert required in decisive, (
+            f"{required} is advisory, so an error in it would be recorded and the "
+            "protocol would carry on — for detect_installation that means "
+            "concluding a live installation is a fresh one and returning exit 0"
+        )
+    for advisory in ("disable_tasks", "stop_tray", "stop_service_children"):
+        assert advisory not in decisive, (
+            f"{advisory} aborts the whole protocol when it fails, which is how "
+            "one unregistered scheduled task stopped 3.5.1 from ever running its "
+            "kill"
+        )
+
+    dispatcher = re.search(r"function Invoke-Phase\b.*?\n\}", script, re.DOTALL)
+    assert dispatcher, "quiesce.ps1 has no phase dispatcher"
+    assert "$Script:DecisivePhases -contains $Name" in dispatcher.group(0), (
+        "the dispatcher rethrows for every phase, so an advisory failure is "
+        "still an abort"
+    )
+
+
+def test_the_harness_reads_the_verdict_where_the_installer_writes_it(iss):
+    """A refusal nobody can read is a refusal nobody can act on.
+
+    `installer.iss` decides where `quiesce.ps1 -LogPath` points and
+    `scripts/verify_upgrade_install.py` is what turns that file into CI output.
+    If those two ever name different directories, an exit-7 leg reports a
+    refusal with no cause attached and the next person has to reproduce the
+    whole 48-minute matrix to find out why.
+    """
+    code = code_section(iss)
+    directory = pascal_body(code, "QuiesceLogDirectory")
+    assert directory, "installer.iss no longer decides where the verdict is written"
+    match = re.search(r"ExpandConstant\('([^']+)'\)", directory)
+    assert match, f"the log directory is not a constant path: {directory}"
+    installer_path = match.group(1)          # {localappdata}\RAGTools\logs
+
+    harness = (ROOT / "scripts" / "verify_upgrade_install.py").read_text(encoding="utf-8")
+    declared = re.search(r"QUIESCE_LOG_DIR\s*=\s*(.+)", harness)
+    assert declared, (
+        "the harness no longer names the quiescence log directory, so it cannot "
+        "report what a refusal found"
+    )
+    tail = installer_path.replace("{localappdata}", "").strip("\\/")
+    for segment in tail.split("\\"):
+        assert f'"{segment}"' in declared.group(1), (
+            f"the harness reads {declared.group(1).strip()} but the installer "
+            f"writes to {installer_path}; the segment {segment!r} is missing"
+        )
+
+    # And it reads the STRUCTURED verdict, not only the summary. The summary is
+    # written for Inno's dialog and carries the blockers alone, so a protocol
+    # that aborted before it looked for any produces an empty list — which is
+    # exactly how a refusal came to print `Blockers:` and nothing else. The
+    # phases are the part that says where it stopped.
+    assert "QUIESCE_JSON" in harness and '"phases"' in harness, (
+        "the harness reports only the blocker summary; a run that aborted before "
+        "identifying any holder would print an empty list and no cause"
+    )
+
+
+def test_the_two_implementations_agree_on_which_phases_are_decisive():
+    script = quiesce_source()
+    from ragtools.upgrade import quiescence as policy
+
+    declared = ps_array(script, "DecisivePhases")
+    assert declared == list(policy.DECISIVE_PHASES), (
+        "the two implementations disagree about which failures abort:\n"
+        f"  PowerShell: {declared}\n  Python:     {list(policy.DECISIVE_PHASES)}"
+    )
 
 
 def test_a_fresh_install_short_circuits_the_whole_protocol():

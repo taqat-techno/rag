@@ -113,6 +113,33 @@ RETRYABLE_PHASES: tuple[str, ...] = (
     PHASE_STOP_ENGINE,
 )
 
+#: Phases whose FAILURE could let the protocol wrongly conclude quiescence, and
+#: which therefore abort it. Everything else is ADVISORY: it is recorded as an
+#: error and the protocol carries on, because the decisive phases still have to
+#: pass before anything proceeds.
+#:
+#: * :data:`PHASE_DETECT` decides whether there is anything to protect at all —
+#:   an error read as "nothing installed" returns ``EXIT_QUIESCENT`` and lets
+#:   Setup delete a *live* installation.
+#: * :data:`PHASE_VERIFY_CLEAR` and :data:`PHASE_PROBE_REPLACEABLE` are the two
+#:   that actually prove the answer.
+#:
+#: This is not a refinement, it is the 3.5.1 defect. ``disable_tasks`` raised on
+#: a scheduled task that was merely not registered, and the whole protocol
+#: aborted *before* ``stop_tray`` — no tray stop, no supervisor stop, no
+#: ``taskkill``, no engine stop. Every upgrade leg refused with the previous
+#: version still serving and all of its processes alive, and the refusal named
+#: an exception where a blocker belonged. A preparatory step failing must never
+#: be able to skip every step that does the work.
+DECISIVE_PHASES: tuple[str, ...] = (
+    PHASE_DETECT,
+    PHASE_VERIFY_CLEAR,
+    PHASE_PROBE_REPLACEABLE,
+)
+
+#: The complement, stated rather than derived at each site.
+ADVISORY_PHASES: tuple[str, ...] = tuple(p for p in PHASES if p not in DECISIVE_PHASES)
+
 #: Exit codes, keyed by the verdict they carry.
 #:
 #: ``0`` and ``2`` are the whole point of moving the protocol into
@@ -599,6 +626,23 @@ class _Run:
         for phase in PHASES[index + 1:]:
             self._record(phase, OUTCOME_SKIPPED, reason)
 
+    def _advisory(self, phase: str, step) -> None:
+        """Run a phase that only HELPS reach quiescence.
+
+        Its failure is recorded and the protocol continues. Nothing is concluded
+        from it: :data:`DECISIVE_PHASES` still have to pass before anything
+        proceeds, so carrying on can only ever lead to a refusal that names a
+        real blocker instead of an abort that names an exception.
+
+        Exactly one record is produced either way — ``step`` records its own on
+        success, and this records the error otherwise.
+        """
+        started = self.ports.clock.now()
+        try:
+            step()
+        except Exception as exc:  # noqa: BLE001 — advisory is what that means
+            self._record(phase, OUTCOME_ERROR, f"{type(exc).__name__}: {exc}", started)
+
     def _expired(self) -> bool:
         return self.ports.clock.now() >= self.deadline
 
@@ -710,10 +754,13 @@ class _Run:
         ``qdrant.exe`` on the machine would be data loss in someone else's
         application caused by installing this one.
         """
-        self._stop_role(PHASE_STOP_TRAY, ROLE_TRAY)
-        self._stop_role(PHASE_STOP_SUPERVISOR, ROLE_SUPERVISOR)
-        self._stop_role(PHASE_STOP_SERVICE_CHILDREN, ROLE_SERVICE)
-        self._stop_role(PHASE_STOP_ENGINE, ROLE_ENGINE)
+        for phase, role in ((PHASE_STOP_TRAY, ROLE_TRAY),
+                            (PHASE_STOP_SUPERVISOR, ROLE_SUPERVISOR),
+                            (PHASE_STOP_SERVICE_CHILDREN, ROLE_SERVICE),
+                            (PHASE_STOP_ENGINE, ROLE_ENGINE)):
+            # Advisory INDIVIDUALLY: one role failing to stop must not cost the
+            # three that would have.
+            self._advisory(phase, lambda p=phase, r=role: self._stop_role(p, r))
 
     def identify_holders(self) -> list[Blocker]:
         started = self.ports.clock.now()
@@ -851,12 +898,17 @@ def run(config: QuiescenceConfig, ports: Ports) -> Verdict:
                 elapsed_seconds=ports.clock.now() - run_state.started,
             )
 
-        run_state.enter_maintenance()
-        run_state.disable_tasks()
+        # Advisory: each of these only HELPS reach quiescence, so one of them
+        # raising is recorded and the rest still run. `verify_clear` and
+        # `probe_replaceable` below are DECISIVE and deliberately are not
+        # wrapped — an error there means the answer is unknown, and unknown
+        # refuses.
+        run_state._advisory(PHASE_MAINTENANCE, run_state.enter_maintenance)
+        run_state._advisory(PHASE_DISABLE_TASKS, run_state.disable_tasks)
         run_state.stop_roles()
-        run_state.identify_holders()
-        run_state.wait_for_exit()
-        run_state.retry()
+        run_state._advisory(PHASE_IDENTIFY_HOLDERS, run_state.identify_holders)
+        run_state._advisory(PHASE_WAIT, run_state.wait_for_exit)
+        run_state._advisory(PHASE_RETRY, run_state.retry)
         process_blockers = run_state.verify_clear()
         # Run regardless of what the process sweep found: fixing one blocker at
         # a time across five failed attempts is a miserable way to upgrade.
@@ -1182,7 +1234,8 @@ __all__ = [
     "REASON_PROCESSES_SURVIVED", "REASON_FILES_NOT_REPLACEABLE",
     "REASON_TIMEOUT", "REASON_INTERNAL_ERROR",
     "BLOCKER_PROCESS", "BLOCKER_FILE",
-    "PHASES", "RESTORE_PHASE", "RETRYABLE_PHASES", "EXIT_CODES",
+    "PHASES", "RESTORE_PHASE", "RETRYABLE_PHASES", "DECISIVE_PHASES",
+    "ADVISORY_PHASES", "EXIT_CODES",
     "EXIT_QUIESCENT", "EXIT_NOT_QUIESCENT", "EXIT_INTERNAL_ERROR",
     "SCHEMA", "VERDICT_KEYS",
     "OUTCOME_OK", "OUTCOME_SKIPPED", "OUTCOME_BLOCKED", "OUTCOME_ERROR",

@@ -124,6 +124,31 @@ $Script:RetryablePhases = @(
     'stop_managed_engine'
 )
 
+# Phases whose FAILURE could let this script wrongly conclude quiescence, and
+# which therefore abort the protocol. Everything else is ADVISORY: an advisory
+# phase that fails is recorded and the protocol carries on, because the decisive
+# phases still have to pass before anything proceeds.
+#
+#   detect_installation  decides whether there is anything to protect at all. An
+#                        error read as "nothing installed" returns exit 0 and
+#                        lets Setup delete a LIVE installation.
+#   verify_clear         is one of the two that actually prove the answer.
+#   probe_replaceable    is the other, and the stronger of the two.
+#
+# This distinction is not decoration; it is the 3.5.1 defect. `disable_tasks`
+# threw on a scheduled task that was merely not registered, `Invoke-Phase`
+# rethrew, and the protocol aborted with `internal_error` BEFORE stop_tray -
+# so no tray stop, no supervisor stop, no taskkill and no engine stop ever ran.
+# All five upgrade legs refused with the previous version still serving and
+# every one of its processes alive, and the refusal named an exception instead
+# of a blocker. One preparatory step failing must never be able to skip every
+# step that does the actual work.
+$Script:DecisivePhases = @(
+    'detect_installation',
+    'verify_clear',
+    'probe_replaceable'
+)
+
 $Script:ExitCodes = @{
     quiescent      = 0
     not_quiescent  = 2
@@ -233,7 +258,13 @@ function Invoke-Phase {
             phase = $Name; outcome = $outcome; detail = $detail
             duration_ms = [int] $watch.Elapsed.TotalMilliseconds; blockers = @()
         })
-        throw
+        # A DECISIVE phase failing means the answer is unknown, and unknown
+        # refuses. An ADVISORY phase failing means one attempt to help did not
+        # work - which proves nothing either way, and must not skip the phases
+        # that do the stopping and the proving. The record above keeps the
+        # failure visible in the verdict regardless.
+        if ($Script:DecisivePhases -contains $Name) { throw }
+        return
     }
     $watch.Stop()
     [void] $Script:PhaseRecords.Add([ordered]@{
@@ -281,6 +312,53 @@ function Invoke-Bounded {
         return 258      # WAIT_TIMEOUT, and never mistaken for a real exit code
     }
     return $proc.ExitCode
+}
+
+function Invoke-Native {
+    <#
+        Run a native command and READ ITS OUTPUT, without its stderr being able
+        to abort this script.
+
+        THIS IS THE 3.5.1 DEFECT, and it is subtle enough to deserve the whole
+        comment. In Windows PowerShell, output a native command writes to stderr
+        is turned into an ErrorRecord as soon as a redirection operator is
+        applied to stream 2 - and with $ErrorActionPreference = 'Stop', that
+        ErrorRecord is TERMINATING. `schtasks /query` writes
+
+            ERROR: The system cannot find the file specified.
+
+        to stderr for a task that is simply not registered, which is the normal
+        case for at least one of $Script:OwnedTasks on EVERY release this
+        upgrades from (`\RAGTools Watchdog` is v2's and v3 removes it; a v2
+        machine has neither `\RAGTools\Service` nor `\RAGTools\Tray`). So the
+        `2>$null` that was there to keep the console quiet turned "this task is
+        not registered" into a RemoteException, `Get-TaskState` never returned
+        'Missing', and disable_tasks aborted the protocol before a single stop
+        phase ran. Reproduced exactly: five upgrade legs, every one exit 7, the
+        previous version still serving with all of its processes alive.
+
+        The preference is neutralised HERE, around the call and nowhere else -
+        every other statement in this script still wants Stop. Both streams are
+        captured so a diagnostic can quote what the command actually said, and a
+        launch failure is reported rather than thrown.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [string] $FilePath,
+        [string[]] $ArgumentList = @()
+    )
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
+    $lines = New-Object System.Collections.ArrayList
+    try {
+        foreach ($item in @(& $FilePath @ArgumentList 2>&1)) {
+            [void] $lines.Add([string] $item)
+        }
+    }
+    catch {
+        return @{ ExitCode = -1; Lines = @(); Failed = $true
+                  Detail = "$($_.Exception.GetType().Name): $($_.Exception.Message)" }
+    }
+    return @{ ExitCode = $LASTEXITCODE; Lines = @($lines); Failed = $false; Detail = '' }
 }
 
 # ---------------------------------------------------------------------------
@@ -514,10 +592,16 @@ function Invoke-EnterMaintenance {
 }
 
 function Get-TaskState {
+    # A task that is not registered is 'Missing' - a fact, not a failure. It is
+    # the EXPECTED answer for at least one of $Script:OwnedTasks on every
+    # release this upgrades from, so it must be returnable. Through Invoke-Native
+    # because `schtasks` announces it on stderr; see that function for what a
+    # bare `2>$null` did here.
     param([string] $Name)
-    $output = & "$env:SystemRoot\System32\schtasks.exe" /query /tn "$Name" /fo list 2>$null
-    if ($LASTEXITCODE -ne 0) { return 'Missing' }
-    foreach ($line in @($output)) {
+    $result = Invoke-Native -FilePath "$env:SystemRoot\System32\schtasks.exe" `
+                            -ArgumentList @('/query', '/tn', $Name, '/fo', 'list')
+    if ($result.Failed -or $result.ExitCode -ne 0) { return 'Missing' }
+    foreach ($line in @($result.Lines)) {
         if ($line -match '^\s*Status:\s*(.+?)\s*$') { return $Matches[1] }
     }
     return 'Unknown'

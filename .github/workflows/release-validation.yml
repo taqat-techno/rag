@@ -512,6 +512,38 @@ jobs:
             --version ${{ steps.version.outputs.version }} `
             --from-version ${{ matrix.from }}
 
+      - name: Collect the upgrade evidence
+        # IMMEDIATELY after the upgrade and BEFORE the uninstall sweep, which
+        # removes the directory these files live in. `if: always()` because the
+        # run worth diagnosing is the one that failed.
+        #
+        # Copied into the workspace rather than uploaded from
+        # %LOCALAPPDATA% directly: the `env` context in a `with:` block does not
+        # expose the runner's OS environment, so the path has to be expanded by
+        # a shell that can see it.
+        if: always()
+        run: |
+          $dest = "upgrade-evidence"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item "$env:LOCALAPPDATA\RAGTools\logs\*" $dest -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item "upgrade-work\inno-*.log" $dest -Force -ErrorAction SilentlyContinue
+          if (Test-Path $dest) {
+            Get-ChildItem $dest -Recurse -File |
+              Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+          }
+
+      - name: Upload the upgrade evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # The quiescence verdict (phases, blockers, task states), the summary
+          # Inno showed, and both Inno logs. A refusal must be diagnosable
+          # without another round trip through CI.
+          name: real-upgrade-${{ matrix.from }}-evidence
+          path: upgrade-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Fire the at-logon tasks the installer just registered
         # Here, and not in a job of its own, because here the tasks are the ones
         # the real installer created — pointing at the real `ragw.exe`. A
