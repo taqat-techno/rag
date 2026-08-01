@@ -21,6 +21,8 @@ Plan: docs/planning/RAG_V3_LOCAL_DEV_IMPLEMENTATION_PLAN.md  (S6 §11 -> G6)
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import sqlite3
 import threading
 import uuid as _uuid
@@ -28,6 +30,28 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("ragtools.registry")
+
+class RegistryIntegrityError(RuntimeError):
+    """A registry whose contents cannot be vouched for refused an operation.
+
+    Raised by the operations that would make an unproven mapping permanent —
+    minting a new project identity, and swapping a project's active collection
+    — while a hold is in force (:meth:`ProjectRegistry.hold`). The hold is armed
+    by :func:`ragtools.registry_integrity.reconcile_startup` when the live
+    registry is not the one the index was built against.
+
+    Re-adoption is deliberately NOT refused: it is the recovery verb, and it
+    only ever restores an identity the collection name already encodes.
+    """
+
+
+#: ``PRAGMA synchronous`` value that fsyncs at every commit. Under WAL the
+#: usual advice is NORMAL (1), which does NOT fsync the WAL on commit: a
+#: committed transaction can be lost to a power failure. That trade is fine for
+#: a cache and wrong for this file — see :meth:`ProjectRegistry.set_active_collection`.
+SYNCHRONOUS_FULL = 2
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -47,11 +71,26 @@ def _connect(db_path: str) -> sqlite3.Connection:
     # "database is locked".
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    # FULL, not the WAL-default NORMAL. Registry writes are rare (add, rename,
+    # move, mode, swap) so the fsync costs nothing measurable, and this file is
+    # the only record of which collection holds a project's vectors: a commit
+    # lost to a power cut points the project back at the collection the rebuild
+    # was replacing, with no way to tell from the data which one is current.
+    conn.execute(f"PRAGMA synchronous={SYNCHRONOUS_FULL}")
     return conn
+
+
+def _synchronous_level(conn: sqlite3.Connection) -> int:
+    """What ``PRAGMA synchronous`` is *actually* set to on this connection."""
+    row = conn.execute("PRAGMA synchronous").fetchone()
+    if row is None:
+        return -1
+    return int(row[0])
 
 from ragtools.identity import (
     framework_collection_name,
     project_collection_name,
+    project_uuid_from_collection_name,
     validate_project_id,
 )
 
@@ -81,6 +120,13 @@ class ProjectRegistry:
         # Serialises every use of the connection. The relaxed
         # check_same_thread in _connect is only safe because of this lock.
         self._lock = threading.RLock()
+        #: Why identity-creating writes are refused, or "" when they are not.
+        #: In memory on purpose: it is a statement about THIS process's belief,
+        #: re-derived from the state DB at every start by
+        #: ``registry_integrity.reconcile_startup``. Persisting it would
+        #: outlive the evidence and leave an install wedged with no file to
+        #: point at.
+        self._hold_reason = ""
         self._conn = _connect(db_path)
         self._conn.execute(
             """
@@ -115,6 +161,45 @@ class ProjectRegistry:
             self._conn.execute(
                 "ALTER TABLE projects ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
 
+    # -- integrity hold -------------------------------------------------
+
+    def hold(self, reason: str) -> None:
+        """Refuse identity-creating writes until :meth:`release_hold`.
+
+        Armed when this installation cannot prove the live registry is the one
+        its index was built against. Two operations are then refused:
+
+        * ``add`` — minting a fresh UUID for a project that already has a
+          collection full of its vectors is how a recoverable loss becomes a
+          permanent one (N empty ``proj_<hex>`` beside the N that hold the
+          data);
+        * ``set_active_collection`` — repointing a project while it is unclear
+          which collection currently holds it writes the confusion down.
+
+        Reads, renames, moves, mode changes and re-adoption stay available: a
+        held registry must still be *diagnosable* and *recoverable*, or the
+        guard becomes the outage.
+        """
+        self._hold_reason = str(reason or "registry integrity is unresolved")
+
+    def release_hold(self) -> None:
+        """Clear the hold. Idempotent."""
+        self._hold_reason = ""
+
+    @property
+    def hold_reason(self) -> str:
+        """Why writes are held, or "" when they are not."""
+        return getattr(self, "_hold_reason", "")
+
+    def _assert_writable(self, operation: str) -> None:
+        reason = self.hold_reason
+        if reason:
+            raise RegistryIntegrityError(
+                f"refusing to {operation}: {reason}. Nothing has been deleted; "
+                f"re-adopt the existing collections or restore registry.db, then "
+                f"reconcile."
+            )
+
     # -- reads ----------------------------------------------------------
 
     def get(self, project_id: str) -> Optional[ProjectRecord]:
@@ -124,6 +209,19 @@ class ProjectRegistry:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        return self._record(row) if row else None
+
+    def get_by_uuid(self, project_uuid: str) -> Optional[ProjectRecord]:
+        """Look a project up by its immutable identity.
+
+        Needed by re-adoption: a collection name carries a UUID, and before
+        reattaching it to a project we must know whether some *other* project
+        already holds that identity.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM projects WHERE uuid = ?", (str(project_uuid),)
             ).fetchone()
         return self._record(row) if row else None
 
@@ -148,6 +246,10 @@ class ProjectRegistry:
     ) -> ProjectRecord:
         """Register a project: validate the id, mint a UUID, derive the collection."""
         pid = validate_project_id(project_id)
+        # A fresh uuid4 here is a fresh, EMPTY collection. That is right for a
+        # genuinely new project and catastrophic for one whose registry row was
+        # merely lost, so it is refused while integrity is unresolved.
+        self._assert_writable(f"mint a new identity for project {pid!r}")
         if self.get(pid) is not None:
             raise ValueError(f"project id {pid!r} already exists")
         u = str(_uuid.uuid4())
@@ -241,8 +343,32 @@ class ProjectRegistry:
         The caller must have VERIFIED the new collection first. Nothing here
         can tell whether the replacement is any good; this only makes the
         handover atomic once it is.
+
+        Atomic is not the same as durable, and v3.5.0 bought only the first.
+        Two things are therefore proven rather than assumed:
+
+        * the connection really is fsyncing at commit (``PRAGMA synchronous``
+          is re-checked here, not merely set at open — one ``PRAGMA`` on a
+          reused connection is all it takes to silently downgrade this file to
+          "probably written");
+        * the row really changed, read back after the commit. The read-back is
+          on the same connection, so it proves the write landed in the database
+          rather than in a lost cursor; ``synchronous=FULL`` is what carries it
+          to the platter.
+
+        A swap that cannot be proven raises. The caller has just built and
+        verified a replacement collection; failing loudly leaves it standing and
+        the project on its old one, which is recoverable. Returning as if the
+        flip happened is not.
         """
         with self._lock:
+            # Ownership before durability: fsyncing a pointer nobody can vouch
+            # for only makes the wrong answer permanent. This is also the guard
+            # WP-R03's reaper consults before it may consider a collection
+            # orphaned — see `registry_integrity.assert_reaping_allowed`.
+            self._assert_writable(
+                f"swap the active collection of project {project_uuid!r}")
+            self._assert_durable()
             cur = self._conn.execute(
                 "UPDATE projects SET collection_name = ?, generation = ? WHERE uuid = ?",
                 (collection_name, int(generation), project_uuid),
@@ -252,7 +378,86 @@ class ProjectRegistry:
             self._conn.commit()
             row = self._conn.execute(
                 "SELECT * FROM projects WHERE uuid = ?", (project_uuid,)).fetchone()
-        return self._record(row)
+        if row is None:
+            raise RuntimeError(
+                f"the collection swap for {project_uuid!r} committed but the row "
+                f"is gone; the registry cannot be trusted"
+            )
+        rec = self._record(row)
+        if rec.collection_name != collection_name or rec.generation != int(generation):
+            raise RuntimeError(
+                f"the collection swap for {project_uuid!r} did not land: expected "
+                f"{collection_name!r} generation {int(generation)}, read back "
+                f"{rec.collection_name!r} generation {rec.generation}"
+            )
+        return rec
+
+    def _assert_durable(self) -> None:
+        """Re-establish and verify ``PRAGMA synchronous`` before a swap.
+
+        Called with ``self._lock`` held. Re-applying is cheap and idempotent;
+        verifying is the point, because "we set it at open" is exactly the kind
+        of claim that stays true until something else on the connection changes
+        it.
+        """
+        level = _synchronous_level(self._conn)
+        if level >= SYNCHRONOUS_FULL:
+            return
+        self._conn.execute(f"PRAGMA synchronous={SYNCHRONOUS_FULL}")
+        level = _synchronous_level(self._conn)
+        if level < SYNCHRONOUS_FULL:
+            raise RuntimeError(
+                f"refusing to swap a collection on a registry that does not "
+                f"fsync: PRAGMA synchronous is {level}, expected "
+                f">= {SYNCHRONOUS_FULL} (FULL)"
+            )
+
+    def _readopt(
+        self,
+        project_id: str,
+        project_uuid: str,
+        collection_name: str,
+        *,
+        path: str,
+        display_name: Optional[str],
+        mode: str,
+        generation: int,
+    ) -> ProjectRecord:
+        """Insert-or-update the row that reattaches a project to a collection.
+
+        Private: the public entry point is :func:`readopt_collection`, which
+        owns the checks that make the reattachment legitimate.
+        """
+        existing = self.get(project_id)
+        with self._lock:
+            self._assert_durable()
+            if existing is None:
+                self._conn.execute(
+                    "INSERT INTO projects (uuid, project_id, display_name, path, "
+                    "mode, collection_name, created_at, archived, generation) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                    (project_uuid, project_id, display_name or project_id, path,
+                     mode, collection_name,
+                     datetime.now(timezone.utc).isoformat(), int(generation)),
+                )
+            else:
+                # In place, keyed by the id we were asked to reattach. The uuid
+                # moves to the one the collection encodes — that is the whole
+                # operation: identity follows the data, not the other way round.
+                self._conn.execute(
+                    "UPDATE projects SET uuid = ?, display_name = ?, path = ?, "
+                    "mode = ?, collection_name = ?, generation = ? "
+                    "WHERE project_id = ?",
+                    (project_uuid, display_name or existing.display_name, path,
+                     mode, collection_name, int(generation), project_id),
+                )
+            self._conn.commit()
+        rec = self.get_by_uuid(project_uuid)
+        if rec is None or rec.collection_name != collection_name:
+            raise RuntimeError(
+                f"re-adoption of {collection_name!r} by {project_id!r} did not land"
+            )
+        return rec
 
     def close(self) -> None:
         """Release the SQLite connection. Idempotent.
@@ -298,20 +503,157 @@ class ProjectRegistry:
         )
 
 
+def project_mapping(registry: "ProjectRegistry") -> dict[str, str]:
+    """``project_id -> collection_name`` for every project, archived included.
+
+    The thing the fingerprint digests, kept available undigested because the
+    interesting questions ("which project moved?", "did the restore bring back
+    the same mapping?") cannot be answered from a hash.
+    """
+    return {rec.project_id: rec.collection_name
+            for rec in registry.list(include_archived=True)}
+
+
+def registry_fingerprint(registry: "ProjectRegistry") -> str:
+    """A stable digest of the whole ``project_id -> collection_name`` mapping.
+
+    **This is a GLOBAL INTEGRITY signal — "is this the same registry?" — and
+    nothing else.** Its consumers are registry corruption / replacement /
+    rollback detection, backup and restore validation, degraded health
+    reporting, the block on unsafe pointer swaps and orphan reaping, and
+    startup reconciliation.
+
+    It is deliberately NOT an input to per-project invalidation, and the first
+    R06 shipping it as one is the defect this refinement repairs: because the
+    digest covers every project, adding the sixteenth changed it, the state DB
+    was declared untrustworthy wholesale, and the fifteen already-indexed
+    projects were re-embedded for a change that moved none of them. "Is THIS
+    project's mapping still valid?" is answered per project by
+    :class:`ragtools.index_identity.ProjectIdentity`.
+
+    Properties it needs, and why:
+
+    * **Archived projects count.** ``archive`` keeps both the row and the
+      vectors, so an archived project's collection is still part of the
+      mapping. Excluding them would make archiving invalidate the whole state
+      DB and re-embed the corpus for a change that moved nothing.
+    * **Sorted.** Row order is an implementation detail of SQLite; the mapping
+      is a set.
+    * **Empty is "".** No projects means there is nothing to be wrong about,
+      and "" is already the "unknown" value — an install with an empty registry
+      and one with no registry at all should behave identically.
+
+    A change here means *the mapping is not the one recorded* — no more than
+    that. It says nothing about WHICH project moved, or whether anything moved
+    at all: a project merely appearing changes it too. Turning that unqualified
+    signal into a skip decision is the fused reading; ask
+    :func:`ragtools.registry_integrity.evaluate`, which localises the change
+    against the per-project rows and can tell an addition from a rollback.
+    """
+    pairs = sorted(
+        (rec.project_id, rec.collection_name)
+        for rec in registry.list(include_archived=True)
+    )
+    if not pairs:
+        return ""
+    payload = "\x1e".join(f"{pid}\x1f{coll}" for pid, coll in pairs)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def owns_collection(registry: "ProjectRegistry", collection_name: str) -> bool:
+    """Did THIS installation create ``collection_name``? Proven, not guessed.
+
+    True only when some row's ``collection_name`` is exactly this name.
+    ``proj_<32hex>`` is a *shape*: another installation sharing a managed engine
+    produces collections that match it perfectly, and this installation's
+    registry is the only thing that knows which of them are its own.
+
+    The project has made the opposite mistake once already —
+    ``obsolete_collections`` computed ``existing - current`` and handed the
+    result to a caller that deletes, which on a shared engine is another
+    install's entire index. Deciding by prefix or regex is the same error with
+    a friendlier face.
+    """
+    if not collection_name:
+        return False
+    name = str(collection_name).strip()
+    return any(rec.collection_name == name
+               for rec in registry.list(include_archived=True))
+
+
+def readopt_collection(
+    registry: "ProjectRegistry",
+    project_id: str,
+    collection_name: str,
+    *,
+    path: str,
+    display_name: Optional[str] = None,
+    mode: str = "docs",
+    generation: int = 0,
+) -> ProjectRecord:
+    """Reattach an existing collection to a project, PRESERVING its identity.
+
+    The recovery half of R06. When ``registry.db`` is lost, the collections are
+    not: their names still encode the UUIDs they were derived from. Re-adoption
+    reads the UUID back out of the name (:func:`ragtools.identity.project_uuid_from_collection_name`)
+    and rebuilds the row around it, so the project points at the vectors it
+    already has. ``registry.add`` would mint a fresh uuid4 instead, creating an
+    empty collection beside the full one — which is precisely how a recoverable
+    loss becomes a permanent one.
+
+    Nothing is deleted here, and nothing is stolen: re-adopting a collection
+    that another project already holds is refused, because two rows pointing at
+    one collection is a merge nobody asked for.
+    """
+    pid = validate_project_id(project_id)
+    # Raises InvalidProjectId for anything that is not proj_<32 hex>. A name we
+    # cannot invert is a name whose identity we would be inventing.
+    project_uuid = project_uuid_from_collection_name(collection_name)
+    canonical = project_collection_name(project_uuid)
+
+    holder = registry.get_by_uuid(project_uuid)
+    if holder is not None and holder.project_id != pid:
+        raise ValueError(
+            f"collection {canonical!r} already belongs to project "
+            f"{holder.project_id!r}; refusing to reattach it to {pid!r}"
+        )
+    existing = registry.get(pid)
+    if existing is not None and existing.collection_name != canonical:
+        logger.warning(
+            "re-adopting %s for project %s; its previous collection %s is left "
+            "in place (nothing here deletes)",
+            canonical, pid, existing.collection_name,
+        )
+    return registry._readopt(
+        pid, project_uuid, canonical,
+        path=path, display_name=display_name, mode=mode, generation=generation,
+    )
+
+
 def sync_projects_from_config(configs, registry: "ProjectRegistry") -> dict:
     """Populate ``registry`` from the live TOML project configs, idempotently.
 
     Each config (anything with ``id`` / ``path`` and optional ``mode`` / ``name``)
     that is new is added; an existing one whose path or mode changed is updated
     in place — UUID and collection are preserved (§11.2), because identity is the
-    UUID, not the path. Returns ``{added, updated, unchanged}`` counts.
+    UUID, not the path. Returns ``{added, updated, unchanged, blocked}``.
 
     This is the safe first step of the collection-per-project migration: it makes
     the registry mirror the live projects WITHOUT changing the search path or
     creating per-project collections. Nothing here reverses the single-collection
     model — that switch is a separate, deliberate act.
+
+    **A refused mint is reported, never raised and never silent.** This function
+    runs at boot for every configured project, so a lost registry.db would send
+    it down the "new project" branch for all of them at once — which is exactly
+    the case where minting a fresh uuid4 produces N empty collections beside the
+    N that hold the data. While the registry is held (see
+    :meth:`ProjectRegistry.hold`) those projects are listed in ``blocked``
+    instead: the boot completes, the projects are visibly absent rather than
+    invisibly empty, and ``readopt_collection`` can still reclaim them.
     """
     added = updated = unchanged = 0
+    blocked: list[str] = []
     for cfg in configs:
         pid = cfg.id
         mode = getattr(cfg, "mode", "docs") or "docs"
@@ -319,7 +661,13 @@ def sync_projects_from_config(configs, registry: "ProjectRegistry") -> dict:
         name = getattr(cfg, "name", None)
         existing = registry.get(pid)
         if existing is None:
-            registry.add(pid, path=path, display_name=name, mode=mode)
+            try:
+                registry.add(pid, path=path, display_name=name, mode=mode)
+            except RegistryIntegrityError as exc:
+                blocked.append(pid)
+                logger.error(
+                    "Not registering project %r: %s", pid, exc)
+                continue
             added += 1
             continue
         changed = False
@@ -331,7 +679,8 @@ def sync_projects_from_config(configs, registry: "ProjectRegistry") -> dict:
             changed = True
         updated += 1 if changed else 0
         unchanged += 0 if changed else 1
-    return {"added": added, "updated": updated, "unchanged": unchanged}
+    return {"added": added, "updated": updated, "unchanged": unchanged,
+            "blocked": blocked}
 
 
 class FrameworkLinkError(RuntimeError):

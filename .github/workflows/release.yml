@@ -8,8 +8,18 @@ permissions:
   contents: write
 
 jobs:
+  # Every job here is bounded — see the header of release-validation.yml for the
+  # incident. A tag build that hangs is worse than one that fails: it holds the
+  # run open, and GitHub seals the run's job logs until it completes, so a stuck
+  # job hides why a sibling job failed.
+  #
+  # The headroom is deliberately generous on this workflow specifically: a
+  # timeout that kills a HEALTHY release build costs a re-tag, so these sit at
+  # roughly 2.5x observed rather than the 2x used for validation.
   build-windows:
     runs-on: windows-latest
+    # observed ~25 min: full suite + model download + PyInstaller + Inno Setup.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -112,7 +122,13 @@ jobs:
             dist/RAGTools-${{ steps.version.outputs.version }}-portable.zip
 
   build-macos:
+    # macOS ARM64 only, and that is the whole macOS story for a release: this is
+    # the only macOS job and `RAGTools-<version>-macOS-arm64.zip` below is the
+    # only macOS asset. There is no Intel x86_64 build and no Intel artifact, so
+    # macOS Intel is a best-effort target, not a shipped one — the policy
+    # release-validation.yml now states.
     runs-on: macos-14
+    timeout-minutes: 45          # observed 15-20 min
 
     steps:
       - uses: actions/checkout@v4
@@ -187,6 +203,7 @@ jobs:
 
   build-linux:
     runs-on: ubuntu-22.04
+    timeout-minutes: 45          # observed 15-20 min
 
     steps:
       - uses: actions/checkout@v4

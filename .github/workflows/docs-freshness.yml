@@ -25,6 +25,10 @@ jobs:
   audit:
     name: Audit freshness
     runs-on: ubuntu-latest
+    # Finite by policy — see the header of release-validation.yml. A scheduled
+    # job with no timeout is the easiest one to leave hanging, because nobody is
+    # watching the month it happens.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 

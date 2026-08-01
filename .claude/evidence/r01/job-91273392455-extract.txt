@@ -1,0 +1,80 @@
+# Trimmed extract of release-validation run 30666102565, job 91273392455
+# (packaged v3.3.0 -> candidate, windows-latest). Full 3.16 MB log kept locally,
+# not committed. Extraction: verify_upgrade_install.py narrative + teardown.
+
+2026-07-31T21:29:45.1660107Z >>> installing v3.3.0: RAGTools-Setup-3.3.0.exe
+2026-07-31T21:31:18.6291105Z     exit=0
+2026-07-31T21:31:18.9902021Z   [PASS] previous release installed (3.3.0) � ragtools v3.3.0
+2026-07-31T21:31:18.9902532Z   [PASS] previous uninstall registry entry � 3.3.0
+2026-07-31T21:31:19.6504036Z   [PASS] previous release is serving � {"status": "ready", "migration": null, "collection": "markdown_kb", "version": "3.3.0", "watcher_running": false, "storage_reachable": true, "storage_error": "", "engine": {"state": "ready", "pid": 1264, "exit_code": null, "restart_attempt": 0, "max_restarts": 3, "uptime_seconds": 6.104046106338501, "died_at": null, "detail": "managed engine ready on http://127.0.0.1:21500", "log_path": "C:\\Users\\runneradmin\\AppData\\Local\\RAGTools\\data\\logs\\qdrant.log", "log_error": "", "available": true, "history": [{"at": 1785533472.7120812, "state": "starting", "detail": "starting the managed engine", "pid": null, "exit_code": null, "attempt": 0}, {"at": 1785533473.5437534, "state": "ready", "detail": "managed engine ready on http://127.0.0.1:21500", "pid": 1264, "exit_code": null, "attempt": 0}]}, "storage_degraded_reason": "", "degraded": true, "issues": ["watcher_not_running"], "storage_backend": "managed", "collection_strategy": "per_project", "config_version": 3, "config_state": "configuration already current"}
+2026-07-31T21:31:19.9940851Z   [PASS] previous release has live processes holding its binaries � 3 process(es)
+2026-07-31T21:31:19.9961250Z >>> installing v3.5.0 (over v3.3.0): RAGTools-Setup-3.5.0.exe
+2026-07-31T21:31:45.2685053Z     exit=5
+2026-07-31T21:31:45.2686679Z --- Inno log for v3.5.0 (over v3.3.0) (last 120 of 1 lines) ---
+2026-07-31T21:31:45.2701766Z --- end Inno log ---
+2026-07-31T21:31:45.2702167Z   [FAIL] the upgrade installer exited 0 � exit 5
+2026-07-31T21:31:45.2849605Z   [FAIL] rag.exe reports 3.5.0 � [PYI-2072:ERROR] Failed to load Python DLL 'C:\Users\runneradmin\AppData\Local\Programs\RAGTools\_internal\python312.dll'.
+2026-07-31T21:31:45.2850939Z   [PASS] ragw.exe was installed � C:\Users\runneradmin\AppData\Local\Programs\RAGTools\ragw.exe
+2026-07-31T21:31:45.2852356Z   [FAIL] uninstall registry entry updated � registry reads 3.3.0
+2026-07-31T21:31:45.6135901Z   [PASS] no owned process runs from outside the install directory � all inside C:\Users\runneradmin\AppData\Local\Programs\RAGTools
+2026-07-31T21:31:46.7069241Z   [PASS] scheduled tasks point into the install directory � {'Tray': 'C:\\Users\\runneradmin\\AppData\\Local\\Programs\\RAGTools\\ragw.exe'}
+2026-07-31T21:31:47.3658993Z   [PASS] no browser was opened by the mandatory service start � none
+2026-07-31T21:36:55.6912598Z   [FAIL] the service answers after the upgrade � nothing responded within 300s � the state below cannot be read
+2026-07-31T21:37:13.7388447Z     service stopped answering during the rebuild
+2026-07-31T21:37:36.7785592Z     service stopped answering during the rebuild
+2026-07-31T21:37:59.8301186Z     service stopped answering during the rebuild
+2026-07-31T21:38:22.8456791Z     service stopped answering during the rebuild
+2026-07-31T21:38:45.9054561Z     service stopped answering during the rebuild
+2026-07-31T21:39:08.9259642Z     service stopped answering during the rebuild
+2026-07-31T21:39:31.9587612Z     service stopped answering during the rebuild
+2026-07-31T21:39:54.9985939Z     service stopped answering during the rebuild
+2026-07-31T21:40:18.0315682Z     service stopped answering during the rebuild
+2026-07-31T21:40:41.0623523Z     service stopped answering during the rebuild
+2026-07-31T21:41:04.0797767Z     service stopped answering during the rebuild
+2026-07-31T21:41:27.0911546Z     service stopped answering during the rebuild
+2026-07-31T21:41:50.1087410Z     service stopped answering during the rebuild
+2026-07-31T21:42:13.1220339Z     service stopped answering during the rebuild
+2026-07-31T21:42:36.1377901Z     service stopped answering during the rebuild
+2026-07-31T21:42:59.1559187Z     service stopped answering during the rebuild
+2026-07-31T21:43:22.1882440Z     service stopped answering during the rebuild
+2026-07-31T21:43:45.2089665Z     service stopped answering during the rebuild
+2026-07-31T21:44:08.4153494Z     service stopped answering during the rebuild
+2026-07-31T21:44:31.4601592Z     service stopped answering during the rebuild
+2026-07-31T21:44:54.5078782Z     service stopped answering during the rebuild
+2026-07-31T21:45:17.5756381Z     service stopped answering during the rebuild
+2026-07-31T21:45:40.5950071Z     service stopped answering during the rebuild
+2026-07-31T21:46:03.6107258Z     service stopped answering during the rebuild
+2026-07-31T21:46:26.6599364Z     service stopped answering during the rebuild
+2026-07-31T21:46:49.6906638Z     service stopped answering during the rebuild
+2026-07-31T21:47:12.7621781Z     service stopped answering during the rebuild
+2026-07-31T21:47:35.8050645Z     service stopped answering during the rebuild
+2026-07-31T21:47:58.8218876Z     service stopped answering during the rebuild
+2026-07-31T21:48:21.8544614Z     service stopped answering during the rebuild
+2026-07-31T21:48:44.8725573Z     service stopped answering during the rebuild
+2026-07-31T21:49:07.9000628Z     service stopped answering during the rebuild
+2026-07-31T21:49:30.9138918Z     service stopped answering during the rebuild
+2026-07-31T21:49:53.9496383Z     service stopped answering during the rebuild
+2026-07-31T21:50:16.9687218Z     service stopped answering during the rebuild
+2026-07-31T21:50:40.0056972Z     service stopped answering during the rebuild
+2026-07-31T21:51:03.0393848Z     service stopped answering during the rebuild
+2026-07-31T21:51:26.0859303Z     service stopped answering during the rebuild
+2026-07-31T21:51:49.1023959Z     service stopped answering during the rebuild
+2026-07-31T21:52:12.1305338Z     service stopped answering during the rebuild
+2026-07-31T21:52:16.7462587Z Traceback (most recent call last):
+2026-07-31T21:52:16.7522520Z KeyboardInterrupt
+2026-07-31T21:54:25.5721807Z   [PASS] the wheel builds — ragtools-3.5.0-py3-none-any.whl
+2026-07-31T21:54:25.5722338Z   [PASS] it installs into a clean interpreter
+2026-07-31T21:54:25.5722842Z   [PASS] entry points are created — rag-mcp.exe, rag.exe
+2026-07-31T21:54:25.5723413Z   [PASS] the installed artifact imports and resolves its platform — 3.5.0
+2026-07-31T21:54:25.5723958Z   [PASS] uninstall succeeds
+2026-07-31T21:54:25.5724206Z   [PASS] the package is no longer importable
+2026-07-31T21:54:25.5724544Z   [PASS] entry points are removed — none
+2026-07-31T21:54:25.5724916Z   [PASS] no package directory survives — site-packages clean
+2026-07-31T21:54:25.5725624Z   [PASS] the data directory is left alone — an uninstaller that destroys a rebuilt index is doing something the user did not ask for
+2026-07-31T21:54:25.5726291Z   [PASS] a fresh scan finds no installation — 0 finding(s)
+2026-07-31T21:54:25.5726613Z   [PASS] a fresh scan finds no registrations
+2026-07-31T21:54:25.5726911Z   [PASS] a fresh scan finds no product PATH entries
+2026-07-31T21:54:25.5727483Z   [PASS] the sandbox itself is removed — C:\Users\RUNNER~1\AppData\Local\Temp\ragtools-uninstall-svh_n8eh
+2026-07-31T21:54:28.4949626Z Cleaning up orphan processes
+2026-07-31T21:54:28.5892872Z Terminate orphan process: pid (1264) (qdrant)
+2026-07-31T21:54:28.5971732Z Terminate orphan process: pid (1688) (conhost)

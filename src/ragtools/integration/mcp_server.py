@@ -150,12 +150,15 @@ def _initialize() -> None:
                 _mode = "proxy"
                 # Share the session id between the core tools and the ops
                 # tools so audit-log entries from both carry the same id.
-                from ragtools.integration.mcp_common import MCP_SESSION_HEADER, _new_session_id
+                from ragtools.integration.mcp_common import _new_session_id, proxy_headers
                 _session_id = _new_session_id() if _session_id is None else _session_id
                 _http_client = httpx.Client(
                     base_url=f"http://{_settings.service_host}:{_settings.service_port}",
                     timeout=httpx.Timeout(5.0, read=120.0),
-                    headers={MCP_SESSION_HEADER: _session_id},
+                    # Carries the client-profile id when one is configured, so
+                    # the service re-checks authorization for itself rather than
+                    # trusting that this process already did.
+                    headers=proxy_headers(_session_id),
                 )
                 _init_error = None
                 logger.info("MCP initialized in PROXY mode (service at %s:%d)",
@@ -962,6 +965,13 @@ def add_project_ignore_rule(project: str, pattern: str) -> dict:
         project: Project ID.
         pattern: Gitignore-style pattern.
     """
+    # The capability check comes FIRST. Through v3.5.0 this tool (and its
+    # `remove` twin) enforced only the cooldown — a rate limit is not an
+    # authorization decision, so a retrieval-only client could shrink another
+    # client's index one pattern at a time, at a polite pace.
+    _cap = _ops_capability_error("add_project_ignore_rule")
+    if _cap is not None:
+        return _cap
     gate = _cooldown_guard("add_project_ignore_rule")
     if gate is not None:
         return gate
@@ -985,6 +995,9 @@ def remove_project_ignore_rule(project: str, pattern: str) -> dict:
         project: Project ID.
         pattern: Pattern to remove (exact match).
     """
+    _cap = _ops_capability_error("remove_project_ignore_rule")
+    if _cap is not None:
+        return _cap
     gate = _cooldown_guard("remove_project_ignore_rule")
     if gate is not None:
         return gate
@@ -1399,17 +1412,26 @@ def _direct_dev_search(
     project = None
 
     client = None
+    router = None
     try:
         # Fail-closed (S1/A2): dev-search bypasses the owner, so enforce scope
         # here too — an unscoped/empty scope is refused, never widened.
         resolve_scope(project, projects, allow_unscoped=False)
 
+        from ragtools.collection_router import build_router
         from ragtools.retrieval.dev_pipeline import dev_search
         from ragtools.retrieval.formatter import format_dev_context
         from ragtools.retrieval.searcher import Searcher
 
         client = _get_direct_client()
-        searcher = Searcher(client=client, encoder=_encoder, settings=_settings)
+        # Same routing as the service's /api/dev-search, for the same reason:
+        # an unrouted dev search under per_project reads nothing and reports it
+        # as "no matches".
+        router, _reg, _fw = build_router(_settings)
+        searcher = Searcher(client=client, encoder=_encoder, settings=_settings,
+                            collections=router.read_collections(
+                                project_id=project, project_ids=projects),
+                            router=router)
         outcome = dev_search(
             searcher, query,
             project_id=project, project_ids=projects, top_k=top_k,
@@ -1423,6 +1445,8 @@ def _direct_dev_search(
         logger.exception("dev-search failed")
         return f"[RAG ERROR] dev-search failed: {e}"
     finally:
+        if router is not None:
+            router.close()
         if client:
             del client
 
@@ -1472,19 +1496,30 @@ def _direct_find_definition(symbol: str, project: str | None, top_k: int) -> str
             _errcodes.SCOPE_UNRESOLVED, False, symbol)
 
     client = None
+    router = None
     try:
+        from ragtools.collection_router import build_router
         from ragtools.retrieval.codegraph import find_definitions
         from ragtools.retrieval.formatter import format_definitions
         from ragtools.retrieval.searcher import Searcher
 
         client = _get_direct_client()
-        searcher = Searcher(client=client, encoder=_encoder, settings=_settings)
+        router, _reg, _fw = build_router(_settings)
+        # A symbol may be defined in the project or in a framework it links —
+        # both, and only those, as the service's code graph already reads.
+        collections = router.read_collections(project_id=project)
+        searcher = Searcher(client=client, encoder=_encoder, settings=_settings,
+                            collections=collections, router=router)
+        searcher.definition_collections = collections
+        searcher.collection_scoped = router.is_per_project
         defs = find_definitions(searcher, symbol, project_id=project, top_k=top_k)
         return format_definitions(symbol, defs)
     except Exception as e:
         logger.exception("find_definition failed")
         return f"[RAG ERROR] find_definition failed: {e}"
     finally:
+        if router is not None:
+            router.close()
         if client:
             del client
 
@@ -1676,12 +1711,21 @@ def _direct_search(
     project = None      # the authorized list is now the only scope that counts
 
     client = None
+    router = None
     try:
+        from ragtools.collection_router import build_router
         from ragtools.retrieval.formatter import format_context_compact
         from ragtools.retrieval.searcher import Searcher
 
         client = _get_direct_client()
-        searcher = Searcher(client=client, encoder=_encoder, settings=_settings)
+        # Route it exactly as the service does. A bare Searcher falls back to
+        # the legacy single-collection name, which under per_project names
+        # nothing that exists — so direct mode answered "no matches" for a
+        # fully indexed machine, while the same query through the service
+        # returned hits. Two surfaces, opposite answers.
+        router, _reg, _fw = build_router(_settings)
+        searcher = Searcher(client=client, encoder=_encoder, settings=_settings,
+                            router=router)
 
         results = searcher.search(
             query=query,
@@ -1692,6 +1736,9 @@ def _direct_search(
             # Fail-closed (S1/A2): MCP-direct refuses an unscoped/empty scope
             # just like the service path — no silent global search.
             allow_unscoped=False,
+            collections=router.read_collections(project_id=project,
+                                                project_ids=projects),
+            collection_scoped=router.is_per_project,
         )
         context = format_context_compact(results, query)
         if structured:
@@ -1705,6 +1752,12 @@ def _direct_search(
                         "file_path": r.file_path,
                         "project_id": r.project_id,
                         "headings": r.headings,
+                        # Which source answered. The service surface has carried
+                        # this since the label existed; direct mode dropped it,
+                        # so the same hit was framework-attributed on one
+                        # surface and unattributed on the other.
+                        "scope": r.scope,
+                        "scope_source": r.scope_source,
                     }
                     for r in results
                 ],
@@ -1738,6 +1791,10 @@ def _direct_search(
             }
         return f"[RAG ERROR] Search failed: {e}"
     finally:
+        # The router owns SQLite handles; on Windows a leaked one keeps the
+        # registry file locked.
+        if router is not None:
+            router.close()
         if client:
             del client
 

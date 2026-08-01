@@ -8,6 +8,14 @@ on:
 
 jobs:
   test:
+    # Finite by policy — see the header of release-validation.yml. A job with no
+    # timeout can sit unstarted forever, and because GitHub seals a run's job
+    # logs until the run completes, one such job withholds the logs of every
+    # other job in the run, including the ones that actually failed.
+    #
+    # The same suite as release-validation's `suite` (observed 11-25 min) plus
+    # coverage instrumentation and a cached model download.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -61,7 +69,20 @@ jobs:
         run: python scripts/check_qdrant_compat.py
 
       - name: Run tests
-        run: pytest --cov=ragtools --cov-report=term-missing -q
+        run: >
+          pytest --cov=ragtools --cov-report=term-missing -q
+          --junitxml=junit-suite.xml
+
+      - name: No release-blocking test may report `skipped`
+        # The same gate release-validation's `suite` job runs, on every push and
+        # pull request rather than only on a release path. The rule has to be
+        # uniform or it is not a rule: a suite guarded in one workflow and
+        # unguarded in another is a suite where a new silent skip has somewhere
+        # to land. See scripts/check_no_silent_skips.py for what "silent" cost.
+        if: always()
+        run: >
+          python scripts/check_no_silent_skips.py
+          --suite full-suite --junit junit-suite.xml
 
       - name: Verify CLI
         run: rag version

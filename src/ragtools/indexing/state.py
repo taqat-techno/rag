@@ -103,6 +103,26 @@ class IndexState:
         )
         self.conn.commit()
 
+    def get_meta_prefix(self, prefix: str) -> dict[str, str]:
+        """Every ``index_meta`` row whose key starts with ``prefix``.
+
+        The store's identity used to be exactly one row, so a point read was
+        enough. Per-project collection identity is one row PER PROJECT (R06
+        refinement), and the question "which projects does this state DB
+        describe" has to be answerable without a registry — that is precisely
+        the case where the registry was lost.
+        """
+        rows = self.conn.execute(
+            "SELECT key, value FROM index_meta WHERE key LIKE ? ESCAPE '\\'",
+            (prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",),
+        ).fetchall()
+        return {row["key"]: row["value"] for row in rows}
+
+    def delete_meta(self, key: str) -> None:
+        """Forget one ``index_meta`` row. Idempotent."""
+        self.conn.execute("DELETE FROM index_meta WHERE key = ?", (key,))
+        self.conn.commit()
+
     def _migrate_schema(self) -> None:
         """Check and migrate the SQLite schema version.
 

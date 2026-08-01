@@ -26,9 +26,29 @@ Layout
     data/backups/
       20260418_013045_rebuild/
         index_state.db        (full SQLite backup)
+        registry.db           (per-project layout only; absent under `shared`)
         manifest.json         ({timestamp, trigger, size, ...})
       20260418_015012_project_remove/
         ...
+
+Why registry.db is here (R06)
+-----------------------------
+Under `collection_strategy = "per_project"` the registry says which collection
+holds each project's vectors, so losing it loses the index just as thoroughly as
+losing the state DB — the collections survive, but nothing knows whose they are.
+
+This is SUPPORTING, not the fix. A restored registry is only *correct* because
+the registry fingerprint first NOTICES that the live mapping is not the one the
+state DB was written against; without that, a wrong registry is
+indistinguishable from a right one and the restore would be a coin flip nobody
+knew they were tossing.
+
+That fingerprint is a GLOBAL integrity signal and nothing else — it answers "is
+this the same registry?", never "may this project's file hashes be trusted?".
+Restoring a backup therefore has an exact success criterion rather than a
+statistical one: `registry_integrity.verify_restored_mapping` compares the
+restored `project_id -> collection_name` mapping against the recorded one, per
+project, and names every entry it disagrees about.
 """
 
 from __future__ import annotations
@@ -47,6 +67,9 @@ logger = logging.getLogger("ragtools.backup")
 
 MANIFEST_FILENAME = "manifest.json"
 STATE_DB_FILENAME = "index_state.db"
+#: Same name it has in the data dir (see collection_router.build_router), so a
+#: backup directory can be read without a decoder ring.
+REGISTRY_DB_FILENAME = "registry.db"
 VALID_TRIGGERS = {"rebuild", "project_remove", "manual", "pre_restore"}
 
 
@@ -61,6 +84,10 @@ class BackupManifest:
     source_path: str        # absolute path of the DB that was backed up
     project_count: int = 0  # optional, 0 if DB didn't expose it
     note: str = ""          # free-form, set by `rag backup create --note`
+    #: Bytes of the captured registry.db; 0 means "not captured" — either a
+    #: `shared`-layout install (which has no registry) or a failed copy. The
+    #: snapshot is still valid without it, so this is a fact, not a status.
+    registry_db_size: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -90,6 +117,56 @@ def _make_backup_id(trigger: str, now: Optional[datetime] = None) -> str:
     when = now or datetime.now(timezone.utc)
     stamp = when.strftime("%Y%m%d_%H%M%S")
     return f"{stamp}_{trigger}"
+
+
+def registry_db_path(settings) -> Optional[Path]:
+    """Where this installation's registry lives, or None if it cannot be known.
+
+    Mirrors ``collection_router.build_router``: ``<data_dir>/registry.db``. A
+    settings object without ``data_dir`` (the CLI's minimal shims, tests) gets
+    None rather than a guess — backing up the wrong file would be worse than
+    backing up none.
+    """
+    data_dir = getattr(settings, "data_dir", None)
+    if not data_dir:
+        return None
+    return Path(data_dir) / REGISTRY_DB_FILENAME
+
+
+def _copy_sqlite(source: Path, target: Path) -> int:
+    """Snapshot one SQLite file with the online backup API; return its size."""
+    src = sqlite3.connect(str(source), timeout=5.0)
+    try:
+        dst = sqlite3.connect(str(target))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    return target.stat().st_size
+
+
+def _backup_registry(settings, target_dir: Path) -> int:
+    """Best-effort snapshot of registry.db beside the state DB.
+
+    Deliberately non-fatal and separate from the state-DB copy: the registry is
+    absent under the `shared` layout (the default), and a state-DB backup that
+    failed because an optional companion file was missing would be a worse
+    outcome than a state-DB backup without it.
+    """
+    source = registry_db_path(settings)
+    if source is None or not source.is_file():
+        return 0
+    try:
+        return _copy_sqlite(source, target_dir / REGISTRY_DB_FILENAME)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Registry not included in backup (%s): %s", source, e)
+        try:
+            (target_dir / REGISTRY_DB_FILENAME).unlink()
+        except Exception:
+            pass
+        return 0
 
 
 def _count_projects(db_path: Path) -> int:
@@ -144,24 +221,21 @@ def backup_state_db(
 
         # Use SQLite's online backup API so WAL/journal are handled cleanly
         # and a concurrently-writing indexer can't corrupt the snapshot.
-        src = sqlite3.connect(str(state_db_path), timeout=5.0)
-        try:
-            dst = sqlite3.connect(str(target_db))
-            try:
-                src.backup(dst)
-            finally:
-                dst.close()
-        finally:
-            src.close()
+        state_db_size = _copy_sqlite(state_db_path, target_db)
+
+        # And the registry, which under `per_project` is the only record of
+        # which collection holds each project's vectors.
+        registry_db_size = _backup_registry(settings, target_dir)
 
         manifest = BackupManifest(
             backup_id=backup_id,
             timestamp=(now or datetime.now(timezone.utc)).isoformat(),
             trigger=trigger,
-            state_db_size=target_db.stat().st_size,
+            state_db_size=state_db_size,
             source_path=str(state_db_path.resolve()),
             project_count=_count_projects(target_db),
             note=note,
+            registry_db_size=registry_db_size,
         )
         (target_dir / MANIFEST_FILENAME).write_text(
             json.dumps(manifest.to_dict(), indent=2)
@@ -245,11 +319,39 @@ def prune_backups(settings, keep: Optional[int] = None) -> int:
     return deleted
 
 
-def restore_backup(settings, backup_id: str) -> Path:
-    """Restore the state DB from a previous backup.
+def _atomic_replace(source: Path, target: Path, prefix: str) -> None:
+    """Copy `source` over `target` via a sibling tempfile + os.replace."""
+    import os as _os
+    import tempfile as _tempfile
 
-    A safety snapshot of the current DB is taken FIRST (trigger=pre_restore)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = _tempfile.mkstemp(prefix=prefix, suffix=".db",
+                                     dir=str(target.parent))
+    _os.close(fd)
+    try:
+        shutil.copyfile(source, tmp_path)
+        _os.replace(tmp_path, target)
+    except Exception:
+        # Clean up the temp file on error.
+        try:
+            _os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def restore_backup(settings, backup_id: str) -> Path:
+    """Restore the state DB — and the registry, if the backup has one.
+
+    A safety snapshot of the current DBs is taken FIRST (trigger=pre_restore)
     so the restore itself is reversible.
+
+    The registry goes back BEFORE the state DB, deliberately. If it cannot be
+    replaced (on Windows a running service holds the handle) the failure lands
+    with nothing yet changed. The reverse order would leave a state DB
+    describing a mapping that was never restored — and while R06's fingerprint
+    would catch that and force a re-index rather than let it pass silently,
+    "nothing happened" is a better place to fail than "half happened".
 
     Args:
         backup_id: the directory name of the backup to restore from.
@@ -266,30 +368,15 @@ def restore_backup(settings, backup_id: str) -> Path:
     if not source_db.is_file():
         raise FileNotFoundError(f"Backup not found or incomplete: {backup_id}")
 
-    # Safety first — snapshot the current state DB (if any) before overwriting.
+    # Safety first — snapshot the current DBs (if any) before overwriting.
     safety_dir = backup_state_db(settings, trigger="pre_restore")
 
-    target_db = Path(settings.state_db)
-    target_db.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic replace: copy to a sibling tempfile then os.replace.
-    import os as _os
-    import tempfile as _tempfile
-    fd, tmp_path = _tempfile.mkstemp(
-        prefix="state_restore_",
-        suffix=".db",
-        dir=str(target_db.parent),
-    )
-    _os.close(fd)
-    try:
-        shutil.copyfile(source_db, tmp_path)
-        _os.replace(tmp_path, target_db)
-    except Exception:
-        # Clean up the temp file on error.
-        try:
-            _os.unlink(tmp_path)
-        except Exception:
-            pass
-        raise
+    source_registry = source_dir / REGISTRY_DB_FILENAME
+    target_registry = registry_db_path(settings)
+    if source_registry.is_file() and target_registry is not None:
+        _atomic_replace(source_registry, target_registry, "registry_restore_")
+        logger.info("Restored registry from backup: %s", backup_id)
 
+    _atomic_replace(source_db, Path(settings.state_db), "state_restore_")
     logger.info("Restored state DB from backup: %s", backup_id)
     return safety_dir if safety_dir else source_dir

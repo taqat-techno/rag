@@ -19,10 +19,18 @@ import uuid
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("RAG_E2E_QDRANT"),
-    reason="managed-Qdrant e2e is resource-gated; set RAG_E2E_QDRANT=1 to run",
-)
+pytestmark = [
+    # Registered in pyproject.toml. The `managed-qdrant-e2e` job fetches the
+    # pinned binary on all three first-class platforms and REQUIRES both tests
+    # below to pass; `scripts/check_no_silent_skips.py` fails the build if
+    # either reports skipped there.
+    pytest.mark.e2e_managed_qdrant,
+    pytest.mark.release_blocking,
+    pytest.mark.skipif(
+        not os.environ.get("RAG_E2E_QDRANT"),
+        reason="managed-Qdrant e2e is resource-gated; set RAG_E2E_QDRANT=1 to run",
+    ),
+]
 
 BIN = os.environ.get("RAG_E2E_QDRANT_BIN", "")
 HTTP_PORT = int(os.environ.get("RAG_E2E_QDRANT_HTTP", "26333"))

@@ -337,6 +337,17 @@ class QdrantOwner:
         self._frameworks = None
         self._capabilities = None
         self._router = self._build_router(settings)
+        #: Changes the watcher saw while an index was being replaced. Durable,
+        #: so a service killed mid-rebuild still replays them at next boot.
+        #: Opened LAZILY — see `_pending_store`.
+        self._pending = None
+        self._pending_unavailable: str | None = None
+        self._pending_lock = threading.Lock()
+        # Is the registry we just opened the one this index was built against?
+        # Asked BEFORE anything writes: a registry that cannot be vouched for
+        # must not mint identities or swap pointers, and the answer is also what
+        # /health reports. Never fatal — see `_reconcile_registry_integrity`.
+        self._reconcile_registry_integrity()
         self._ensured_collections: set[str] = set()
 
         for name in self._router.all_collections():
@@ -1023,7 +1034,9 @@ class QdrantOwner:
                     "file_path": file_path,
                     "project": project_id,
                     "collection": target,
-                    "scope": "framework" if target.startswith("fw_") else "project",
+                    # One authority decides what a collection is (R08); this
+                    # read used to re-derive it from the name prefix inline.
+                    "scope": self._router.identify([target])[target].scope,
                     "language": first["language"],
                     "chunk_type": first["chunk_type"],
                     "source_class": first["source_class"],
@@ -1040,29 +1053,135 @@ class QdrantOwner:
                 "scope": "project", "total": 0, "returned": 0, "truncated": False,
                 "chunks": []}
 
+    def _identity_registry(self):
+        """The registry the store identity is fingerprinted against, or None.
+
+        ``None`` under ``shared``, where there is no registry and the identity
+        is exactly what it was before R06 — so the fingerprint stays "" and
+        nothing about the default layout changes.
+
+        A registry that raises is NOT smoothed over into ``None`` here. Both
+        callers already guard: the check assumes trustworthy (its existing
+        behaviour), and the stamp is skipped, which leaves the previous identity
+        standing and forces a re-index next run. Substituting "" instead would
+        stamp "unknown" and quietly switch the guard off for this install.
+        """
+        return self._registry
+
     def _check_index_identity(self, state) -> tuple[bool, list[str]]:
-        """Whether ``state``'s file hashes may be trusted for skipping."""
+        """Whether ``state``'s file hashes may be trusted for skipping.
+
+        STORE-WIDE only: engine, layout, legacy collection name, model,
+        dimension. A change to any of those moves every project's vectors at
+        once, so the whole state DB stops describing this store.
+
+        Where a project's own mapping moved, ask :meth:`_untrusted_projects`.
+        Folding that into this answer is what made adding one project re-embed
+        the corpus.
+        """
         from ragtools.index_identity import current_identity, reconcile
 
         try:
-            identity = current_identity(self._settings, self._encoder.dimension)
+            identity = current_identity(self._settings, self._encoder.dimension,
+                                        registry=self._identity_registry())
             return reconcile(state, identity)
         except Exception:  # noqa: BLE001 — never block indexing on the guard
             logger.exception("index-identity check failed; assuming trustworthy")
             return True, []
 
-    def _stamp_index_identity(self) -> None:
-        """Record the current store on the state DB, after a run has written it."""
-        from ragtools.index_identity import current_identity, stamp
+    def _untrusted_projects(self, state) -> dict[str, list[str]]:
+        """``project_id -> changed fields`` for projects that must be re-indexed.
+
+        The per-project half of R06. Only a project whose OWN recorded mapping
+        (uuid, collection, generation, embedding identity) differs appears here;
+        a project that merely appeared alongside does not, which is the entire
+        difference between this and the registry-wide fingerprint.
+
+        An empty dict on failure, matching :meth:`_check_index_identity`: the
+        guard narrows a re-index, and a guard that cannot run must not widen one.
+        """
+        from ragtools.index_identity import current_project_identities, untrusted_projects
 
         try:
+            live = current_project_identities(self._settings, self._encoder.dimension,
+                                              registry=self._identity_registry())
+            return untrusted_projects(state, live)
+        except Exception:  # noqa: BLE001 — never block indexing on the guard
+            logger.exception("per-project identity check failed; assuming trustworthy")
+            return {}
+
+    def _stamp_index_identity(self, projects=None) -> None:
+        """Record the current store on the state DB, after a run has written it.
+
+        Two stamps, written together:
+
+        * the store-wide identity, including the registry fingerprint — the
+          GLOBAL integrity signal that notices a lost or restored registry;
+        * one row per project, so a later change can be localised to the project
+          it actually affects instead of invalidating every project's hashes.
+
+        They are written together on purpose: a fingerprint with no per-project
+        rows is exactly the ambiguous state that has to be answered
+        conservatively (see ``index_identity.reconcile``), so leaving one behind
+        would re-create the blast radius this refinement removes.
+
+        ``projects`` limits the per-project rows to the ones this run actually
+        covered; ``None`` means all of them, which is right for an unscoped run
+        and for a rebuild. A SCOPED run must not stamp its neighbours: recording
+        project B's current mapping because project A was indexed is how a
+        project that still needs re-indexing comes to look finished — the same
+        "confidently empty" shape, one project wide.
+        """
+        from ragtools.index_identity import (
+            current_identity, current_project_identities, stamp, stamp_projects,
+        )
+
+        try:
+            registry = self._identity_registry()
             state = IndexState(self._settings.state_db)
             try:
-                stamp(state, current_identity(self._settings, self._encoder.dimension))
+                stamp(state, current_identity(self._settings,
+                                              self._encoder.dimension,
+                                              registry=registry))
+                live = current_project_identities(
+                    self._settings, self._encoder.dimension, registry=registry)
+                if projects is not None:
+                    wanted = {p for p in projects if p}
+                    live = {k: v for k, v in live.items() if k in wanted}
+                stamp_projects(state, live)
+                # The mapping has just been proven against real writes, so a
+                # hold armed at boot can now clear. Without this an install that
+                # recovered stays locked out of swaps until it is restarted.
+                self._reconcile_registry_integrity(state)
             finally:
                 state.close()
         except Exception:  # noqa: BLE001
             logger.exception("could not record the index identity")
+
+    def _reconcile_registry_integrity(self, state=None):
+        """Re-derive registry integrity and arm/release the write hold.
+
+        Non-fatal by construction: a reporting-and-guarding pass must never be
+        the reason the service will not boot. A failure here leaves the hold as
+        it was, which is the conservative side of the trade.
+        """
+        from ragtools import registry_integrity
+
+        registry = self._identity_registry()
+        if registry is None:
+            return None
+        owned = state is None
+        try:
+            if owned:
+                state = IndexState(self._settings.state_db)
+            try:
+                return registry_integrity.reconcile_startup(state, registry)
+            finally:
+                if owned:
+                    state.close()
+        except Exception:  # noqa: BLE001
+            logger.exception("registry-integrity reconciliation failed")
+            return None
 
     def _collections_for_path(self, state, relative_path: str) -> list[str]:
         """Which collection(s) hold a tracked path's points.
@@ -1140,6 +1259,10 @@ class QdrantOwner:
                 client=self._client,
                 encoder=self._encoder,
                 settings=self._settings,
+                # Provenance authority. Without it the searcher can only read
+                # the naming scheme, which knows a collection is a project's
+                # but not WHICH project's.
+                router=self._router,
             )
             return searcher.search(
                 query=query,
@@ -1242,7 +1365,14 @@ class QdrantOwner:
                 # search() with no collections and hit the legacy fallback, so
                 # /api/dev-search answered `count: 0` on every per-project
                 # install — indistinguishable from "no matches".
-                collections=self._read_collections(project_id),
+                #
+                # Both ids, not just the singular one: a multi-project dev
+                # search routed to `read_collections(None)` — every collection
+                # on the machine — and relied on the payload filter to narrow
+                # it afterwards. Search and dev-search must read the same set,
+                # or the two surfaces answer from different stores.
+                collections=self._read_collections(project_id, project_ids),
+                router=self._router,
             )
             outcome = dev_search(
                 searcher,
@@ -1290,12 +1420,17 @@ class QdrantOwner:
         """Find likely definition sites for a symbol (cross-file code-graph v1)."""
         with self._lock:
             from ragtools.retrieval.codegraph import find_definitions as _find
+            # A symbol may be defined in the project or in a framework it
+            # references — the code graph must look in both. Passed on the
+            # constructor so the SEMANTIC fallback routes too: it calls
+            # `search()` with no collections, which under per_project resolved
+            # to nothing at all.
+            collections = self._read_collections(project_id)
             searcher = Searcher(
                 client=self._client, encoder=self._encoder, settings=self._settings,
+                collections=collections, router=self._router,
             )
-            # A symbol may be defined in the project or in a framework it
-            # references — the code graph must look in both.
-            searcher.definition_collections = self._read_collections(project_id)
+            searcher.definition_collections = collections
             searcher.collection_scoped = self._router.is_per_project
             return _find(searcher, symbol, project_id=project_id, top_k=top_k)
 
@@ -1463,7 +1598,9 @@ class QdrantOwner:
         log_activity("success", "indexer",
                      f"Full index: {stats['files_indexed']} files, {stats['chunks_indexed']} chunks")
         # The state DB now describes this store (engine + collection layout).
-        self._stamp_index_identity()
+        # Scoped to what ran: a single-project full index proves that project's
+        # mapping and says nothing about anyone else's.
+        self._stamp_index_identity(None if project_id is None else [project_id])
         # Surface a scale warning into logs (and via /api/status) if applicable.
         self._emit_scale_warning_after_index(log_activity)
         return stats
@@ -1519,6 +1656,21 @@ class QdrantOwner:
             _log("warning", "indexer",
                  f"Storage changed ({explain(changed)}) — full re-index required")
 
+        # Per project, and ONLY the ones whose own mapping moved. A project
+        # added alongside these does not appear here, so it costs its own index
+        # run and nothing else — the whole point of separating this from the
+        # registry-wide fingerprint.
+        stale_projects = {} if not trustworthy else self._untrusted_projects(read_state)
+        if stale_projects:
+            from ragtools.index_identity import explain_project
+            from ragtools.service.activity import log_activity as _log
+            for pid, fields in sorted(stale_projects.items()):
+                reason = explain_project(pid, fields)
+                logger.warning("Re-indexing one project: %s", reason)
+                _log("warning", "indexer",
+                     f"Re-indexing '{pid}' only — {reason}. Other projects are "
+                     f"unaffected and keep their index.")
+
         stats = {"indexed": 0, "skipped": 0, "deleted": 0, "chunks_indexed": 0,
                  "projects": set()}
         total_files = len(files)
@@ -1543,9 +1695,12 @@ class QdrantOwner:
                 _tick(n, total_files, "chunk")
                 relative_path = self._resolve_relative_path(pid, file_path)
                 current_hash = IndexState.hash_file(file_path)
-                # `trustworthy` is False when the state DB describes a different
-                # store: the hash may match while the vectors do not exist.
-                if trustworthy and not read_state.file_changed(relative_path, current_hash):
+                # Two independent reasons a matching hash may not mean "already
+                # in the store": the STORE changed (`trustworthy` False — every
+                # project), or THIS PROJECT's collection changed (`stale_projects`
+                # — that project alone). Both mean re-index; neither means delete.
+                if (trustworthy and pid not in stale_projects
+                        and not read_state.file_changed(relative_path, current_hash)):
                     stats["skipped"] += 1
                     continue
                 yield pid, relative_path, current_hash, file_path
@@ -1572,10 +1727,233 @@ class QdrantOwner:
                      f"Incremental: {stats['indexed']} indexed, {stats['skipped']} skipped, {stats['deleted']} deleted")
         # Only now — after the vectors are actually written — does the state DB
         # describe this store. Stamping earlier would let an interrupted
-        # migration look complete on the next run.
-        self._stamp_index_identity()
+        # migration look complete on the next run, and stamping projects this
+        # run did not touch would do the same thing one project at a time.
+        self._stamp_index_identity(None if project_id is None else [project_id])
         self._emit_scale_warning_after_index(log_activity)
         return stats
+
+    # ------------------------------------------------------------------
+    # Changes observed while an index was being replaced
+    #
+    # A rebuild holds the index mutex for its whole duration, so every watcher
+    # tick during one is answered `busy`. That answer used to be discarded on
+    # the assumption that the next tick would pick the change up — but nothing
+    # schedules a next tick, and the rebuild rewrites the project's state rows
+    # from its own scan, so the edited file ends up recorded against the hash
+    # the rebuild read. The store kept pre-edit content with no pending work
+    # anywhere to correct it.
+    #
+    # Capture is cheap and happens only on the `busy`/error paths. Replay is
+    # the ORDINARY incremental indexer scoped to one project — no second
+    # pipeline — run AFTER that project's collection swap, so it writes into
+    # what the project is actually serving.
+    # ------------------------------------------------------------------
+
+    def _pending_path(self) -> Path:
+        return Path(self._settings.data_dir) / "pending_changes.db"
+
+    def _pending_store(self, *, create: bool = False):
+        """The durable change ledger, opened on first real need.
+
+        Lazily, and that is not an optimisation. Nothing is queued unless an
+        index run is already in progress, which for most installs is never — so
+        eagerly opening it would put a SQLite handle (and a file, and its WAL)
+        on every owner ever constructed for a mechanism that stays idle.
+
+        ``create=False`` is the read path: no file means nothing was ever
+        captured, which is an answer, not a reason to create one.
+        """
+        from ragtools.service.pending_changes import PendingChanges
+
+        with self._pending_lock:
+            if self._pending is not None:
+                return self._pending
+            if self._pending_unavailable is not None:
+                return None
+            path = self._pending_path()
+            if not create and not path.exists():
+                return None
+            try:
+                self._pending = PendingChanges(
+                    str(path), limit=self._settings.pending_change_limit)
+            except Exception as exc:  # noqa: BLE001 — never block indexing on it
+                self._pending_unavailable = str(exc)
+                logger.error(
+                    "Could not open the pending-change ledger (%s); changes made "
+                    "while an index is being replaced cannot be captured", exc)
+                return None
+            return self._pending
+
+    def capture_pending_changes(self, project_id: str, changes) -> dict:
+        """Durably record changes that could not be indexed right now.
+
+        ``changes`` is an iterable of ``(kind, absolute_path)`` where ``kind``
+        is ``"upsert"`` or ``"delete"`` — the watcher's vocabulary, not
+        watchfiles', so this layer stays free of the watcher's dependency.
+
+        A path whose project-relative identity cannot be resolved does not get
+        dropped: the project is flagged for a full re-scan instead. Degrade,
+        never discard.
+        """
+        from ragtools.service.pending_changes import KIND_DELETE, KIND_UPSERT
+
+        pending = self._pending_store(create=True)
+        if pending is None:
+            return {"status": "unavailable", "queued": 0, "project": project_id,
+                    "reason": self._pending_unavailable}
+
+        entries = []
+        for kind, raw_path in changes:
+            try:
+                rel = self._resolve_relative_path(project_id, Path(raw_path))
+            except Exception as exc:  # noqa: BLE001
+                pending.mark_rescan(
+                    project_id,
+                    f"a change to {raw_path!r} could not be attributed to a file "
+                    f"within the project ({exc}); the project needs a full re-scan")
+                return {"status": "marked", "queued": 0, "project": project_id}
+            entries.append(
+                (KIND_DELETE if kind == KIND_DELETE else KIND_UPSERT, rel, str(raw_path))
+            )
+        result = pending.record_many(project_id, entries)
+        if result.get("status") == "overflowed":
+            from ragtools.service.activity import log_activity
+            log_activity("warning", "watcher",
+                         f"Too many changes queued for '{project_id}' during a "
+                         f"rebuild — it will be fully re-scanned instead")
+        return result
+
+    def pending_changes_report(self) -> dict:
+        """What is still waiting to be replayed, and what failed trying.
+
+        A ledger that could not be OPENED reports ``pending_files: None``: a
+        count we could not take is not zero. A ledger that was never NEEDED
+        reports zero, because that is the true answer.
+        """
+        pending = self._pending_store()
+        if pending is None:
+            if self._pending_unavailable is not None:
+                return {"available": False, "reason": self._pending_unavailable,
+                        "pending_files": None, "projects": {},
+                        "rescan_required": {}, "failures": {}}
+            return {"available": True, "pending_files": 0, "projects": {},
+                    "rescan_required": {}, "failures": {},
+                    "limit": self._settings.pending_change_limit}
+        return {"available": True, **pending.report()}
+
+    def _projects_awaiting_replay(self) -> list:
+        """Projects still holding captured work. Empty if nothing was captured."""
+        pending = self._pending_store()
+        if pending is None:
+            return []
+        try:
+            return pending.projects_with_work()
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not list projects awaiting replay")
+            return []
+
+    def _replay_pending(self, project_id: str, *,
+                        stamp_identity: bool = True) -> dict | None:
+        """Replay one project's captured changes. The mutex must ALREADY be held.
+
+        Returns ``None`` when the project had nothing outstanding — the common
+        case, and free. Never raises: a rebuild that worked must not be
+        reported as failed because the replay after it did not, and the failure
+        is recorded rather than swallowed (the rows stay, so the next boot
+        retries them).
+
+        ``stamp_identity`` belongs to the caller that just swapped this
+        project's collection. A caller that did NOT swap must leave the stamp
+        alone: the recorded mapping is still the true one, and re-stamping it
+        for a project whose rebuild failed would assert something the run did
+        not establish.
+        """
+        from ragtools.service.activity import log_activity
+
+        pending = self._pending_store()
+        if pending is None:
+            return None
+        try:
+            claim = pending.claim(project_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Could not read pending changes for %s", project_id)
+            return {"project": project_id, "ok": False, "error": str(exc),
+                    "files": 0, "indexed": None, "deleted": None}
+        if claim is None:
+            return None
+
+        logger.info("Replaying changes captured during the rebuild — %s",
+                    claim.describe())
+        # The swap and `_replace_state_rows` have both happened, so the state
+        # rows now describe the collection the project serves. Say so before
+        # the replay reads them: otherwise the per-project identity guard sees
+        # the pre-swap stamp, distrusts every hash, and the replay re-embeds
+        # the whole project the rebuild has just finished embedding.
+        if stamp_identity:
+            self._stamp_index_identity([project_id])
+        try:
+            stats = self._run_incremental_index_locked(project_id=project_id)
+        except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+            pending.record_failure(project_id, str(exc))
+            logger.exception("Replaying changes for %s failed", project_id)
+            log_activity(
+                "error", "indexer",
+                f"Changes made to '{project_id}' while its index was being "
+                f"replaced could not be replayed ({exc}); they are still queued "
+                f"and will be retried when the service next starts")
+            return {"project": project_id, "ok": False, "error": str(exc),
+                    "files": len(claim.files), "indexed": None, "deleted": None,
+                    "rescan": claim.is_rescan}
+
+        # `_run_incremental_index_locked` is the pipeline itself, not a wrapper,
+        # so it cannot answer `busy` — but if it ever did, consuming the claim
+        # would discard the work it declined to do.
+        if stats.get("busy"):
+            pending.record_failure(
+                project_id, "the replay was skipped because an index run was in progress")
+            return {"project": project_id, "ok": False, "files": len(claim.files),
+                    "error": "busy", "indexed": None, "deleted": None}
+
+        removed = pending.consume(claim)
+        result = {"project": project_id, "ok": True, "files": len(claim.files),
+                  "consumed": removed, "indexed": stats.get("indexed", 0),
+                  "deleted": stats.get("deleted", 0), "rescan": claim.is_rescan}
+        if result["indexed"] or result["deleted"]:
+            log_activity(
+                "success", "indexer",
+                f"Replayed changes made to '{project_id}' during the rebuild: "
+                f"{result['indexed']} indexed, {result['deleted']} deleted")
+        return result
+
+    def replay_pending_changes(self, project_id: str | None = None) -> dict:
+        """Replay everything outstanding. Takes the index mutex itself.
+
+        The recovery entry point: called at service start so a rebuild that was
+        interrupted — by a crash, a restart, or the window being closed — does
+        not leave the changes it swallowed stranded on disk for ever.
+        """
+        available = self._pending_unavailable is None
+        targets = ([project_id] if project_id else self._projects_awaiting_replay())
+        if not targets:
+            return {"replayed": [], "busy": False, "available": available}
+
+        with self._exclusive_index("Replay of pending changes") as acquired:
+            if acquired is None:
+                # Not a failure and not a loss: the rows are durable, and the
+                # run that holds the mutex either replays them itself or leaves
+                # them for the next attempt.
+                return {"replayed": [], "busy": True, "available": available}
+            results = []
+            for pid in targets:
+                # This caller did NOT swap anything, so it must not re-stamp a
+                # project's identity. If the guard then distrusts the project's
+                # hashes the replay re-indexes all of it — the expensive answer,
+                # and the safe direction.
+                outcome = self._replay_pending(pid, stamp_identity=False)
+                if outcome is not None:
+                    results.append(outcome)
+        return {"replayed": results, "busy": False, "available": available}
 
     def rebuild(self) -> dict:
         """Drop all data and rebuild from scratch.
@@ -1671,7 +2049,7 @@ class QdrantOwner:
 
         stats = {"files_indexed": 0, "chunks_indexed": 0, "deleted": 0,
                  "projects": [], "failed_projects": [], "empty_projects": {},
-                 "status": "completed"}
+                 "replayed": [], "replay_failures": [], "status": "completed"}
         rebuilt: list[str] = []
         failed: list[str] = []
         for project in projects:
@@ -1687,6 +2065,9 @@ class QdrantOwner:
                     "error", "indexer",
                     f"Rebuild failed for project '{project.id}': {exc} — its "
                     f"previous index was left in place")
+                # The project kept its previous index, so whatever the watcher
+                # captured still applies to it. Leave the queue alone; the next
+                # successful run replays it.
                 continue
             stats["files_indexed"] += result["files_indexed"]
             stats["chunks_indexed"] += result["chunks_indexed"]
@@ -1694,6 +2075,37 @@ class QdrantOwner:
             if result.get("empty_reason"):
                 stats["empty_projects"][project.id] = result["empty_reason"]
             rebuilt.append(project.id)
+
+            # AFTER this project's swap, and only this project's. Replaying
+            # before it would write into the collection that is about to be
+            # superseded; replaying every project at the end would leave a
+            # partial rebuild — some projects swapped, some not — with the
+            # already-swapped ones still stale.
+            replay = self._replay_pending(project.id)
+            if replay is not None:
+                stats["replayed"].append(replay)
+                if not replay.get("ok"):
+                    stats["replay_failures"].append(project.id)
+
+        # A change to a project whose replay has ALREADY run — it arrived later
+        # in the rebuild, while a different project was being replaced — has no
+        # second post-swap moment to be picked up at, and the watcher will not
+        # wake again until the filesystem moves. Sweep once more before the
+        # mutex is released, so "current afterwards" does not depend on the
+        # user happening to edit something else.
+        #
+        # ONE pass over a snapshot: work arriving during the sweep is left for
+        # the next tick or the next boot, which terminates. Only a project this
+        # run actually swapped may re-stamp its identity.
+        already = {r["project"] for r in stats["replayed"]}
+        for pid in self._projects_awaiting_replay():
+            if pid in already:
+                continue
+            outcome = self._replay_pending(pid, stamp_identity=pid in rebuilt)
+            if outcome is not None:
+                stats["replayed"].append(outcome)
+                if not outcome.get("ok"):
+                    stats["replay_failures"].append(pid)
 
         stats["projects"] = sorted(rebuilt)
         stats["failed_projects"] = failed
@@ -1722,6 +2134,19 @@ class QdrantOwner:
             log_activity("success", "indexer",
                          f"Rebuild: {stats['files_indexed']} files, "
                          f"{stats['chunks_indexed']} chunks")
+
+        # Reported whether or not the rebuild itself succeeded. A replay that
+        # failed means those projects are serving content the user has already
+        # changed, which is precisely the condition this whole mechanism exists
+        # to make visible rather than silent.
+        if stats["replay_failures"]:
+            logger.error("Changes captured during the rebuild could not be "
+                         "replayed for: %s", ", ".join(stats["replay_failures"]))
+            log_activity(
+                "error", "indexer",
+                f"Rebuild finished, but changes made during it could not be "
+                f"replayed for {', '.join(stats['replay_failures'])} — they are "
+                f"still queued and will be retried at the next start")
         return stats
 
     @staticmethod
@@ -2649,6 +3074,12 @@ class QdrantOwner:
                 for r in records:
                     state.remove(r["file_path"])
                     deleted_files += 1
+                # The project's recorded mapping goes with its file rows. A
+                # DELIBERATE removal must not later read as a registry that lost
+                # a project — that is the rollback signal, and a routine removal
+                # firing it would block swaps for an install with nothing wrong.
+                from ragtools.index_identity import forget_project
+                forget_project(state, project_id)
                 state.close()
 
             self._invalidate_map_cache()
@@ -2723,7 +3154,7 @@ class QdrantOwner:
         the .db file locked, so skipping them leaves files that cannot be
         deleted or replaced on restart.
         """
-        for registry in (self._registry, self._frameworks):
+        for registry in (self._registry, self._frameworks, self._pending):
             if registry is not None:
                 try:
                     registry.close()
@@ -2731,6 +3162,11 @@ class QdrantOwner:
                     pass
         self._registry = None
         self._frameworks = None
+        self._pending = None
+        # Not merely cleared: `_pending_store` opens on demand, so a stray call
+        # after close would silently hand out a fresh handle on a file the
+        # caller believes this owner has let go of.
+        self._pending_unavailable = "the owner has been closed"
         try:
             del self._client
         except Exception:

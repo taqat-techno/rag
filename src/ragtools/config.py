@@ -495,6 +495,12 @@ class Settings(BaseSettings):
     # State
     state_db: str = Field(default_factory=_default_state_db)
 
+    # Ceiling on distinct files queued per project while that project's index is
+    # being replaced (rebuild / re-layout). Past it the queue degrades to a
+    # recorded "this project needs a full re-scan" marker — see
+    # ``service/pending_changes.py``. Never a silent drop.
+    pending_change_limit: int = 2000
+
     # Ignore rules (global — apply to all projects)
     ignore_patterns: list[str] = Field(default_factory=list)
     use_ragignore_files: bool = True
@@ -519,6 +525,22 @@ class Settings(BaseSettings):
 
     # Backups of the SQLite state DB (taken before destructive operations).
     backup_keep: int = 10
+
+    # Unattended deletion of orphaned generation collections — the staging and
+    # superseded `proj_<uuid>_g<n>` collections a rebuild leaves behind
+    # (`ragtools.generation_reaper`). OFF, and it stays off unless somebody
+    # declares otherwise: reaping is the one destructive addition in this
+    # release, and the shipped behaviour is a dry run that names every candidate
+    # and every exclusion and deletes nothing. Turning it on relaxes no safety
+    # check — it only lets the sweep act on what it already reports.
+    reap_generations: bool = False
+
+    # How long a generation collection must have been SEEN orphaned before it is
+    # considered settled. Measured from this installation's first sighting, not
+    # from any property of the collection — Qdrant does not say when a collection
+    # was created, and inventing an age is how an in-flight staging collection
+    # gets deleted out from under the rebuild filling it.
+    reap_grace_hours: float = 24.0
 
     # Per-tool access control for the MCP server.
     # Core tools (search_knowledge_base, list_projects, index_status) are always

@@ -44,6 +44,13 @@ DATA_DIR = LOCALAPPDATA / "RAGTools"
 UNINSTALL_KEY = (r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
                  r"\{7E4B2A3C-F1D8-4A5E-B9C0-1234567890AB}_is1")
 
+#: Where `installer.iss` points `quiesce.ps1 -LogPath`. Three files land here:
+#: the structured verdict, the plain-text blocker summary Inno shows the user,
+#: and the record of which scheduled tasks the upgrade disabled.
+QUIESCE_LOG_DIR = LOCALAPPDATA / "RAGTools" / "logs"
+QUIESCE_JSON = QUIESCE_LOG_DIR / "upgrade-quiesce.json"
+QUIESCE_BLOCKERS = QUIESCE_LOG_DIR / "quiesce-blockers.txt"
+
 results: list[tuple[str, bool, str]] = []
 
 
@@ -211,6 +218,178 @@ def _dump_inno_log(log_path: Path, label: str, *, tail: int = 120) -> None:
     print("--- end Inno log ---\n", flush=True)
 
 
+def _echo(line: str = "") -> None:
+    """Print a line the console's own codec is guaranteed to accept.
+
+    `_dump_inno_log` learned this the expensive way: a character the runner's
+    cp1252 console cannot encode raises `UnicodeEncodeError` and takes down the
+    script that was added to diagnose the failure. Blocker text contains paths,
+    exception messages and whatever `schtasks` said, so it gets the same
+    treatment.
+    """
+    codec = sys.stdout.encoding or "utf-8"
+    print(line.encode(codec, "replace").decode(codec), flush=True)
+
+
+def dump_quiescence(label: str) -> str:
+    """Everything the quiescence protocol recorded, into the CI log.
+
+    A gate that refuses without saying why is not diagnosable, and this leg had
+    exactly that shape: `quiesce-blockers.txt` is written for Inno's refusal
+    dialog and carries only the BLOCKERS, so a run that aborted before it ever
+    tried to stop anything printed a blocker list with nothing in it. The
+    PHASES are where that is visible, and they live in the JSON verdict.
+
+    So the JSON is the primary source here, the summary is secondary, and a
+    missing file is reported as a missing file — with the directory listed —
+    rather than as an absence of blockers.
+
+    Returns a one-line summary for the check detail; the detail is in the log.
+    """
+    _echo()
+    _echo(f"--- quiescence verdict for {label} ---")
+    _echo(f"    log directory: {QUIESCE_LOG_DIR}")
+
+    if not QUIESCE_JSON.is_file():
+        _echo(f"    NO VERDICT AT {QUIESCE_JSON}")
+        if QUIESCE_LOG_DIR.is_dir():
+            entries = sorted(QUIESCE_LOG_DIR.iterdir())
+            _echo(f"    the directory exists and holds {len(entries)} entr(ies):")
+            for entry in entries:
+                try:
+                    size = entry.stat().st_size
+                except OSError as exc:                     # pragma: no cover
+                    size = f"<{exc}>"
+                _echo(f"      {entry.name}  ({size} bytes)")
+        else:
+            _echo("    the directory does not exist, so quiesce.ps1 never ran "
+                  "far enough to create it — suspect PowerShell startup, "
+                  "ExtractTemporaryFile, or a parse error in the script")
+        _echo("--- end quiescence verdict ---")
+        return "no quiescence verdict was written"
+
+    try:
+        verdict = json.loads(QUIESCE_JSON.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError) as exc:
+        _echo(f"    the verdict could not be parsed: {exc}")
+        _echo("--- end quiescence verdict ---")
+        return f"the quiescence verdict is unreadable: {exc}"
+
+    reason = verdict.get("reason")
+    _echo(f"    reason={reason} exit_code={verdict.get('exit_code')} "
+          f"quiescent={verdict.get('quiescent')} "
+          f"elapsed={verdict.get('elapsed_seconds')}s")
+    _echo(f"    app_dir={verdict.get('app_dir')}")
+    _echo(f"    data_dir={verdict.get('data_dir')}")
+    _echo(f"    installation={json.dumps(verdict.get('installation'))}")
+
+    # THE PHASES. A protocol that aborted before it stopped anything is only
+    # visible here — the blocker list of such a run is empty by construction.
+    phases = verdict.get("phases") or []
+    _echo(f"    phases ({len(phases)}):")
+    for phase in phases:
+        _echo(f"      {str(phase.get('outcome')).upper():<8} "
+              f"{phase.get('phase')}  ({phase.get('duration_ms')} ms)")
+        if phase.get("detail"):
+            _echo(f"               {phase['detail']}")
+        for blocker in phase.get("blockers") or []:
+            _echo(f"               blocker: {json.dumps(blocker)}")
+
+    tasks = verdict.get("tasks") or []
+    _echo(f"    scheduled tasks ({len(tasks)}):")
+    for task in tasks:
+        _echo(f"      {task.get('name')}: prior={task.get('prior_state')} "
+              f"disabled_by_us={task.get('disabled_by_us')}")
+    if not tasks:
+        _echo("      (none recorded — either none is registered, or the phase "
+              "that records them never completed)")
+
+    blockers = verdict.get("blockers") or []
+    _echo(f"    blockers ({len(blockers)}):")
+    for blocker in blockers:
+        _echo(f"      [{blocker.get('kind')}] {blocker.get('identity')}")
+        _echo(f"          pid={blocker.get('pid')} path={blocker.get('path')}")
+        _echo(f"          {blocker.get('detail')}")
+    if not blockers:
+        _echo("      (none — so nothing was found HOLDING anything; if the "
+              "verdict still refused, the phases above say why)")
+
+    if QUIESCE_BLOCKERS.is_file():
+        summary = QUIESCE_BLOCKERS.read_text(encoding="utf-8", errors="replace")
+        _echo(f"    the summary Inno showed ({len(summary)} bytes):")
+        for line in summary.splitlines() or ["(the file is empty)"]:
+            _echo(f"      {line}")
+    else:
+        _echo(f"    NO SUMMARY AT {QUIESCE_BLOCKERS}")
+    _echo("--- end quiescence verdict ---")
+
+    aborted = [p.get("phase") for p in phases if p.get("outcome") == "error"]
+    parts = [f"reason={reason}"]
+    if aborted:
+        parts.append("phases that ERRORED: " + ", ".join(str(p) for p in aborted))
+    parts.append(f"{len(blockers)} blocker(s)")
+    return "; ".join(parts)
+
+
+def dump_lock_owners(install: Path) -> None:
+    """Who actually holds the installation's files, asked of Windows itself.
+
+    The quiescence verdict says what `quiesce.ps1` concluded. This says what is
+    true, independently — via the Restart Manager, which names the owning PIDs
+    of a specific file rather than guessing from image names. Verified read-only
+    against a real installation, where `_internal\\python312.dll` returned EIGHT
+    owning processes against the two image names the installer's kill targets.
+
+    Best effort by construction: a diagnostic that can fail the run it is
+    diagnosing is worse than no diagnostic.
+    """
+    _echo()
+    _echo("--- who is holding the installation ---")
+    try:
+        # Imported lazily: `diagnose_upgrade_lock` imports FROM this module, so
+        # a module-level import here would be a cycle.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from diagnose_upgrade_lock import (  # noqa: PLC0415
+            PSUTIL_UNAVAILABLE, lockable_files, process_snapshot, rm_owners_for_files,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _echo(f"    the forensic helpers could not be imported: {exc!r}")
+        _echo("--- end holders ---")
+        return
+
+    try:
+        files, truncated, total = lockable_files(install, limit=25)
+        _echo(f"    Restart Manager, {len(files)} of {total} lockable file(s)"
+              + (" (truncated)" if truncated else ""))
+        for record in rm_owners_for_files(files):
+            owners = record.get("owners")
+            if owners is None:
+                _echo(f"      {record['path']}: could not ask — {record.get('error')}")
+                continue
+            if not owners:
+                continue        # free, and there are hundreds of those
+            _echo(f"      {record['path']}: HELD BY {len(owners)} process(es)")
+            for owner in owners:
+                _echo(f"          {json.dumps(owner)}")
+    except Exception as exc:  # noqa: BLE001
+        _echo(f"    the Restart Manager sweep failed: {exc!r}")
+
+    try:
+        snapshot = process_snapshot(install)
+        if PSUTIL_UNAVAILABLE:
+            _echo(f"    process sweep unavailable: {PSUTIL_UNAVAILABLE}")
+        procs = snapshot.get("processes") or []
+        _echo(f"    processes whose image OR a loaded module lies under "
+              f"{install} ({len(procs)}):")
+        for proc in procs:
+            _echo(f"      {json.dumps(proc)}")
+        for denied in snapshot.get("inspection_denied") or []:
+            _echo(f"      undetermined: {json.dumps(denied)}")
+    except Exception as exc:  # noqa: BLE001
+        _echo(f"    the process sweep failed: {exc!r}")
+    _echo("--- end holders ---")
+
+
 def install_silently(installer: Path, label: str, *, log_dir: Path | None = None) -> int:
     """Inno silent install. `startnow` is omitted so nothing opens a browser;
     the service is started explicitly instead, which is the state that matters.
@@ -325,7 +504,30 @@ def main(argv=None) -> int:
     # --- 2. the upgrade, over a live installation ------------------------
     rc = install_silently(new_installer, f"v{args.version} (over v{args.from_version})",
                           log_dir=work)
-    check("the upgrade installer exited 0", rc == 0, f"exit {rc}")
+    # Name the two failures that are NOT the same failure. Inno's exit 5 means
+    # Setup aborted mid-write and the installation is now mixed; exit 7 means
+    # `PrepareToInstall` refused BEFORE the first destructive write and the
+    # previous version is intact. A leg that reports only "exit 7" sends the
+    # next person looking for a half-installed tree that does not exist.
+    detail = f"exit {rc}"
+    if rc != 0:
+        # EVERY non-zero exit gets the full picture, not only the refusal. The
+        # protocol's own verdict says what it decided and — critically — which
+        # phases it reached; the Restart Manager sweep says what is holding the
+        # files whether or not the protocol got as far as looking.
+        summary = dump_quiescence(f"v{args.version} (over v{args.from_version})")
+        dump_lock_owners(install)
+        if rc == 7:
+            detail = (f"exit 7 — quiescence REFUSED the upgrade before writing "
+                      f"anything; the previous version is intact. {summary} "
+                      f"(full verdict above and in {QUIESCE_JSON})")
+        elif rc == 5:
+            detail = ("exit 5 — Setup aborted DURING the write; the installation may "
+                      "be mixed. This is the failure quiescence exists to convert "
+                      f"into a 7. {summary}")
+        else:
+            detail = f"exit {rc}. {summary}"
+    check("the upgrade installer exited 0", rc == 0, detail)
 
     # --- 3. the machine must now belong to the new release ---------------
     print("\n--- the machine after the upgrade ---", flush=True)

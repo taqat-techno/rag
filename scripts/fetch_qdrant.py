@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import platform
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -109,7 +110,46 @@ def extract(archive: Path, into: Path) -> Path:
     target = into / wanted
     if platform.system().lower() != "windows":
         target.chmod(0o755)
+    if platform.system().lower() == "darwin":
+        _ensure_executable_on_macos(target)
     return target
+
+
+def _ensure_executable_on_macos(target: Path) -> None:
+    """On Apple Silicon an invalid signature is not a warning — it is SIGKILL.
+
+    arm64 macOS refuses to execute a binary whose code signature is missing or
+    broken; the process is killed before ``main``, and what the caller sees is a
+    child that died instantly with no output. Extracting a file from a tarball
+    can invalidate a signature that was fine inside it.
+
+    So: VERIFY first, and only ad-hoc sign if verification fails. Unconditional
+    ``--force --sign -`` would replace a genuine signature with an ad-hoc one,
+    which runs locally and cannot be notarized — repairing a signature is the
+    goal, not overwriting one.
+
+    Best-effort by design. A machine with no ``codesign`` (Command Line Tools
+    absent) still gets the binary, and the failure it will produce is at least
+    reported here rather than discovered as a mystery exit.
+    """
+    try:
+        verify = subprocess.run(["codesign", "--verify", "--strict", str(target)],
+                                capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"  codesign unavailable ({exc}); leaving the binary as extracted")
+        return
+    if verify.returncode == 0:
+        print("  signature verified; left untouched")
+        return
+
+    detail = (verify.stderr or verify.stdout).strip().splitlines()
+    print(f"  signature invalid ({detail[0] if detail else 'no detail'}); "
+          f"ad-hoc signing so arm64 will execute it")
+    signed = subprocess.run(["codesign", "--force", "--sign", "-", str(target)],
+                            capture_output=True, text=True, timeout=300)
+    if signed.returncode != 0:
+        print(f"  ad-hoc signing FAILED: "
+              f"{(signed.stderr or signed.stdout).strip()[:300]}")
 
 
 def fetch(dest: Path, *, force: bool = False) -> Path:

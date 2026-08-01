@@ -13,6 +13,178 @@ _Nothing yet._
 
 ---
 
+## [3.5.1] — 2026-08-01
+
+**Upgrading from 3.3.0, 3.4.0 or 3.5.0 was unsafe. This release fixes it.**
+
+### If you are on 3.3.0, 3.4.0 or 3.5.0, read this first
+
+Installing 3.5.0 over any of those versions could fail **mid-write**, leaving a
+mixed installation: `_internal\python312.dll` deleted or unloadable, `rag.exe`
+refusing to start, the uninstall registry entry still naming the old version,
+and the service never coming back. The v3.5.0 advisory described that state.
+**It is resolved here**, and the resolution was measured rather than reasoned.
+
+**The cause.** From 3.3.0 onward the installation supervises a *native* engine
+process, `qdrant.exe`, living at `<install>\bin\`. It loads the Microsoft C
+runtime — `msvcp140.dll`, `vcruntime140.dll`, `vcruntime140_1.dll` — out of
+`<install>\_internal\`, the PyInstaller payload directory, because Windows
+resolves those from the application directory. The installer's `[InstallDelete]`
+removes `{app}\_internal` **wholesale**, met a DLL held by a process nothing was
+stopping, and `/SUPPRESSMSGBOXES` answered the resulting file-in-use prompt with
+**Abort** — exit code 5, half-deleted payload.
+
+Confirmed on a clean disposable runner by the Windows Restart Manager, which
+named the holder outright: pid 2720, `qdrant.exe`, holding its own image and all
+three runtime DLLs. 2.7.0 and 3.0.1 were never affected because they run Qdrant
+in-process; the boundary is that feature, not a coincidence of timing.
+
+**Why nothing stopped it.** `installer.iss` declares no 64-bit architecture, so
+Inno's Setup is 32-bit and its `Exec('powershell.exe', …)` resolves through
+WOW64 to the **32-bit** host. In that host `Process.Path` and `Process.Modules`
+return `$null` and `[]` for 64-bit processes — *silently*, with no exception. The
+path-scoped sweep therefore found zero owned processes and the engine was
+invisible. Ownership is now established out-of-process via `Win32_Process`,
+which is bitness-independent.
+
+### Upgrade safety
+
+* **The installer can now refuse.** Quiescence is proved in `PrepareToInstall()`,
+  which runs before any file operation. If an installation-owning process cannot
+  be stopped, Setup exits **7** having written nothing, and the previous version
+  keeps running. Exit 5 meant "your installation is now mixed"; exit 7 means
+  "nothing was touched". Those were indistinguishable before.
+* **One authoritative protocol** (`installer/quiesce.ps1`): detect, suspend the
+  scheduled tasks (disable, not merely `/end` — a `/end` leaves the trigger
+  armed), stop tray → supervisor → service children → the installation's own
+  managed engine, identify anything still holding a file *by loaded module and
+  not only by image name*, wait with a bounded budget, then **probe every
+  `.exe`/`.dll`/`.pyd` for replaceability before the first write**.
+* Scoping is preserved: a `qdrant.exe` outside this installation is never
+  touched. `storage_backend = "external"` means a server you run, and killing it
+  would be data loss in someone else's application.
+* **Supported upgrade paths, each validated against a genuine packaged
+  installer on a real machine in CI:** 2.7.0, 3.0.1, 3.3.0, 3.4.0, 3.5.0 → 3.5.1.
+
+### Safety and recovery
+
+* **A rebuild no longer loses edits.** Filesystem changes made while a rebuild
+  runs were silently dropped — the "next tick picks it up" assumption is false,
+  because the rebuild rewrites the state rows from its own scan. Changes are now
+  captured durably and replayed after each project swaps, surviving a restart.
+* **Recovery no longer requires restarting the service.** An interrupted rebuild
+  is re-driven on a maintenance tick with bounded backoff, and `/health` reports
+  the unresolved plan until it is genuinely resolved. No message anywhere now
+  offers a restart as the remedy for a recoverable failure.
+* **Destructive endpoints are gated.** Project reindex, project delete, shutdown,
+  mode changes, dependency and ignore-rule mutation, rebuild and collection
+  reclaim now pass through one authorization gate across the API, UI, CLI and
+  both MCP paths. Writes are default-closed; local access alone is not treated
+  as authorization.
+* **Orphaned generation collections are reportable and reclaimable** — dry-run by
+  default, automatic deletion off. Nothing is deleted for resembling a name.
+* **Registry durability**: losing `registry.db` is detected rather than silently
+  minting empty replacement collections, and an orphaned collection is
+  re-adopted by UUID instead of replaced.
+* **A profile lookup leaked a SQLite handle per request** on the refusal path —
+  the `raise` captured the frame into the traceback, keeping the connection
+  alive until the cyclic collector happened to run.
+
+### Correctness
+
+* **The Semantic Map no longer dies whole.** Vectors from different collections
+  were stacked into one projection with no check that they shared a vector
+  space: a differing dimension raised an uncaught `ValueError` → HTTP 500 and
+  the entire map vanished, while a same-dimension/different-model mix silently
+  produced a projection separating *encoders* rather than meaning. Collections
+  are now checked for dimension, model, normalization, metric and vector type,
+  and an incompatible one is excluded **with its reason** while the rest render.
+* **A multi-project search no longer calls your own code a vendored
+  dependency.** Result scope was derived from loop position, so every collection
+  after the first was labelled `framework`, and internal `proj_<uuid>` store
+  names leaked into user-facing output. Scope now comes from what the collection
+  *is*. This also fixed MCP direct search reading **no collections at all** under
+  the per-project layout.
+
+### Known limitations
+
+* **macOS Intel (x86_64) is best-effort.** No Intel artifact is built or
+  published. The leg runs and reports pass/fail/unsupported but cannot block or
+  delay a release.
+* The MCP client-profile header is an identity claim on an unauthenticated
+  localhost socket. It constrains a cooperating restricted client; it is not a
+  defence against a hostile local process.
+* Automatic reaping of orphaned generation collections ships **off** and has not
+  been exercised against a live engine.
+* `rag storage reap`, `rag recover`, the two new config keys and the `/health`
+  `recovery` key are not yet in the wiki.
+
+### Platform support
+
+Windows, Linux x86_64 and macOS arm64 are first-class and release-blocking.
+macOS Intel is best-effort, as above.
+
+### The gates that would have caught the last two releases now execute
+
+The evidence was a summary line nobody read as a defect:
+
+```
+2581 passed, 19 skipped
+```
+
+Ten of those nineteen were the two suites that mattered. `test_panel_e2e.py` —
+the entire admin panel in a browser — is gated on `RAG_E2E_PANEL_URL`, and
+Playwright was not a dependency of any extra, so even setting the variable by
+hand produced an import-skip. `test_storage_managed_e2e.py` — the managed
+engine against a real `qdrant` binary — is gated on `RAG_E2E_QDRANT`. There
+were **zero** occurrences of `RAG_E2E` anywhere under `.github/workflows`. The
+two code paths behind the v3.4 and v3.5.0 field incidents were validated by
+nothing, and the workflow reported success while proving it.
+
+A skip is not a failure, which is exactly the problem: a green run and a green
+run with the interesting half missing look identical from outside.
+
+* **`managed-qdrant-e2e`** fetches the pinned engine with the existing
+  `scripts/fetch_qdrant.py` — checksum-verified against a digest committed
+  here — and runs the managed lifecycle on Windows, Linux and macOS arm64.
+* **`panel-e2e`** boots a real service on an isolated port and data directory,
+  indexes two fixture projects into the per-project layout, and drives the
+  panel with Chromium. Booting it *populated* is deliberate: the isolation test
+  skips itself against an empty panel, and a job that green-lights while its
+  isolation test excused itself is the defect, not the fix.
+* **`transport-stress`** drives 20,000 requests against a real engine, past the
+  16,384-wide ephemeral range that produced `[WinError 10048]`, and asserts on
+  a **measurement** — distinct client-side ports, socket growth — not on the
+  absence of a crash. It runs a negative control first: a client with
+  keep-alive disabled (the v3.4 configuration) must trip the same threshold the
+  real run has to clear, or the measurement has no discriminating power.
+  Observed on Windows: control 1,743 distinct ports for 3,000 requests; the
+  shipped pool 8 for 20,000. On all three platforms, because the failure was
+  Windows-specific and the fix is shared code.
+* **`winget-manifest`** runs `scripts/check_winget_hash.py` on tag pushes only,
+  waiting for the installer `release.yml` is building from the same tag. It
+  cannot run on a pre-release pull request, where the manifest cannot
+  legitimately be correct yet.
+
+### A skip in a release-blocking suite is now a build failure
+
+`scripts/check_no_silent_skips.py` parses the JUnit report structurally — never
+console output — and fails on four independent conditions, so no single edit
+satisfies it by accident: every skip must be declared by node id **and** by the
+reason it recorded; every required test must be present **and** passed; a suite
+has a collected-case floor; and a skip excused as "it runs in the dedicated
+job" is only valid if that job actually requires it. `tests/test_ci_gates.py`
+proves every node id it names resolves to a real test, and drives each failure
+mode against synthetic reports — a structural check that has never been shown
+to fail is not evidence of anything.
+
+Also: pytest markers are registered for the first time (`--strict-markers` is
+now on, so an undeclared one is a collection error rather than a warning), a
+coverage floor of 75% guards the Windows leg against a measured 76.73%, and
+every job producing a JUnit report is required to check it.
+
+---
+
 ## [3.5.0] — 2026-07-31
 
 A rebuild could not fail without destroying data, and the product could not

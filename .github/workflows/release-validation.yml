@@ -9,6 +9,10 @@
 # `validate_release.py` treats a check with no evidence as MANUAL, and MANUAL
 # blocks the verdict. A green workflow with unrun rows would be the same
 # manufactured pass the gate exists to prevent.
+#
+# The three first-class platforms are Windows, Linux, and macOS ARM64. macOS
+# Intel x86_64 is best-effort — no Intel artifact is built or published — and is
+# validated in its own non-blocking job; see `suite-macos-intel` below.
 
 name: release-validation
 
@@ -21,19 +25,73 @@ on:
       - "src/ragtools/platform/**"
       - "src/ragtools/upgrade/**"
       - "scripts/**"
+      # The installer and its quiescence script were NOT listed here, and that
+      # is not a small omission: every packaged-upgrade leg in this file exists
+      # to validate `installer.iss`, and a pull request that rewrote it would
+      # have run none of them. The upgrade protocol moved from
+      # `CurStepChanged(ssInstall)` to `PrepareToInstall()` without a single
+      # real-upgrade job being triggered by that change.
+      - "installer.iss"
+      - "installer/**"
+      - "winget/**"
       - ".github/workflows/release-validation.yml"
+      # WP-R10. The gates added below validate the storage engine, the HTTP
+      # transport and the admin panel, and none of those files were listed —
+      # so a pull request rewriting the connection pool that caused the v3.4
+      # `WinError 10048` would have run no gate that touches it. A path list
+      # that omits the code a job exists to test is the same omission that let
+      # `installer.iss` change without a single upgrade leg firing.
+      - "src/ragtools/transport.py"
+      - "src/ragtools/storage.py"
+      - "src/ragtools/storage_managed.py"
+      - "src/ragtools/service/**"
+      - "tests/test_storage_managed_e2e.py"
+      - "tests/test_panel_e2e.py"
+      - "pyproject.toml"
 
 jobs:
+  # EVERY job in this file carries a finite `timeout-minutes`. That is not
+  # paperwork, it is the fix for a specific incident.
+  #
+  # On the v3.5.0 run (30653097391) `suite (macos-13)` was queued at 17:55:30Z
+  # and never started — no runner was ever allocated to it. At the time exactly
+  # ONE job here had a timeout (`real-upgrade`), so nothing bounded that wait
+  # and the run could not conclude. GitHub seals a run's job logs until the run
+  # completes, so one unstartable job sealed the logs of a genuinely FAILED one
+  # (`packaged v3.3.0 -> this build`) for hours; the run had to be cancelled by
+  # hand to release the evidence.
+  #
+  # So: a job without a timeout does not merely risk wasting a runner. It can
+  # withhold the diagnosis of an unrelated failure. The values below come from
+  # durations observed on that run with roughly 2x headroom — long enough that a
+  # slow but healthy leg is never killed, short enough that a stalled one cannot
+  # hold the evidence hostage.
   suite:
     name: suite (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60          # observed 11-25 min; the Windows leg adds coverage
     strategy:
       fail-fast: false
       matrix:
-        # macos-14 is arm64; macos-13 is x86_64. Both are shipped targets, so
-        # both are validated — an adapter that only works on Apple Silicon is
-        # not a macOS adapter.
-        os: [ubuntu-latest, macos-14, macos-13, windows-latest]
+        # RELEASE-BLOCKING platforms only. macOS Intel is validated too, but
+        # best-effort and in its own job — see `suite-macos-intel` for why.
+        os: [ubuntu-latest, macos-14, windows-latest]
+        include:
+          # THE COVERAGE FLOOR, on ONE platform and stated where the number
+          # came from. Measured 2026-08-01 on Windows: 17,905 statements,
+          # 4,166 uncovered = 76.73% (2581 passed, 19 skipped, 0 failed). The
+          # floor is 75 — a point and three quarters below the measurement, so
+          # it ratchets upward without failing on ordinary noise.
+          #
+          # It is NOT imposed on Linux or macOS, and that restraint is the
+          # honest part: the number above was measured on Windows and nowhere
+          # else. Platform-specific modules (the registry reader, Task
+          # Scheduler, the junction scanner) are covered differently on each,
+          # and a floor derived from one platform and applied to another is a
+          # guess. A guessed floor that fires falsely is a floor someone
+          # deletes. Measure the other two, then add them.
+          - os: windows-latest
+            coverage: "--cov=ragtools --cov-report=term --cov-fail-under=75"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,11 +100,104 @@ jobs:
       - name: Install with dev extras
         run: python -m pip install -e ".[dev]"
       - name: Full suite
+        # `--junitxml` is what makes the next step possible. The gate below
+        # parses the REPORT — element by element — rather than grepping the
+        # console, because a console line ("19 skipped") is a summary and a
+        # summary is exactly what hid this for two releases.
+        shell: bash
+        run: python -m pytest -q --junitxml=junit-suite.xml ${{ matrix.coverage }}
+      - name: No release-blocking test may report `skipped`
+        # `if: always()` on purpose: when pytest fails, the report still exists
+        # and the skip picture is part of the diagnosis. When pytest never
+        # wrote one, this step says so instead of finding nothing to complain
+        # about.
+        if: always()
+        run: >
+          python scripts/check_no_silent_skips.py
+          --suite full-suite --junit junit-suite.xml
+
+  suite-macos-intel:
+    # macOS PLATFORM POLICY — stated here because this file used to state the
+    # opposite:
+    #
+    #   * macOS arm64 (Apple Silicon) — FIRST-CLASS and RELEASE-BLOCKING.
+    #     `release.yml` builds macOS on `macos-14` and publishes
+    #     `RAGTools-<version>-macOS-arm64.zip`.
+    #   * macOS Intel x86_64 — BEST-EFFORT. No Intel artifact is built or
+    #     published by ANY release: `release.yml` has exactly one macOS job and
+    #     it uploads exactly one asset, the arm64 zip.
+    #
+    # The comment this replaces sat on the `suite` matrix and claimed macos-14
+    # and macos-13 were both "shipped targets". They are not, and the false
+    # claim was load-bearing in the worst direction: it let a leg with no
+    # artifact behind it block a release, which is how an unallocatable
+    # `macos-13` runner came to hold the whole v3.5.0 validation run open.
+    #
+    # Best-effort is not unwatched. This leg still runs and still reports an
+    # explicit verdict — pass, fail, or unsupported. The day a real Intel
+    # artifact is built and published, move it back into the blocking matrix
+    # above — not before.
+    #
+    # TWO CORRECTIONS, both paid for in evidence.
+    #
+    # 1. The label. This job said `runs-on: macos-13`, and the comment above it
+    #    asserted that "a retired runner label fails the job immediately, which
+    #    is the honest answer". That is false, and it is the sentence that cost
+    #    two runs. `macos-13` was retired from GitHub-hosted runners; a job
+    #    requesting a label that no longer exists is not rejected, it QUEUES —
+    #    on run 30653097391 and again on 30666102565, for 15+ hours each, with
+    #    `runner_name` empty the whole time, while `macos-14` legs in the same
+    #    matrix were allocated in under ten seconds. The current Intel labels
+    #    are `macos-15-intel` and `macos-26-intel`.
+    #
+    # 2. `timeout-minutes` does not bound this. It bounds EXECUTION, and this
+    #    job never began executing. Nothing in a workflow file can bound queue
+    #    time, which is why the structural fix below matters more than either
+    #    the label or the timeout: `gate` no longer waits on this job at all.
+    #    A leg that cannot fail the release must also not be able to delay it.
+    name: suite (macOS Intel — best-effort)
+    runs-on: macos-15-intel
+    continue-on-error: true
+    timeout-minutes: 30          # deliberately below the blocking legs' 45
+    outputs:
+      # Kept for anyone who wants to consume it, but NOT read by `gate` any
+      # more. A job with `continue-on-error: true` reports success to `needs`
+      # even when it failed, so the result field cannot tell pass from fail —
+      # and a best-effort leg that always renders as "PASS" is worse than no leg
+      # at all. The verdict below is the honest signal; it is published to the
+      # run summary so it is visible without another job having to block on it.
+      verdict: ${{ steps.verdict.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with dev extras
+        run: python -m pip install -e ".[dev]"
+      - name: Full suite
+        id: pytest
         run: python -m pytest -q
+      - name: Record an explicit verdict and publish it to the run summary
+        if: always()
+        id: verdict
+        run: |
+          if [ "${{ steps.pytest.outcome }}" = "success" ]; then
+            v=pass
+          elif [ "${{ steps.pytest.outcome }}" = "skipped" ]; then
+            # The suite never ran: the runner or the toolchain was unavailable.
+            # That is `unsupported`, not `fail` — calling it a failure would
+            # blame the code for an infrastructure gap.
+            v=unsupported
+          else
+            v=fail
+          fi
+          echo "verdict=$v" >> "$GITHUB_OUTPUT"
+          echo "macOS Intel (best-effort): **$v**" >> "$GITHUB_STEP_SUMMARY"
 
   linux-adapter:
     name: Linux adapter against real systemd
     runs-on: ubuntu-latest
+    timeout-minutes: 15          # observed 2-5 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -62,6 +213,7 @@ jobs:
   macos-adapter:
     name: macOS adapter against real launchd
     runs-on: macos-14
+    timeout-minutes: 20          # observed 2-5 min; macOS runners provision slowest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -116,6 +268,7 @@ jobs:
   clean-install:
     name: clean install of the built wheel (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25          # observed 5-10 min
     strategy:
       fail-fast: false
       matrix:
@@ -162,6 +315,7 @@ jobs:
   windows-autostart:
     name: autostart lifecycle against real Task Scheduler
     runs-on: windows-latest
+    timeout-minutes: 20          # observed 2-5 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -183,6 +337,7 @@ jobs:
   storage-backends:
     name: storage backends (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25          # observed 5-10 min
     strategy:
       fail-fast: false
       matrix:
@@ -204,6 +359,7 @@ jobs:
   posix-upgrade:
     name: packaged upgrade (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 35          # builds a --no-model bundle, like bundle-contract (~10 min)
     strategy:
       fail-fast: false
       matrix:
@@ -229,6 +385,7 @@ jobs:
   bundle-contract:
     name: built bundle contract (windows)
     runs-on: windows-latest
+    timeout-minutes: 30          # observed ~10 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -251,11 +408,15 @@ jobs:
   real-upgrade:
     name: packaged v${{ matrix.from }} -> this build, on a real machine
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 90          # observed ~48 min; the only job that already had one
     strategy:
       fail-fast: false
       matrix:
-        # BOTH legs, and the second one is the one that matters.
+        # FIVE legs, and each one is here for a different reason. Every one of
+        # them downloads a GENUINE PUBLISHED INSTALLER from the releases page —
+        # none of them synthesises a folder — because a synthesised layout has
+        # no running processes and no locked files, which is the only state in
+        # which any of this can fail.
         #
         # 2.7.0 registers its scheduled tasks against `rag.exe`, so the running
         # set during that upgrade is `rag.exe` — which even the OLD single-image
@@ -268,16 +429,40 @@ jobs:
         # "ragw.exe (PID 3076) and the task-registered images are now the
         # running set". Only this leg proves the defect is fixed.
         #
-        # 3.3.0 is the release this one exists to rescue, and it is the upgrade
-        # a real machine is about to perform. What this leg proves is that the
-        # PACKAGED path works from there — installer over installer, previous
-        # processes alive. What it does NOT prove is recovery of a STALLED
-        # migration: a runner's fresh 3.3.0 has no plan to be stuck in. That
-        # half is covered by `tests/test_v340_recovery.py`, which synthesises the
-        # exact stalled shape, and by the live end-to-end recovery. Saying which
-        # is which matters — a leg that quietly proves less than its name
-        # suggests is how a gate becomes decoration.
-        from: ["2.7.0", "3.0.1", "3.3.0"]
+        # 3.3.0 is the release that exposed WP-R02, and it is still the leg that
+        # matters most. On job 91273392455 it was the only one of the three that
+        # failed: the candidate installer exited 5 having half-deleted
+        # `_internal`, leaving `[PYI-2072] Failed to load Python DLL`, a registry
+        # still reading 3.3.0, and nothing answering within 300 s — while the
+        # 2.7.0 and 3.0.1 legs of the same run passed. What this leg proves is
+        # that the PACKAGED path works from there — installer over installer,
+        # previous processes alive and holding their own binaries. What it does
+        # NOT prove is recovery of a STALLED migration: a runner's fresh 3.3.0
+        # has no plan to be stuck in. That half is covered by
+        # `tests/test_v340_recovery.py`, which synthesises the exact stalled
+        # shape, and by the live end-to-end recovery. Saying which is which
+        # matters — a leg that quietly proves less than its name suggests is how
+        # a gate becomes decoration.
+        #
+        # 3.4.0 is the first release whose managed engine is SUPERVISED for its
+        # whole life, so it is the first previous version that reliably has a
+        # `qdrant.exe` of its own alive at the moment the upgrade starts. That
+        # makes it the leg where path-scoped engine stopping is actually
+        # exercised rather than merely present. What it does NOT prove: that a
+        # Qdrant belonging to someone ELSE is spared — a runner has no external
+        # engine to leave alone, so that half lives in
+        # `tests/test_upgrade_quiescence.py`.
+        #
+        # 3.5.0 is the immediately preceding release and therefore the upgrade
+        # almost every existing user will actually perform. It is the closest
+        # thing to a same-shape upgrade in the matrix — same storage layout,
+        # same task registrations, same executables — which is exactly why it
+        # proves the LEAST about the failure modes above and the MOST about the
+        # ordinary path not regressing. Both claims are worth making out loud: a
+        # green n-1 leg is not evidence that a two-major-versions-old install
+        # upgrades, and the older legs are not evidence that the common case
+        # still works.
+        from: ["2.7.0", "3.0.1", "3.3.0", "3.4.0", "3.5.0"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -327,6 +512,38 @@ jobs:
             --version ${{ steps.version.outputs.version }} `
             --from-version ${{ matrix.from }}
 
+      - name: Collect the upgrade evidence
+        # IMMEDIATELY after the upgrade and BEFORE the uninstall sweep, which
+        # removes the directory these files live in. `if: always()` because the
+        # run worth diagnosing is the one that failed.
+        #
+        # Copied into the workspace rather than uploaded from
+        # %LOCALAPPDATA% directly: the `env` context in a `with:` block does not
+        # expose the runner's OS environment, so the path has to be expanded by
+        # a shell that can see it.
+        if: always()
+        run: |
+          $dest = "upgrade-evidence"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item "$env:LOCALAPPDATA\RAGTools\logs\*" $dest -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item "upgrade-work\inno-*.log" $dest -Force -ErrorAction SilentlyContinue
+          if (Test-Path $dest) {
+            Get-ChildItem $dest -Recurse -File |
+              Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+          }
+
+      - name: Upload the upgrade evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # The quiescence verdict (phases, blockers, task states), the summary
+          # Inno showed, and both Inno logs. A refusal must be diagnosable
+          # without another round trip through CI.
+          name: real-upgrade-${{ matrix.from }}-evidence
+          path: upgrade-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Fire the at-logon tasks the installer just registered
         # Here, and not in a job of its own, because here the tasks are the ones
         # the real installer created — pointing at the real `ragw.exe`. A
@@ -351,6 +568,7 @@ jobs:
   upgrade-rehearsal:
     name: upgrade rehearsal (synthesised layout)
     runs-on: windows-latest
+    timeout-minutes: 20          # one script against a synthesised layout
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -363,24 +581,354 @@ jobs:
         # copies the actual config — see the script.
         run: python scripts/rehearse_upgrade.py
 
-  gate:
-    name: release gate
-    needs: [suite, linux-adapter, macos-adapter, clean-install, windows-autostart,
-            bundle-contract, real-upgrade, upgrade-rehearsal, storage-backends,
-            posix-upgrade]
-    runs-on: ubuntu-latest
+  # --- WP-R10: the gates that were declared and never executed ---------------
+  #
+  # Before this block there were ZERO occurrences of `RAG_E2E` anywhere under
+  # .github/workflows. `tests/test_storage_managed_e2e.py` and
+  # `tests/test_panel_e2e.py` were both env-gated, nothing set the variables,
+  # and the suite reported "19 skipped" as though that were a footnote. Ten of
+  # those nineteen were these two files: the managed engine and the admin
+  # panel — the two paths that produced the field incidents — validated by
+  # nothing at all.
+  #
+  # Each job below therefore does the provisioning itself rather than asking
+  # the suite to run if it feels able to, and each ends with
+  # `scripts/check_no_silent_skips.py`, which fails the job if a required test
+  # reports skipped OR is simply absent from the report.
+
+  managed-qdrant-e2e:
+    name: managed engine e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30          # engine fetch ~1 min, the two tests ~1 min
+    strategy:
+      fail-fast: false
+      matrix:
+        # All three first-class platforms. The engine is a native binary with a
+        # different build per platform, supervised by our own code — "it worked
+        # on Linux" says nothing about the Windows console-flag path or the
+        # macOS one, and the whole point of `managed` is that it behaves the
+        # same everywhere or refuses out loud.
+        os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Report what is still unrun
-        # The gate is not "did CI go green" — it is "did every required row
-        # execute". Rows needing a reboot, a destructive uninstall or a signing
-        # identity are still outstanding, and this says so out loud rather than
-        # letting a green tick imply otherwise.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: The client and the engine this job is about to fetch must be a supported pair
+        # Kept in step with `PINNED_QDRANT_VERSION` by the same check the build
+        # uses. Fetching an engine and then testing it with a client three
+        # minors away would be v3.2.0 again, this time inside the gate meant to
+        # prevent it.
+        run: python scripts/check_qdrant_compat.py
+      - name: Fetch the pinned engine and point the gate at it
+        # `scripts/fetch_qdrant.py` is the ONE provisioning mechanism: it pins
+        # the asset to PINNED_QDRANT_VERSION and verifies its sha256 against a
+        # digest committed to this repository. A second downloader here would
+        # be a second thing to keep in step with the pin.
+        #
+        # `--dest engine` is RELATIVE, and that is load-bearing on Windows. The
+        # shell here is Git Bash, where `$PWD` is an MSYS path (`/d/a/rag/rag`)
+        # — and CPython resolves a leading `/` against the CURRENT DRIVE ROOT,
+        # so `--dest "$PWD/engine"` writes to `D:\d\a\rag\rag\engine` while the
+        # lookup below resolves `engine` to `D:\a\rag\rag\engine`. Two paths,
+        # one of them empty, and a gate that fails for a reason that has
+        # nothing to do with what it tests. A relative path is interpreted the
+        # same way by both.
+        #
+        # Existence is asserted in PYTHON, not with `test -f`: the path this
+        # emits is a native Windows path with backslashes, and the process that
+        # has to open it is Python. Let the reader do the checking.
+        shell: bash
         run: |
-          echo "Automated rows validated by this workflow."
-          echo "STILL OUTSTANDING and NOT covered here:"
+          set -euo pipefail
+          python scripts/fetch_qdrant.py --dest engine
+          bin="$(python -c "import pathlib, sys; sys.path.insert(0, '.'); from scripts.fetch_qdrant import binary_name; p = pathlib.Path('engine', binary_name()).resolve(); assert p.is_file(), f'the engine was not written to {p}'; print(p)")"
+          echo "engine: $bin"
+          echo "RAG_E2E_QDRANT=1" >> "$GITHUB_ENV"
+          echo "RAG_E2E_QDRANT_BIN=$bin" >> "$GITHUB_ENV"
+      - name: The managed lifecycle against the real binary
+        run: >
+          python -m pytest tests/test_storage_managed_e2e.py -v -rs
+          --junitxml=junit-managed-qdrant.xml
+      - name: This suite may not report a single skip
+        if: always()
+        run: >
+          python scripts/check_no_silent_skips.py
+          --suite managed-qdrant-e2e --junit junit-managed-qdrant.xml
+
+  panel-e2e:
+    name: admin panel in a real browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 45          # model download on a cold cache dominates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache the embedding model
+        # The panel does not boot without an encoder: `QdrantOwner.__init__`
+        # constructs one and a failure there kills startup. Cached, the load is
+        # seconds and entirely offline; cold, it is a ~90 MB download, which is
+        # what the boot timeout in the script allows for.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2
+          key: model-all-MiniLM-L6-v2-Linux-v1
+      - name: Install CPU-only torch
+        # Same reason as release.yml's build-linux and test.yml: the default
+        # Linux torch wheel drags in ~2 GB of CUDA this job will never use.
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install with the dev AND e2e extras
+        # `.[e2e]` is where playwright now lives. It was in no extra at all
+        # before, which is why setting RAG_E2E_PANEL_URL by hand still produced
+        # an import-skip.
+        run: python -m pip install -e ".[dev,e2e]"
+      - name: Install the browser
+        run: python -m playwright install --with-deps chromium
+      - name: Boot an isolated panel and drive it
+        # ONE step for boot + index + assert + pytest + teardown. Splitting it
+        # would mean carrying a background service across step boundaries,
+        # which is the arrangement that ends up starting nothing and reporting
+        # success. `--root` is under RUNNER_TEMP, OUTSIDE the checkout: the
+        # panel writes a data directory, and tests/conftest.py's
+        # `_no_repository_pollution` fails the suite for exactly that.
+        run: >
+          python scripts/serve_panel_e2e.py
+          --root "$RUNNER_TEMP/panel-e2e"
+          --junit "$RUNNER_TEMP/junit-panel.xml"
+      - name: This suite may not report a single skip
+        if: always()
+        run: >
+          python scripts/check_no_silent_skips.py
+          --suite panel-e2e --junit "$RUNNER_TEMP/junit-panel.xml"
+
+  transport-stress:
+    name: transport stress (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30          # observed ~50 s of load plus the engine fetch
+    strategy:
+      fail-fast: false
+      matrix:
+        # ALL THREE, and the reason is the whole argument. The v3.4 failure was
+        # `[WinError 10048]` — ephemeral-port exhaustion, a Windows-specific
+        # wall. A Linux-only stress job would have proved nothing about it. But
+        # the FIX is shared code (`ragtools.storage._HTTP_LIMITS` and
+        # `ragtools.transport`), so a leak that appeared on Linux or macOS
+        # would be a regression in the same lines. Both directions matter.
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: 20,000 requests against a real engine, measuring the socket signal
+        # Past the 16,384-wide range the incident walked, and asserting on a
+        # MEASUREMENT — connections opened, distinct client-side ephemeral
+        # ports, socket growth — not on the absence of a crash. It runs a
+        # negative control first: a client built the way qdrant-client builds
+        # one for loopback (keep-alive off, the v3.4 configuration) MUST look
+        # leaky on every signal this platform designates, or the gate has no
+        # discriminating power and fails before reporting on the real client.
+        #
+        # WHICH signal is per platform and is declared in the script.
+        # Windows keeps S1 (distinct ephemeral ports) at exactly its old
+        # strictness — [WinError 10048] is ephemeral-port exhaustion and the
+        # control there produces 1,743 ports for 3,000 requests. Linux
+        # allocates differently: the identical control produced ONE port for
+        # 3,000 requests, so S1 cannot see the known-bad case there, which is
+        # what turned all three legs of run 30676422208 red. S0 (connections
+        # opened, counted inside the process) discriminates everywhere and is
+        # designated on all three.
+        shell: bash
+        run: >
+          python scripts/stress_transport.py
+          --engine-dir "$RUNNER_TEMP/engine"
+          --root "$RUNNER_TEMP/stress"
+
+  winget-manifest:
+    name: winget manifest matches the published installer
+    # TAG PUSHES ONLY — and this condition is the job's design, not a detail.
+    #
+    # `scripts/check_winget_hash.py` compares the manifest's InstallerSha256
+    # with the digest of the asset actually attached to the release its own URL
+    # names. On a pre-release pull request that comparison CANNOT legitimately
+    # pass: the installer for the version under review has not been built, so
+    # the manifest necessarily still describes the previous release. Running it
+    # there would produce a red check that is correct about the world and wrong
+    # about the change, and a check that is always red is a check people learn
+    # to ignore.
+    #
+    # On a tag push it is exactly right, and it is the only moment it is. That
+    # is also why the step below passes `--wait-for-asset`: this workflow and
+    # `release.yml` are triggered by the SAME tag push, so when this job starts
+    # the installer it must hash is still being built on another runner.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90          # 70 min of asset wait, 20 min of margin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The version under release, from the tag itself
+        id: version
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          test -n "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: The manifest must describe THIS release's installer
+        # `--expect-version` is what makes the common failure fast: a manifest
+        # still declaring the previous version fails in seconds, without
+        # spending the wait budget to reach the same answer.
+        #
+        # This check currently exits 1 against the committed manifest, and that
+        # is correct — it carries the v3.4.0 digest under a v3.5.0 version, so
+        # every `winget install` fails a hash comparison before it runs
+        # anything. The manifest is what has to change, not this gate.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          python scripts/check_winget_hash.py
+          --expect-version "${{ steps.version.outputs.version }}"
+          --wait-for-asset 4200
+
+  gate:
+    name: release gate
+    # `suite-macos-intel` is DELIBERATELY ABSENT from this list.
+    #
+    # It was here, and that is the whole incident. A best-effort leg cannot fail
+    # the release — but while it sat in `needs` it could still DELAY it without
+    # limit, because `needs` waits on queue time as well as run time and nothing
+    # bounds queue time. Twice, a job requesting a retired runner label queued
+    # for 15+ hours; both times the gate could not conclude, and GitHub seals a
+    # run's job logs until the run completes, so an unstartable best-effort leg
+    # sealed the diagnosis of a genuinely FAILED blocking leg.
+    #
+    # The rule this encodes: a job that cannot block the release must not be
+    # able to block the gate either. `tests/test_workflow_contract.py` asserts
+    # it, so re-adding it here fails the suite rather than a future release.
+    #
+    # EVERY OTHER JOB IN THIS FILE IS HERE, and `tests/test_ci_gates.py`
+    # asserts it. A job absent from `needs` is a job the gate cannot see, and a
+    # job present in `needs` but absent from the lists below is one the gate
+    # waits for and then ignores — which is precisely how this gate came to be
+    # decoration the first time.
+    needs: [suite, linux-adapter, macos-adapter, clean-install,
+            windows-autostart, bundle-contract, real-upgrade, upgrade-rehearsal,
+            storage-backends, posix-upgrade,
+            managed-qdrant-e2e, panel-e2e, transport-stress, winget-manifest]
+    # Not the default (`needs` all succeeded): a gate that only runs when
+    # everything already passed can never report a failure, and reporting the
+    # failure is the whole job. Not `always()` either — a run someone cancelled
+    # in order to reach its logs must not then be held open by this job.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10          # echoes and one comparison loop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Summarise every leg, and fail if a release-blocking one did not pass
+        # Until now this job `echo`ed and asserted NOTHING. It went green while
+        # jobs it named in `needs` had failed, because a job whose own steps all
+        # succeed succeeds — so "did every required leg pass" was not a question
+        # the release gate could answer. That is how a gate becomes decoration.
+        shell: bash
+        env:
+          # RELEASE-BLOCKING. Anything other than `success` fails this gate.
+          BLOCKING: |
+            suite ${{ needs.suite.result }}
+            linux-adapter ${{ needs.linux-adapter.result }}
+            macos-adapter ${{ needs.macos-adapter.result }}
+            clean-install ${{ needs.clean-install.result }}
+            windows-autostart ${{ needs.windows-autostart.result }}
+            storage-backends ${{ needs.storage-backends.result }}
+            posix-upgrade ${{ needs.posix-upgrade.result }}
+            bundle-contract ${{ needs.bundle-contract.result }}
+            real-upgrade ${{ needs.real-upgrade.result }}
+            upgrade-rehearsal ${{ needs.upgrade-rehearsal.result }}
+            managed-qdrant-e2e ${{ needs.managed-qdrant-e2e.result }}
+            panel-e2e ${{ needs.panel-e2e.result }}
+            transport-stress ${{ needs.transport-stress.result }}
+          # RELEASE-BLOCKING ON A TAG PUSH, AND ONLY THEN. Kept in its own list
+          # rather than folded into BLOCKING because the two want opposite
+          # verdicts on the same result: `skipped` is the CORRECT outcome for
+          # this leg on a pull request, and a failure on a tag.
+          #
+          # The alternative — leaving the job out of `needs` — is what the
+          # macOS-Intel incident warns against in reverse: a leg nobody waits
+          # on is a leg nobody reads. The queue-time hazard that rule protects
+          # against does not apply here, because a job skipped by an `if:`
+          # resolves immediately and never queues at all.
+          TAG_ONLY: |
+            winget-manifest ${{ needs.winget-manifest.result }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          # BEST-EFFORT. Named out loud, never waited on, never decisive.
+          # Deliberately NOT read from `needs.suite-macos-intel.outputs` — that
+          # expression is what put the job in `needs` and let it hold the gate
+          # open. The leg publishes its own verdict to the run summary instead.
+        run: |
+          set -uo pipefail
+          blocked=0
+
+          echo "RELEASE-BLOCKING legs"
+          while read -r job result; do
+            [ -n "${job:-}" ] || continue
+            if [ "$result" = "success" ]; then
+              printf '  PASS         %-22s (%s)\n' "$job" "$result"
+            else
+              printf '  NOT PASSED   %-22s (%s)\n' "$job" "$result"
+              blocked=$((blocked + 1))
+            fi
+          done <<< "$BLOCKING"
+
+          echo ""
+          echo "TAG-ONLY legs - blocking on a tag push (is_tag=$IS_TAG)"
+          while read -r job result; do
+            [ -n "${job:-}" ] || continue
+            if [ "$IS_TAG" = "true" ]; then
+              if [ "$result" = "success" ]; then
+                printf '  PASS         %-22s (%s, tag push)\n' "$job" "$result"
+              else
+                printf '  NOT PASSED   %-22s (%s, tag push)\n' "$job" "$result"
+                blocked=$((blocked + 1))
+              fi
+            elif [ "$result" = "skipped" ]; then
+              printf '  N/A          %-22s (%s - the release it validates does\n' \
+                "$job" "$result"
+              printf '               not exist yet on a non-tag run)\n'
+            else
+              # Not tolerated. `skipped` is the only defensible result off a
+              # tag; anything else means the `if:` condition and this list have
+              # drifted apart, and a gate that shrugs at that is guessing.
+              printf '  UNEXPECTED   %-22s (%s on a non-tag run)\n' "$job" "$result"
+              blocked=$((blocked + 1))
+            fi
+          done <<< "$TAG_ONLY"
+
+          echo ""
+          echo "BEST-EFFORT legs - informational, cannot block OR delay a release"
+          printf '  %-12s %-22s (%s)\n' "SEE JOB" "suite-macos-intel" \
+            "macOS Intel x86_64: best-effort, no Intel artifact is built or published"
+          echo "    Its verdict (pass | fail | unsupported) is published to the run"
+          echo "    summary by the job itself. This gate does not wait on it: a leg"
+          echo "    that cannot fail the release must not be able to delay it, and"
+          echo "    nothing in a workflow file can bound a job's QUEUE time."
+
+          echo ""
+          echo "STILL OUTSTANDING and NOT covered by this workflow at all:"
           echo "  - autostart on a NON-ADMIN account (runners are administrators,"
           echo "    which is what hid the /sc onlogon defect in the first place)"
           echo "  - the OS actually firing an at-logon trigger at logon"
           echo "  - signed and notarized artifacts (needs signing identities)"
           echo "Release requires these to be executed and recorded separately."
+
+          echo ""
+          if [ "$blocked" -ne 0 ]; then
+            echo "RELEASE GATE: FAILED - $blocked release-blocking leg(s) did not pass."
+            exit 1
+          fi
+          echo "RELEASE GATE: every release-blocking leg passed."
+          echo "That is necessary, not sufficient - see the outstanding rows above."

@@ -32,7 +32,30 @@
 6. Tag: `git tag vX.Y.Z`
 7. Push: `git push origin main --tags`
 8. GitHub Actions builds and creates the release automatically
-9. Verify the release on GitHub: installer `.exe` and portable `.zip` attached
+9. Verify the release on GitHub — **all four** assets must be attached:
+   - `RAGTools-Setup-X.Y.Z.exe` (Windows installer)
+   - `RAGTools-X.Y.Z-portable.zip` (Windows portable)
+   - `RAGTools-X.Y.Z-macOS-arm64.zip` (macOS Apple Silicon)
+   - `RAGTools-X.Y.Z-linux-x86_64.tar.gz` (Linux)
+
+## Platform Policy
+
+Stated here because `release-validation.yml` once claimed otherwise, and a false
+platform claim let a leg with no artifact behind it block a release.
+
+| Target | Status | Artifact |
+|---|---|---|
+| Windows x64 | first-class, release-blocking | `.exe` + portable `.zip` |
+| macOS **arm64** (Apple Silicon) | first-class, release-blocking | `RAGTools-X.Y.Z-macOS-arm64.zip` |
+| Linux x86_64 | first-class, release-blocking | `RAGTools-X.Y.Z-linux-x86_64.tar.gz` |
+| macOS **Intel x86_64** | **best-effort** | **none — no Intel artifact is built or published** |
+
+`release.yml` has exactly one macOS job (`build-macos`, on `macos-14`) and it
+uploads exactly one macOS asset, the arm64 zip. Intel macOS is therefore
+validated but never release-blocking: `release-validation.yml` runs the suite on
+`macos-13` in a `continue-on-error` job that reports pass / fail / unsupported
+and cannot fail the workflow. Promote Intel to first-class only when a real
+Intel artifact is built and published here — not before.
 
 ## Post-Release
 

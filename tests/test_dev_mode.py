@@ -244,6 +244,16 @@ def _routes_env(monkeypatch, projects):
 
     class _FakeOwner:
         captured = None
+        # The destructive gate proves the store is reachable before any
+        # write (v3.5.1 WP-R09) and reads that from the owner. A double
+        # that cannot answer is indistinguishable from a dead engine —
+        # the correct production reading, and the wrong one for a
+        # stand-in that has no store at all.
+        indexing = False
+
+        def storage_reachable(self):
+            return True, ""
+
         def update_projects(self, projs):
             _FakeOwner.captured = list(projs)
 
@@ -310,6 +320,11 @@ def test_schedule_reindex_is_delete_aware(monkeypatch):
     calls = {"reindex_project": 0, "run_full_index": 0, "run_incremental_index": 0}
 
     class _FakeOwner:
+        indexing = False
+
+        def storage_reachable(self):
+            return True, ""
+
         def reindex_project(self, project_id):
             calls["reindex_project"] += 1
             return {}
@@ -380,6 +395,16 @@ def _ui_env(monkeypatch, projects):
 
     class _FakeOwner:
         captured = None
+        # The destructive gate proves the store is reachable before any
+        # write (v3.5.1 WP-R09) and reads that from the owner. A double
+        # that cannot answer is indistinguishable from a dead engine —
+        # the correct production reading, and the wrong one for a
+        # stand-in that has no store at all.
+        indexing = False
+
+        def storage_reachable(self):
+            return True, ""
+
         def update_projects(self, projs):
             _FakeOwner.captured = list(projs)
 

@@ -36,7 +36,11 @@ def test_sync_adds_new_projects(reg):
     result = sync_projects_from_config(
         [_Cfg("a", "/w/a"), _Cfg("b", "/w/b", mode="code")], reg
     )
-    assert result == {"added": 2, "updated": 0, "unchanged": 0}
+    # ``blocked`` names the projects a held registry refused to mint an
+    # identity for (R06). Empty here, and pinned rather than ignored: a sound
+    # registry that starts quietly refusing projects is exactly the failure
+    # the key exists to make visible.
+    assert result == {"added": 2, "updated": 0, "unchanged": 0, "blocked": []}
     assert reg.get("b").mode == "code"
     assert reg.get("a").collection_name  # UUID-derived collection assigned
 
@@ -45,7 +49,7 @@ def test_sync_is_idempotent(reg):
     cfgs = [_Cfg("a", "/w/a"), _Cfg("b", "/w/b")]
     sync_projects_from_config(cfgs, reg)
     result = sync_projects_from_config(cfgs, reg)
-    assert result == {"added": 0, "updated": 0, "unchanged": 2}
+    assert result == {"added": 0, "updated": 0, "unchanged": 2, "blocked": []}
 
 
 def test_sync_updates_moved_path_preserving_identity(reg):

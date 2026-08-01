@@ -128,8 +128,36 @@ def _post_startup(settings: Settings, from_scheduler: bool) -> None:
                 logger.warning("Startup sync skipped — no projects in config. Config may not have loaded correctly.")
                 return
 
-            log_activity("info", "indexer", "Startup sync: checking for offline changes...")
             owner = get_owner()
+
+            # Anything the watcher captured while an index was being replaced
+            # and that was never replayed — a rebuild interrupted by a crash, a
+            # restart, or the window being closed. It runs BEFORE the ordinary
+            # sync so the replay is not the thing that gets told `busy`, and it
+            # is scoped per project, so it costs nothing when there is nothing
+            # outstanding (the common case).
+            try:
+                replay = owner.replay_pending_changes()
+                for outcome in replay.get("replayed", []):
+                    if outcome.get("ok"):
+                        log_activity(
+                            "success", "indexer",
+                            f"Replayed changes to '{outcome['project']}' captured "
+                            f"while its index was being replaced: "
+                            f"{outcome['indexed']} indexed, {outcome['deleted']} deleted")
+                    else:
+                        log_activity(
+                            "error", "indexer",
+                            f"Changes to '{outcome['project']}' captured during a "
+                            f"previous rebuild still could not be replayed: "
+                            f"{outcome.get('error')}")
+            except Exception as e:
+                logger.error("Replay of pending changes failed (non-fatal): %s", e)
+                log_activity("error", "indexer",
+                             f"Replay of changes captured during a previous "
+                             f"rebuild failed: {e}")
+
+            log_activity("info", "indexer", "Startup sync: checking for offline changes...")
             stats = owner.run_incremental_index()
             indexed = stats.get("indexed", 0)
             deleted = stats.get("deleted", 0)

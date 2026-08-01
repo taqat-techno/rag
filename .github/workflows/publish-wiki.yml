@@ -31,6 +31,10 @@ jobs:
   validate:
     name: Validate wiki-src
     runs-on: ubuntu-latest
+    # Finite by policy — see the header of release-validation.yml. This job
+    # shells out to `npx` and a link checker, both of which can hang on network
+    # rather than fail; `concurrency` means a hung run also blocks the next one.
+    timeout-minutes: 20
     outputs:
       dry_run_flag: ${{ steps.mode.outputs.dry_run_flag }}
     steps:
@@ -131,6 +135,7 @@ jobs:
     needs: validate
     if: needs.validate.outputs.dry_run_flag != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout source repo
         uses: actions/checkout@v4

@@ -14,6 +14,24 @@ validated; what was validated was a different program.
 This runs the real one, silently, against a real installation, and then sweeps
 with the same detection code an upgrade uses.
 
+WHEN THE SWEEP IS TAKEN
+-----------------------
+After the uninstaller has finished with the file system — which is later than
+the signal this script used to stop at. Inno removes the uninstall REGISTRY
+ENTRY and then, from a second process, its own stub and the directory holding
+it; polling for the entry therefore returns while the directory is still being
+removed. In run 30692207245 one leg of five swept inside that window and the two
+checks over the same directory, 0.6 s apart, disagreed::
+
+    [PASS] no program files survive except the uninstaller itself — 0 entries: []
+    [FAIL] a fresh scan finds no packaged installation — install-user: ...\\RAGTools
+
+They disagreed because they were two different predicates. The sweep's mapped
+every unreadable directory to "residue" and reported neither the contents nor
+the error, so the failure could not be told from a real one. There is now one
+predicate (:func:`directory_state`), it is taken only after
+:func:`wait_until_settled`, and it NAMES what survived.
+
 Usage (after an installer has been run):
 
     python scripts/verify_real_uninstall.py
@@ -26,6 +44,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -35,7 +54,108 @@ DATA_DIR = LOCALAPPDATA / "RAGTools"
 UNINSTALL_KEY = (r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
                  r"\{7E4B2A3C-F1D8-4A5E-B9C0-1234567890AB}_is1")
 
+#: `unins000.exe` is the uninstaller itself, and a running program cannot delete
+#: its own image. Inno schedules it for removal at the next reboot; until then it
+#: legitimately remains, alone, in an otherwise empty directory. Treating that as
+#: residue fails every correct uninstall — which it did on the first run of this
+#: script.
+SELF = frozenset({"unins000.exe", "unins000.dat"})
+
+#: The two states the uninstaller is FINISHED with...
+GONE = "gone"
+UNINSTALLER_ONLY = "uninstaller-only"
+#: ...and the two it is not.
+RESIDUE = "residue"
+UNREADABLE = "unreadable"
+
+SETTLED = (GONE, UNINSTALLER_ONLY)
+
+#: How long the uninstaller's asynchronous tail is given to finish.
+#:
+#: The only completion signal this script had was the uninstall REGISTRY ENTRY
+#: disappearing, and Inno removes its own stub and the directory holding it
+#: after that, from a second process. So "the entry is gone" is not "the
+#: uninstaller has finished with the file system", and the sweep was being taken
+#: against a removal still in progress.
+SETTLE_TIMEOUT = 60.0
+
 results: list[tuple[str, bool, str]] = []
+
+
+@dataclass(frozen=True)
+class DirState:
+    """What is in the install directory, and — when it cannot be read — why."""
+
+    state: str
+    entries: tuple[str, ...] = ()
+    reason: str = ""
+
+    @property
+    def settled(self) -> bool:
+        return self.state in SETTLED
+
+    def describe(self) -> str:
+        if self.state == GONE:
+            return "the directory is gone"
+        if self.state == UNINSTALLER_ONLY:
+            return "only Inno's own stub remains, scheduled for deletion at reboot"
+        if self.state == UNREADABLE:
+            return f"the directory could not be read: {self.reason}"
+        return f"{len(self.entries)} surviving: {list(self.entries[:8])}"
+
+
+def directory_state(path, *, listdir=None) -> DirState:
+    """Classify ``path`` — ONE implementation, deliberately.
+
+    There were two, taken 0.6 s apart over the same directory, and in run
+    30692207245 they returned opposite verdicts: the check that iterates the
+    directory reported ``0 entries: []`` while the sweep beside it reported that
+    same directory as a surviving packaged installation.
+
+    The sweep's predicate was ``all(name in SELF for name in path.iterdir())``
+    wrapped in a bare ``except OSError: return False`` — which turns "I could
+    not read it" into "there is residue in it", and records neither the contents
+    nor the error, so the failure said only ``install-user: <path>``. A Windows
+    directory removed while a handle on it is still open is exactly that state:
+    ``stat`` still answers from the parent's entry, so it looks present, while
+    enumeration is refused. It is NAMED here so it can be waited out and, if it
+    persists, reported as itself rather than as an unexplained path.
+
+    ``listdir`` is injectable for the same reason ``scan()`` takes an ``adapter``
+    — so the suite can present a directory in each state without needing a
+    machine that happens to be in it.
+    """
+    lister = listdir or (lambda p: [entry.name for entry in Path(p).iterdir()])
+    try:
+        names = sorted(lister(path))
+    except FileNotFoundError:
+        return DirState(GONE)
+    except NotADirectoryError:
+        # A FILE at this path — a legacy artifact such as `data\service.pid` —
+        # is residue plainly, not something that "could not be read".
+        return DirState(RESIDUE, (os.path.basename(str(path)),))
+    except OSError as exc:
+        return DirState(UNREADABLE, reason=f"{type(exc).__name__}: {exc}")
+    leftovers = tuple(n for n in names if n.lower() not in SELF)
+    return DirState(RESIDUE, leftovers) if leftovers else DirState(UNINSTALLER_ONLY)
+
+
+def wait_until_settled(path, *, timeout: float = SETTLE_TIMEOUT, listdir=None,
+                       sleep=time.sleep, now=time.monotonic) -> DirState:
+    """Poll until the uninstaller has finished with ``path``, or ``timeout``.
+
+    This RELAXES NOTHING. Whatever state the directory is in when the deadline
+    passes is what gets asserted on, by the same predicate as before: a
+    directory still holding program files at the end still fails, and now names
+    them. All the wait removes is the possibility of passing judgement on a
+    removal that is still in progress.
+    """
+    deadline = now() + timeout
+    state = directory_state(path, listdir=listdir)
+    while not state.settled and now() < deadline:
+        sleep(0.5)
+        state = directory_state(path, listdir=listdir)
+    return state
 
 
 def check(name: str, ok: bool, detail: str = "") -> bool:
@@ -87,6 +207,11 @@ def main() -> int:
     # Inno's uninstaller spawns a copy of itself and returns immediately; the
     # work happens in the child. Poll for the registry entry to disappear
     # rather than assuming the exit code means "finished".
+    #
+    # THE REGISTRY ENTRY IS NOT THE LAST THING TO GO. It proves the uninstall
+    # reached its registry step; the stub and the directory holding it are
+    # removed after that. `wait_until_settled` below is the second half of this
+    # wait, and the half that was missing.
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline and registry_value("DisplayVersion"):
         time.sleep(2)
@@ -94,19 +219,13 @@ def main() -> int:
     check("the uninstall entry is gone", registry_value("DisplayVersion") is None,
           str(registry_value("DisplayVersion")))
 
-    # `unins000.exe` is the uninstaller itself, and a running program cannot
-    # delete its own image. Inno schedules it for removal at the next reboot;
-    # until then it legitimately remains, alone, in an otherwise empty
-    # directory. Treating that as residue fails every correct uninstall — which
-    # it did on the first run of this script.
-    SELF = {"unins000.exe", "unins000.dat"}
+    # WAIT FOR THE UNINSTALLER TO FINISH WITH THE DIRECTORY — not merely for the
+    # registry entry to go, which is what the poll above proves and which Inno
+    # does BEFORE it removes its own stub and the directory holding it.
     if install_dir:
-        leftovers = []
-        root = Path(install_dir)
-        if root.is_dir():
-            leftovers = [p.name for p in root.iterdir() if p.name.lower() not in SELF]
+        state = wait_until_settled(Path(install_dir))
         check("no program files survive except the uninstaller itself",
-              not leftovers, f"{len(leftovers)} entries: {leftovers[:8]}")
+              state.settled, state.describe())
 
     # The sweep, run by the same detection code the upgrade uses.
     #
@@ -127,12 +246,6 @@ def main() -> int:
     # `install-pip` is the CI checkout's own editable install and `data` is
     # preserved by policy; neither is residue of the packaged product.
     assert L_INSTALL_PIP and L_DATA  # named so the exclusions are explicit
-    def _only_the_uninstaller(path: Path) -> bool:
-        """A directory holding nothing but Inno's own stub is not residue."""
-        try:
-            return all(p.name.lower() in SELF for p in Path(path).iterdir())
-        except OSError:
-            return False
 
     def _inside_preserved_data(path) -> bool:
         """Is this inside the directory the uninstaller deliberately keeps?
@@ -151,12 +264,21 @@ def main() -> int:
         except ValueError:
             return False
 
-    residue = [f for f in result.findings
-               if f.layout in (L_INSTALL_USER, L_INSTALL_MACHINE, L_LEGACY_ARTIFACT)
-               and not _only_the_uninstaller(f.path)
-               and not _inside_preserved_data(f.path)]
+    # Judged by the SAME predicate as the check above, and each survivor is
+    # named. `install-user: <path>` on its own is what run 30692207245 printed,
+    # and it is not enough to tell a failed uninstall from one still finishing.
+    residue: list[tuple[object, DirState]] = []
+    for finding in result.findings:
+        if finding.layout not in (L_INSTALL_USER, L_INSTALL_MACHINE, L_LEGACY_ARTIFACT):
+            continue
+        if _inside_preserved_data(finding.path):
+            continue
+        state = directory_state(finding.path)
+        if not state.settled:
+            residue.append((finding, state))
     check("a fresh scan finds no packaged installation", not residue,
-          "; ".join(f"{f.layout}: {f.path}" for f in residue) or "clean")
+          "; ".join(f"{f.layout}: {f.path} — {s.describe()}" for f, s in residue)
+          or "clean")
     check("a fresh scan finds no registrations", not result.registrations,
           f"{len(result.registrations)} registration(s)")
     check("no product PATH entries survive", not result.path_entries,
