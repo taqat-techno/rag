@@ -760,11 +760,22 @@ jobs:
     # about the change, and a check that is always red is a check people learn
     # to ignore.
     #
-    # On a tag push it is exactly right, and it is the only moment it is. That
-    # is also why the step below passes `--wait-for-asset`: this workflow and
-    # `release.yml` are triggered by the SAME tag push, so when this job starts
-    # the installer it must hash is still being built on another runner.
-    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    # On a STABLE tag push it is exactly right, and that is the only moment it
+    # is. That is also why the step below passes `--wait-for-asset`: this
+    # workflow and `release.yml` are triggered by the SAME tag push, so when
+    # this job starts the installer it must hash is still being built on
+    # another runner.
+    #
+    # PRE-RELEASE TAGS ARE EXCLUDED, and not for convenience. Winget serves
+    # stable releases; there is no `winget install` of `v3.5.1-rc.1`, and no
+    # manifest that could describe one. `release.yml` already draws exactly
+    # this line — `prerelease: ${{ contains(github.ref_name, '-') }}` — so a
+    # release candidate publishes as a pre-release while the manifest still
+    # points, correctly, at the last stable version. Demanding a match there
+    # would fail every release candidate for being a release candidate, and the
+    # first thing anyone does with a gate that is wrong about the world is stop
+    # believing it.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90          # 70 min of asset wait, 20 min of margin
     steps:
@@ -865,6 +876,13 @@ jobs:
           TAG_ONLY: |
             winget-manifest ${{ needs.winget-manifest.result }}
           IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          # A pre-release tag is a tag, but it is not a tag the TAG-ONLY legs
+          # can pass. `winget-manifest` compares the committed manifest against
+          # the published stable installer, and an RC deliberately does not
+          # produce one — `release.yml` publishes it as a pre-release and the
+          # manifest keeps pointing at the last stable version. So on `-rc.N`
+          # the honest expectation is `skipped`, exactly as on a non-tag run.
+          IS_STABLE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
           # BEST-EFFORT. Named out loud, never waited on, never decisive.
           # Deliberately NOT read from `needs.suite-macos-intel.outputs` — that
           # expression is what put the job in `needs` and let it hold the gate
@@ -885,10 +903,11 @@ jobs:
           done <<< "$BLOCKING"
 
           echo ""
-          echo "TAG-ONLY legs - blocking on a tag push (is_tag=$IS_TAG)"
+          echo "TAG-ONLY legs - blocking on a STABLE tag push" \
+               "(is_tag=$IS_TAG, is_stable_tag=$IS_STABLE_TAG)"
           while read -r job result; do
             [ -n "${job:-}" ] || continue
-            if [ "$IS_TAG" = "true" ]; then
+            if [ "$IS_STABLE_TAG" = "true" ]; then
               if [ "$result" = "success" ]; then
                 printf '  PASS         %-22s (%s, tag push)\n' "$job" "$result"
               else
@@ -896,14 +915,15 @@ jobs:
                 blocked=$((blocked + 1))
               fi
             elif [ "$result" = "skipped" ]; then
-              printf '  N/A          %-22s (%s - the release it validates does\n' \
+              printf '  N/A          %-22s (%s - no stable release for it to\n' \
                 "$job" "$result"
-              printf '               not exist yet on a non-tag run)\n'
+              printf '               validate on this run)\n'
             else
-              # Not tolerated. `skipped` is the only defensible result off a
-              # tag; anything else means the `if:` condition and this list have
-              # drifted apart, and a gate that shrugs at that is guessing.
-              printf '  UNEXPECTED   %-22s (%s on a non-tag run)\n' "$job" "$result"
+              # Not tolerated. `skipped` is the only defensible result when
+              # there is no stable tag; anything else means the `if:` condition
+              # and this list have drifted apart, and a gate that shrugs at
+              # that is guessing.
+              printf '  UNEXPECTED   %-22s (%s without a stable tag)\n' "$job" "$result"
               blocked=$((blocked + 1))
             fi
           done <<< "$TAG_ONLY"
