@@ -207,6 +207,20 @@ _FULL_SUITE = Suite(
                 "for it to assert on Linux or macOS"),
         ),
         ApprovedSkip(
+            nodeid=("tests/test_installer_quiescence_contract.py::"
+                    "test_the_real_enumerator_finds_an_engine_under_the_installation"
+                    "_and_spares_one_outside"),
+            reasons=("Windows PowerShell is the interpreter under test",),
+            justification=(
+                "it starts two real 64-bit processes named qdrant.exe and runs "
+                "the real Get-OwnedProcess over them under EVERY PowerShell host "
+                "on the machine — including the 32-bit one Inno's 32-bit Setup "
+                "actually launches, where Process.Path is $null and "
+                "Process.Modules is empty for every 64-bit process. There is no "
+                "Windows PowerShell, no WOW64 and no {app} off Windows, so no "
+                "job can lift this"),
+        ),
+        ApprovedSkip(
             nodeid="tests/test_scanner_resilience.py::test_a_junction_loop_does_not_multiply_the_index",
             reasons=("junctions are Windows-only",
                      "could not create a junction on this runner"),

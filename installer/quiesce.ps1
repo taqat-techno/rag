@@ -196,6 +196,14 @@ $Script:SettleMilliseconds = 2500
 $Script:SettleRounds = 3
 $Script:RetryBackoffSeconds = @(1, 3, 9)
 
+# How the engine stop AWAITS. `Stop-Process` returns when the request has been
+# issued; the kernel releases the image's file handle afterwards, and the delete
+# that follows fails in exactly that gap. So the phase does not report until it
+# has LOOKED and found the process gone.
+$Script:PollMilliseconds        = 250
+$Script:EngineGraceMilliseconds = 2000
+$Script:EngineExitMilliseconds  = 10000
+
 # ---------------------------------------------------------------------------
 # Bookkeeping
 # ---------------------------------------------------------------------------
@@ -382,6 +390,72 @@ function Test-UnderRoot {
     return ($child -eq $parent) -or ($child.StartsWith($parent + '/'))
 }
 
+function Get-ProcessTable {
+    <#
+        pid -> executable path and command line, asked of the WMI service.
+
+        THIS IS THE 3.5.1 ENGINE DEFECT, and nothing about it is visible in the
+        code that broke. `installer.iss` declares no 64-bit architecture, so
+        Inno's Setup binary is 32-bit and `Exec('powershell.exe', ...)` resolves
+        through WOW64 to the 32-bit PowerShell. From a 32-bit host, .NET's
+        Process.Path and Process.Modules go through EnumProcessModules against a
+        64-bit target. Measured on Windows 11, 32-bit PowerShell, live product:
+
+            pid 46132 qdrant: Path=<NULL> (no exception) Modules=[]
+            pid 18732 rag   : Path=<NULL> (no exception) Modules=[]
+
+        NOT an error. $null and an EMPTY collection, silently, for every 64-bit
+        process on the machine - which is every process this product runs. So
+        Get-OwnedProcess collected no executable evidence and no module
+        evidence, the `catch` never fired, and qdrant.exe - which earns no
+        image-name evidence BY DESIGN, because the name is common and
+        storage_backend = "external" means a server the user runs - produced no
+        evidence at all. The managed engine was therefore invisible to
+        stop_managed_engine, to identify_holders, to wait_for_exit and to
+        verify_clear, which reported "no owned process is running" while the
+        engine held four files [InstallDelete] was about to remove. Only
+        probe_replaceable saw the truth, and by then all it can do is refuse:
+
+            reason=files_not_replaceable  quiescent=False  elapsed=17.126s
+            blocker: <install>\bin\qdrant.exe          in use by another process
+            blocker: <install>\_internal\msvcp140.dll          "
+            blocker: <install>\_internal\vcruntime140.dll      "
+            blocker: <install>\_internal\vcruntime140_1.dll    "
+
+        with ZERO process blockers, and an elapsed far too short for the retry
+        loop to have run - because there was never anything for it to retry.
+        rag.exe and ragw.exe survived the same blindness only because they are
+        killed by NAME through taskkill, which needs no introspection. That also
+        explains, at last, the measurement recorded above this file's image-name
+        lists: the path-scoped PowerShell equivalent that "failed with
+        DeleteFile failed; code 5, with owned processes still alive" failed for
+        exactly this reason.
+
+        Win32_Process is answered by the WMI service out of process, so it is
+        bitness-independent and reads no target memory. From the SAME 32-bit
+        host, the same pid, it returned the executable path and the command line
+        correctly. One bulk query per enumeration (~450 ms for ~590 processes
+        here), not one per process.
+
+        A query that fails returns an EMPTY table rather than throwing: this is
+        reached from decisive phases, and an exception here would abort the
+        protocol instead of degrading its evidence.
+    #>
+    $table = @{}
+    try {
+        foreach ($row in @(Get-CimInstance -ClassName Win32_Process `
+                                           -Property ProcessId, ExecutablePath, CommandLine `
+                                           -ErrorAction Stop)) {
+            $table[[int] $row.ProcessId] = @{
+                ExecutablePath = [string] $row.ExecutablePath
+                CommandLine    = [string] $row.CommandLine
+            }
+        }
+    }
+    catch { }
+    return $table
+}
+
 function Get-OwnedProcess {
     <#
         Every process this installation owns, with the EVIDENCE that says so.
@@ -392,18 +466,31 @@ function Get-OwnedProcess {
             filter cannot see, and the case that produced [PYI-2072];
           * its image name is one this product owns outright.
 
-        qdrant.exe earns no name evidence. That is the whole point.
+        qdrant.exe earns no name evidence. That is the whole point - and it is
+        why the executable path must be obtainable by more than one mechanism.
+        For the engine the PATH IS THE OWNERSHIP PROOF, so one unreadable
+        property is a single point of failure for the entire engine phase. See
+        Get-ProcessTable for what that cost.
 
         A process whose modules cannot be read is RECORDED as unscannable rather
         than dropped. It is not, on its own, a blocker - or every upgrade would
         refuse on System - but it is not evidence of quiescence either. The
         replaceability probe is what decides; this is what explains.
     #>
+    $table = Get-ProcessTable
     $owned = New-Object System.Collections.ArrayList
     foreach ($proc in @(Get-Process -ErrorAction SilentlyContinue)) {
         $evidence = New-Object System.Collections.ArrayList
         $exe = ''
         try { $exe = [string] $proc.Path } catch { $exe = '' }
+        $commandLine = ''
+        $row = $table[[int] $proc.Id]
+        if ($null -ne $row) {
+            # The fallback the engine's ownership rests on. This way round, not
+            # the other: Process.Path is already in hand when it works.
+            if (-not $exe) { $exe = [string] $row['ExecutablePath'] }
+            $commandLine = [string] $row['CommandLine']
+        }
         $modulesReadable = $true
         $modulePaths = @()
         try {
@@ -413,6 +500,12 @@ function Get-OwnedProcess {
             $modulesReadable = $false
             $modulePaths = @()
         }
+        # An EMPTY module list is not a successful scan. A live process has at
+        # least its own image mapped, so zero modules means the scan was refused
+        # or could not cross the bitness boundary - and calling that a clean scan
+        # is what let the 3.5.1 verdict report "0 process(es) refused a module
+        # scan" from a host that could read none of them.
+        if (@($modulePaths).Count -eq 0) { $modulesReadable = $false }
 
         if ((Test-UnderRoot $exe $AppDir) -or (Test-UnderRoot $exe $DataDir)) {
             [void] $evidence.Add('executable_under_installation')
@@ -437,28 +530,18 @@ function Get-OwnedProcess {
                 Executable      = $exe
                 Evidence        = @($evidence)
                 ModulesReadable = $modulesReadable
-                Role            = (Get-ProcessRole -ImageName $imageName -ProcessId $proc.Id)
+                Role            = (Get-ProcessRole -ImageName $imageName -CommandLine $commandLine)
             })
         }
     }
     return @($owned)
 }
 
-function Get-CommandLine {
-    param([int] $ProcessId)
-    try {
-        $row = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
-        if ($row) { return [string] $row.CommandLine }
-    }
-    catch { }
-    return ''
-}
-
 function Get-ProcessRole {
-    param([string] $ImageName, [int] $ProcessId)
+    param([string] $ImageName, [string] $CommandLine = '')
     if ($Script:PathScopedImageNames -contains $ImageName) { return 'engine' }
     if ($ImageName -like 'qdrant*') { return 'engine' }
-    $command = (Get-CommandLine -ProcessId $ProcessId).ToLowerInvariant()
+    $command = ([string] $CommandLine).ToLowerInvariant()
     if ($command -match 'supervis') { return 'supervisor' }
     if ($command -match '(?<![a-z])tray(?![a-z])') { return 'tray' }
     if ($Script:OwnedImageNames -contains $ImageName) { return 'service' }
@@ -487,9 +570,69 @@ function Request-GracefulStop {
         'tray'             { return ((Invoke-Bounded -FilePath $exe -ArgumentList @('tray', 'stop') -TimeoutMilliseconds 30000) -eq 0) }
         'supervisor'       { return ((Invoke-Bounded -FilePath $exe -ArgumentList @('service', 'stop') -TimeoutMilliseconds 60000) -eq 0) }
         'service'          { return ((Invoke-Bounded -FilePath $exe -ArgumentList @('service', 'stop') -TimeoutMilliseconds 60000) -eq 0) }
-        'engine'           { return $false }   # the engine is the service's child; stopping the service stops it
+        # The engine has no CLI stop of its own, and "stopping the service stops
+        # it" is an assumption this product has already been bitten by: an engine
+        # ORPHANED from a service that died (the 3.4.0 incident) has no parent
+        # left to ask, and taskkill /T cannot reach it either. It is asked
+        # directly in Stop-EngineProcess instead.
+        'engine'           { return $false }
         default            { return $false }
     }
+}
+
+function Wait-ProcessGone {
+    <#
+        Await ACTUAL EXIT, by LOOKING - never by believing the request.
+
+        Stop-Process returns once the request has been issued; the kernel
+        releases the image's file handle afterwards, and the delete that follows
+        fails in exactly that gap. Polling Get-Process rather than WaitForExit
+        deliberately: WaitForExit needs a handle this script may not be able to
+        open for a process it did not start, and a permission failure there would
+        read as "it exited".
+
+        Bounded twice - by its own timeout AND by the protocol deadline - so a
+        process that will never die cannot consume the whole upgrade window.
+    #>
+    param([int] $ProcessId, [int] $TimeoutMilliseconds)
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        try { [void] (Get-Process -Id $ProcessId -ErrorAction Stop) }
+        catch { return $true }
+        if ($watch.Elapsed.TotalMilliseconds -ge $TimeoutMilliseconds) { return $false }
+        if (Get-DeadlineExceeded) { return $false }
+        Start-Sleep -Milliseconds $Script:PollMilliseconds
+    }
+}
+
+function Stop-EngineProcess {
+    <#
+        Ask, then insist, then WAIT - in that order, for one managed engine.
+
+        The caller has ALREADY proven this pid's executable lies under -AppDir or
+        -DataDir. Nothing in here re-decides ownership and nothing in here may be
+        reached by path, only by pid: stopping a Qdrant this installation does not
+        own is data loss in someone else's application.
+
+        Returns whether the process is gone. Not whether a request was accepted -
+        that is the distinction the whole protocol is built on.
+    #>
+    param([int] $ProcessId)
+    $proc = $null
+    try { $proc = Get-Process -Id $ProcessId -ErrorAction Stop }
+    catch { return $true }
+    # Graceful first. qdrant.exe is a console process, so this lands only when it
+    # has a window; when it has none the call is a no-op and the wait below falls
+    # straight through to the terminate. Cheap either way, and it is the only
+    # chance the engine gets to close its storage cleanly.
+    try { [void] $proc.CloseMainWindow() } catch { }
+    if (Wait-ProcessGone -ProcessId $ProcessId `
+                         -TimeoutMilliseconds $Script:EngineGraceMilliseconds) {
+        return $true
+    }
+    try { Stop-Process -Id $ProcessId -Force -ErrorAction Stop } catch { }
+    return (Wait-ProcessGone -ProcessId $ProcessId `
+                             -TimeoutMilliseconds $Script:EngineExitMilliseconds)
 }
 
 function Invoke-RoleStop {
@@ -500,11 +643,16 @@ function Invoke-RoleStop {
         mechanism, deliberately not replaced by a tidier path-scoped one that
         was measured to fail. Everything else is stopped by PID, and the engine
         only when its executable lies under -AppDir or -DataDir.
+
+        The engine additionally WAITS. It is the one role with no CLI stop and no
+        taskkill behind it, so if this phase does not confirm the exit, nothing
+        before probe_replaceable does - and probe_replaceable can only refuse.
     #>
     param([string] $Role)
     $asked = Request-GracefulStop -Role $Role
     $stopped = New-Object System.Collections.ArrayList
     $spared = 0
+    $exited = 0
 
     if ($Role -eq 'service') {
         foreach ($image in $Script:OwnedImageNames) {
@@ -517,11 +665,17 @@ function Invoke-RoleStop {
     foreach ($proc in (Get-OwnedProcess)) {
         if ($proc.Role -ne $Role) { continue }
         if ($Role -eq 'engine') {
+            # The scoping rule, unchanged and load-bearing. An engine whose
+            # executable we could not resolve AT ALL lands here too, and is
+            # spared: unattributable is not ours.
             if (-not ((Test-UnderRoot $proc.Executable $AppDir) -or
                       (Test-UnderRoot $proc.Executable $DataDir))) {
                 $spared++
                 continue
             }
+            [void] $stopped.Add($proc.Pid)
+            if (Stop-EngineProcess -ProcessId $proc.Pid) { $exited++ }
+            continue
         }
         try {
             Stop-Process -Id $proc.Pid -Force -ErrorAction Stop
@@ -529,13 +683,19 @@ function Invoke-RoleStop {
         }
         catch { }
     }
-    return @{ asked = $asked; stopped = @($stopped); spared = $spared }
+    return @{ asked = $asked; stopped = @($stopped); spared = $spared; exited = $exited }
 }
 
 function Format-StopDetail {
-    param($Result)
+    param($Result, [string] $Role)
     $detail = "graceful request $(if ($Result.asked) { 'accepted' } else { 'unavailable' }); " +
               "stop issued to $(@($Result.stopped).Count) process(es)"
+    if ($Role -eq 'engine') {
+        $issued = @($Result.stopped).Count
+        # Named separately from the count of stops ISSUED, because those are
+        # different facts and conflating them is what the 3.5.1 verdict did.
+        $detail += "; $($Result.exited) of $issued confirmed gone"
+    }
     if ($Result.spared -gt 0) {
         $detail += "; left $($Result.spared) Qdrant process(es) alone - outside this " +
                    'installation, so not ours to stop'
@@ -654,10 +814,13 @@ function Invoke-IdentifyHolders {
     $owned = @(Get-OwnedProcess)
     $found = New-Object System.Collections.ArrayList
     foreach ($proc in $owned) { [void] $found.Add((Format-ProcessBlocker -Process $proc)) }
+    # Same rule as Get-OwnedProcess: zero modules is a scan that did not happen,
+    # not a process with nothing mapped. Counting an empty result as a successful
+    # scan is what made this line report 0 on a host that could read none of them.
     $unscannable = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
-        $readable = $true
-        try { [void] $_.Modules } catch { $readable = $false }
-        if (-not $readable) { $_.Id }
+        $moduleCount = 0
+        try { $moduleCount = @($_.Modules).Count } catch { $moduleCount = 0 }
+        if ($moduleCount -eq 0) { $_.Id }
     })
     $detail = "$($owned.Count) owned process(es) still running"
     if ($unscannable.Count -gt 0) {
@@ -734,7 +897,16 @@ function Invoke-VerifyClear {
                   detail  = "$($owned.Count) owned process(es) survived every stop"
                   blockers = @($found) }
     }
-    return @{ detail = 'no owned process is running' }
+    $detail = 'no owned process is running'
+    # "Nothing is running" and "nothing could be identified" are opposite facts
+    # that used to read identically. When the process table cannot be answered,
+    # path scoping is BLIND - and the engine's ownership is nothing but path.
+    if ((Get-ProcessTable).Count -eq 0) {
+        $detail += '; the process table could not be read, so this is the absence ' +
+                   'of evidence and not evidence of absence - the replaceability ' +
+                   'probe is what decides'
+    }
+    return @{ detail = $detail }
 }
 
 function Test-Replaceable {
@@ -933,10 +1105,10 @@ try {
 
     Invoke-Phase -Name 'enter_maintenance'     -Body { Invoke-EnterMaintenance }
     Invoke-Phase -Name 'disable_tasks'         -Body { Invoke-DisableTasks }
-    Invoke-Phase -Name 'stop_tray'             -Body { @{ detail = (Format-StopDetail (Invoke-RoleStop -Role 'tray')) } }
-    Invoke-Phase -Name 'stop_supervisor'       -Body { @{ detail = (Format-StopDetail (Invoke-RoleStop -Role 'supervisor')) } }
-    Invoke-Phase -Name 'stop_service_children' -Body { @{ detail = (Format-StopDetail (Invoke-RoleStop -Role 'service')) } }
-    Invoke-Phase -Name 'stop_managed_engine'   -Body { @{ detail = (Format-StopDetail (Invoke-RoleStop -Role 'engine')) } }
+    Invoke-Phase -Name 'stop_tray'             -Body { @{ detail = (Format-StopDetail -Result (Invoke-RoleStop -Role 'tray')       -Role 'tray') } }
+    Invoke-Phase -Name 'stop_supervisor'       -Body { @{ detail = (Format-StopDetail -Result (Invoke-RoleStop -Role 'supervisor') -Role 'supervisor') } }
+    Invoke-Phase -Name 'stop_service_children' -Body { @{ detail = (Format-StopDetail -Result (Invoke-RoleStop -Role 'service')    -Role 'service') } }
+    Invoke-Phase -Name 'stop_managed_engine'   -Body { @{ detail = (Format-StopDetail -Result (Invoke-RoleStop -Role 'engine')     -Role 'engine') } }
     Invoke-Phase -Name 'identify_holders'      -Body { Invoke-IdentifyHolders }
     Invoke-Phase -Name 'wait_for_exit'         -Body { Invoke-WaitForExit }
     Invoke-Phase -Name 'retry_safe_shutdown'   -Body { Invoke-RetrySafeShutdown }

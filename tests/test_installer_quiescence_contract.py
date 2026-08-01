@@ -31,9 +31,12 @@ platform; nothing here needs Windows.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -186,13 +189,32 @@ def declarations_and_functions(script: str) -> str:
     return script[start:end]
 
 
-def run_powershell(body: str, tmp_path: Path) -> subprocess.CompletedProcess:
-    probe = tmp_path / "probe.ps1"
+def run_powershell(body: str, tmp_path: Path,
+                   interpreter: str = "powershell.exe") -> subprocess.CompletedProcess:
+    probe = tmp_path / f"probe-{abs(hash(interpreter)) % 10**8}.ps1"
     probe.write_text(body, encoding="utf-8")
     return subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive",
+        [interpreter, "-NoProfile", "-NonInteractive",
          "-ExecutionPolicy", "Bypass", "-File", str(probe)],
         capture_output=True, text=True, timeout=180)
+
+
+def powershell_hosts() -> list[tuple[str, str]]:
+    """Every Windows PowerShell this script can actually be launched by.
+
+    Not a detail: ``installer.iss`` declares no 64-bit architecture, so Inno's
+    Setup binary is 32-bit and its ``Exec('powershell.exe', ...)`` resolves
+    through WOW64 to ``SysWOW64\\WindowsPowerShell`` — the 32-bit host. Any
+    property of this script that only holds under the 64-bit host is a property
+    the shipped installer does not have.
+    """
+    root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    found = []
+    for label, folder in (("64-bit", "System32"), ("32-bit", "SysWOW64")):
+        exe = root / folder / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        if exe.is_file():
+            found.append((label, str(exe)))
+    return found
 
 
 def invoked_phases(script: str) -> list[str]:
@@ -856,6 +878,206 @@ def test_the_image_name_versus_path_scoping_reasoning_survives():
         "kill mechanism — the path-scoped PowerShell equivalent that was tried "
         "and failed"
     )
+
+
+# ==========================================================================
+# The 3.5.1 ENGINE defect: the managed engine was never stopped, because the
+# enumerator could not see it
+# ==========================================================================
+
+
+def test_the_engines_ownership_does_not_rest_on_one_unreadable_property():
+    """`qdrant.exe` earns no image-name evidence BY DESIGN, so for the engine the
+    executable PATH is the entire ownership proof — and until 3.5.1 that path had
+    exactly one source, `Process.Path`, which shares a primitive with
+    `Process.Modules`. Both go through `EnumProcessModules`, so they fail
+    TOGETHER. Measured under the 32-bit PowerShell that Inno's 32-bit Setup
+    actually launches, against the live product:
+
+        pid 46132 qdrant: Path=<NULL> (no exception) Modules=[]
+
+    `$null` and an empty collection, with nothing raised. So the engine gathered
+    no evidence at all, `stop_managed_engine` iterated an empty set,
+    `verify_clear` reported "no owned process is running", and the only phase
+    that saw the truth was `probe_replaceable` — which can only refuse:
+    `files_not_replaceable`, four locked files, ZERO process blockers.
+    """
+    script = quiesce_code()
+    body = re.search(r"function Get-OwnedProcess\b.*?\n\}", script, re.DOTALL)
+    assert body, "quiesce.ps1 has no process-ownership enumerator"
+    text = body.group(0)
+
+    assert re.search(r"Get-ProcessTable", text), (
+        "the enumerator has a single source for the executable path. For "
+        "qdrant.exe the path IS the ownership proof, so one unreadable property "
+        "makes the managed engine invisible to every phase that stops or proves "
+        "anything"
+    )
+
+    table = re.search(r"function Get-ProcessTable\b.*?\n\}", script, re.DOTALL)
+    assert table, "quiesce.ps1 has no bitness-independent process table"
+    assert "Win32_Process" in table.group(0), (
+        "the fallback does not go through the WMI service, which is the only "
+        "source of an executable path that a 32-bit host can read for a 64-bit "
+        "process"
+    )
+    assert "ExecutablePath" in table.group(0), (
+        "the fallback does not read the executable path, so path scoping still "
+        "has nothing to scope by"
+    )
+    assert re.search(r"catch\s*\{", table.group(0)), (
+        "a failed process-table query would throw out of a DECISIVE phase and "
+        "abort the protocol rather than degrade its evidence"
+    )
+
+
+def test_an_empty_module_list_is_not_counted_as_a_successful_scan():
+    """The silent half. A live process has at least its own image mapped, so
+    zero modules means the scan did not happen — and reporting it as a clean scan
+    is what let the 3.5.1 verdict say "0 process(es) refused a module scan" from
+    a host that could read none of them."""
+    script = quiesce_code()
+    for name in ("Get-OwnedProcess", "Invoke-IdentifyHolders"):
+        body = re.search(rf"function {name}\b.*?\n\}}", script, re.DOTALL)
+        assert body, f"quiesce.ps1 has no {name}"
+        assert "Modules" in body.group(0), f"{name} no longer looks at modules at all"
+        assert re.search(r"Count\s*-eq\s*0", body.group(0)), (
+            f"{name} treats an empty module list as a scan that succeeded, so a "
+            f"host that can read no modules at all reports a clean sweep"
+        )
+
+
+def test_the_engine_stop_awaits_actual_exit_rather_than_a_delivered_signal():
+    """`Stop-Process` returns when the request is issued; the kernel releases the
+    image's file handle afterwards, and `[InstallDelete]` fails in exactly that
+    gap. The engine is the one role with no CLI stop and no `taskkill` behind it,
+    so if this phase does not confirm the exit, nothing before the probe does."""
+    script = quiesce_code()
+
+    stop = re.search(r"function Invoke-RoleStop\b.*?\n\}", script, re.DOTALL)
+    assert stop, "quiesce.ps1 has no role-stop implementation"
+    assert "Stop-EngineProcess" in stop.group(0), (
+        "the engine is stopped by a bare Stop-Process, which proves only that a "
+        "request was issued"
+    )
+
+    engine = re.search(r"function Stop-EngineProcess\b.*?\n\}", script, re.DOTALL)
+    assert engine, "quiesce.ps1 has no engine stop"
+    text = engine.group(0)
+    graceful = text.index("CloseMainWindow")
+    forceful = text.index("Stop-Process")
+    assert graceful < forceful, (
+        "the engine is terminated before it is asked, so it never gets the "
+        "chance to close its storage cleanly"
+    )
+    assert text.count("Wait-ProcessGone") >= 2, (
+        "the engine stop does not wait after BOTH the graceful request and the "
+        "terminate"
+    )
+
+    waiter = re.search(r"function Wait-ProcessGone\b.*?\n\}", script, re.DOTALL)
+    assert waiter, "quiesce.ps1 has no waiter"
+    assert "Get-Process" in waiter.group(0), (
+        "the wait believes a return value instead of looking"
+    )
+    assert "Get-DeadlineExceeded" in waiter.group(0), (
+        "the wait is not bounded by the protocol deadline, so one process that "
+        "will never die can consume the whole upgrade window"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="Windows PowerShell is the interpreter under test")
+def test_the_real_enumerator_finds_an_engine_under_the_installation_and_spares_one_outside(
+        tmp_path):
+    """The 3.5.1 engine defect, asked of the REAL script, with REAL processes.
+
+    Two 64-bit processes named ``qdrant.exe``: one inside a temporary ``{app}``,
+    one outside it. The one inside must be found as ``engine`` with
+    ``executable_under_installation``; the one outside must not appear at all,
+    because ``storage_backend = "external"`` means a server the user runs and
+    stopping it would be data loss in someone else's application.
+
+    Run under EVERY PowerShell host on the machine, and that is the point.
+    ``installer.iss`` declares no 64-bit architecture, so Inno's Setup is 32-bit
+    and its ``Exec('powershell.exe', ...)`` gets the WOW64-redirected 32-bit
+    host — where ``Process.Path`` is ``$null`` and ``Process.Modules`` is empty
+    for every 64-bit process, silently. Measured against the pre-fix script:
+
+        PRE-CHANGE, 32-bit: FOUND=0        <- the shipped installer's host
+        PRE-CHANGE, 64-bit: FOUND=1
+
+    A test that only ran under the 64-bit host would have been green throughout
+    the incident.
+
+    Executed, not grepped: the interpreter's behaviour is the thing that was
+    wrong, and no amount of reading the source reveals it.
+    """
+    hosts = powershell_hosts()
+    assert hosts, "no Windows PowerShell was found to run the protocol under"
+
+    system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    stand_in = system32 / "ping.exe"          # 64-bit, self-contained, idles on demand
+    assert stand_in.is_file(), f"{stand_in} is missing; nothing to stand in for the engine"
+
+    app = tmp_path / "app"
+    (app / "bin").mkdir(parents=True)
+    outside = tmp_path / "someone-elses-qdrant"
+    outside.mkdir()
+    ours = app / "bin" / "qdrant.exe"
+    theirs = outside / "qdrant.exe"
+    shutil.copy(stand_in, ours)
+    shutil.copy(stand_in, theirs)
+
+    idle = ["-n", "60", "127.0.0.1"]
+    mine = subprocess.Popen([str(ours), *idle],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    yours = subprocess.Popen([str(theirs), *idle],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1.5)          # let both processes actually exist
+        body = declarations_and_functions(quiesce_source()) + f"""
+$AppDir = '{app}'
+$DataDir = '{tmp_path / "data"}'
+$TimeoutSeconds = 120
+foreach ($p in (Get-OwnedProcess)) {{
+    Write-Output "OWNED pid=$($p.Pid) role=$($p.Role) evidence=$([string]::Join(',', $p.Evidence))"
+}}
+Write-Output 'ENUMERATED'
+"""
+        for label, interpreter in hosts:
+            result = run_powershell(body, tmp_path, interpreter=interpreter)
+            output = (result.stdout or "") + (result.stderr or "")
+            assert "ENUMERATED" in output, (
+                f"the enumeration did not finish under the {label} host:\n{output}"
+            )
+
+            mine_rows = [line for line in output.splitlines()
+                         if line.startswith(f"OWNED pid={mine.pid} ")]
+            assert mine_rows, (
+                f"under the {label} PowerShell host the managed engine at "
+                f"{ours} was NOT found. This is the 3.5.1 defect exactly: the "
+                f"engine is invisible to stop_managed_engine, to wait_for_exit "
+                f"and to verify_clear, which reports 'no owned process is "
+                f"running' while the engine holds the files [InstallDelete] is "
+                f"about to remove.\n{output}"
+            )
+            assert "role=engine" in mine_rows[0], mine_rows[0]
+            assert "executable_under_installation" in mine_rows[0], (
+                f"the engine was found by something other than its PATH, which "
+                f"is the only evidence qdrant.exe is allowed to earn: "
+                f"{mine_rows[0]}"
+            )
+            assert not [line for line in output.splitlines()
+                        if line.startswith(f"OWNED pid={yours.pid} ")], (
+                f"under the {label} host a Qdrant OUTSIDE this installation "
+                f"({theirs}) was claimed as ours. Stopping it would be data loss "
+                f"in another application caused by installing this one.\n{output}"
+            )
+    finally:
+        for proc in (mine, yours):
+            proc.kill()
+            proc.wait(timeout=30)
 
 
 def test_the_proven_kill_mechanism_was_carried_across_not_reinvented():

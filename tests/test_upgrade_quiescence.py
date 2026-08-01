@@ -108,8 +108,18 @@ class FakeTasks:
 
 
 class FakeProcesses:
+    """The process table, with the gap the whole protocol turns on.
+
+    ``linger`` models it: a stop that is accepted, after which the process is
+    STILL IN THE TABLE for a few more looks. That is not a contrivance — it is
+    what Windows does. `taskkill`/`Stop-Process` return once the request has been
+    issued; the kernel releases the image's file handle afterwards, and the
+    delete that follows fails in exactly that gap.
+    """
+
     def __init__(self, procs=(), *, refuse=(), respawn=(), tasks: FakeTasks | None = None,
-                 attempts_needed: dict | None = None, raises: bool = False) -> None:
+                 attempts_needed: dict | None = None, raises: bool = False,
+                 linger: dict | None = None) -> None:
         self.procs = {p.pid: p for p in procs}
         self.refuse = set(refuse)
         self.respawn = set(respawn)
@@ -117,16 +127,27 @@ class FakeProcesses:
         self.attempts_needed = dict(attempts_needed or {})
         self.attempts: dict[int, int] = {}
         self.stop_calls: list[int] = []
+        #: (pid, force) for every stop request, so "asked" and "insisted" stay
+        #: distinguishable — `stop_calls` cannot tell them apart.
+        self.stop_requests: list[tuple[int, bool]] = []
+        self.linger = dict(linger or {})
+        self.dying: dict[int, int] = {}
         self.raises = raises
         self._next_pid = 9000
 
     def list_processes(self):
         if self.raises:
             raise OSError("the process table could not be read")
+        for pid in list(self.dying):
+            self.dying[pid] -= 1
+            if self.dying[pid] <= 0:
+                del self.dying[pid]
+                self.procs.pop(pid, None)
         return list(self.procs.values())
 
     def stop(self, pid: int, *, force: bool = False) -> bool:
         self.stop_calls.append(pid)
+        self.stop_requests.append((pid, force))
         proc = self.procs.get(pid)
         if proc is None:
             return False
@@ -139,6 +160,9 @@ class FakeProcesses:
             self.attempts[pid] = self.attempts.get(pid, 0) + 1
             if self.attempts[pid] < need:
                 return True
+        if pid in self.linger:
+            self.dying[pid] = self.linger.pop(pid)
+            return True
         del self.procs[pid]
         if pid in self.respawn and self.tasks is not None and self.tasks.armed:
             self._next_pid += 1
@@ -204,10 +228,11 @@ def mcp_client(pid=105):
 
 def build(procs=(), *, refuse=(), respawn=(), attempts_needed=None,
           tasks=None, locks=None, present=True, timeout=120.0,
-          accepts=("tray", "supervisor", "service"), raises=False):
+          accepts=("tray", "supervisor", "service"), raises=False, linger=None):
     tasks = tasks if tasks is not None else FakeTasks()
     processes = FakeProcesses(procs, refuse=refuse, respawn=respawn, tasks=tasks,
-                              attempts_needed=attempts_needed, raises=raises)
+                              attempts_needed=attempts_needed, raises=raises,
+                              linger=linger)
     ports = q.Ports(
         installation=FakeInstallation(present=present, accepts=accepts),
         processes=processes,
@@ -303,6 +328,119 @@ def test_the_managed_engine_is_stopped_but_a_foreign_qdrant_is_not():
     assert verdict.exit_code == q.EXIT_QUIESCENT
     assert theirs.pid not in blocker_pids(verdict), (
         "a foreign Qdrant was reported as blocking OUR upgrade"
+    )
+
+
+def test_the_engine_is_asked_before_it_is_terminated():
+    """The engine is the one role with no CLI stop of its own.
+
+    `rag.exe service stop` stops the SERVICE, and an engine ORPHANED from a
+    service that already died — the 3.4.0 incident — has no parent left to ask
+    and is out of reach of `taskkill /T`. So the engine is asked directly first
+    and terminated only if that does not take, which is the one chance it gets
+    to close its storage cleanly.
+    """
+    ours = engine(pid=210, executable=DATA + r"\bin\qdrant.exe")
+    config, ports = build([ours], linger={ours.pid: 3})
+    q.run(config, ports)
+
+    mine = [force for pid, force in ports.processes.stop_requests if pid == ours.pid]
+    assert mine, "the managed engine was never stopped at all"
+    assert mine[0] is False, (
+        f"the engine was terminated before it was asked: {mine}"
+    )
+
+
+def test_the_engine_stop_awaits_the_engines_actual_exit():
+    """A signal delivered is not a handle released.
+
+    `stop()` returns once the request has been issued; the kernel releases the
+    image's file handle afterwards, and the delete that follows fails in exactly
+    that gap. The engine is the only role with neither a CLI stop nor an
+    image-name kill behind it, so if THIS phase does not confirm the exit,
+    nothing before `probe_replaceable` does — and by then all that phase can do
+    is refuse.
+    """
+    ours = engine(pid=211, executable=DATA + r"\bin\qdrant.exe")
+    config, ports = build([ours], linger={ours.pid: 3})
+    verdict = q.run(config, ports)
+
+    phase = verdict.phase(q.PHASE_STOP_ENGINE)
+    assert phase is not None and phase.outcome == q.OUTCOME_OK
+    assert "1 of 1 confirmed gone" in phase.detail, (
+        f"the engine stop reported only that a request was issued: "
+        f"{phase.detail!r}. That is the fate of the REQUEST, not of the process."
+    )
+    assert ports.clock.slept, (
+        "the phase never waited, so it cannot have observed anything change"
+    )
+    assert verdict.exit_code == q.EXIT_QUIESCENT
+
+
+def test_an_engine_that_will_not_die_is_named_by_the_phase_that_should_have_stopped_it():
+    """The other half: waiting must not turn into believing.
+
+    A refusal that names the engine is actionable. `files_not_replaceable` with
+    zero process blockers — the 3.5.1 verdict — is not.
+    """
+    ours = engine(pid=212, executable=DATA + r"\bin\qdrant.exe")
+    config, ports = build([ours], refuse=[ours.pid])
+    verdict = q.run(config, ports)
+
+    phase = verdict.phase(q.PHASE_STOP_ENGINE)
+    assert "0 of 1 confirmed gone" in phase.detail, (
+        f"an engine that survived every stop was reported as though it had not: "
+        f"{phase.detail!r}"
+    )
+    assert verdict.exit_code == q.EXIT_NOT_QUIESCENT
+    assert verdict.reason == q.REASON_PROCESSES_SURVIVED
+    assert ours.pid in blocker_pids(verdict)
+
+
+def test_an_engine_whose_executable_cannot_be_read_is_spared_not_stopped():
+    """Unattributable is not ours.
+
+    A GUARD, not a regression: this passes before and after the engine fix, and
+    that is the point — making the engine visible again must not make it
+    stoppable on weaker evidence than its path. The scoping rule has to hold in
+    the direction that costs us the upgrade as well as the one that costs
+    someone else their database.
+    """
+    opaque = q.ProcessInfo(pid=213, name="qdrant.exe", executable=None,
+                           command_line="", modules_readable=False)
+    config, ports = build([opaque])
+    verdict = q.run(config, ports)
+
+    assert opaque.pid not in ports.processes.stop_calls, (
+        "a Qdrant this protocol could not place was stopped anyway — on a "
+        "machine running someone else's engine that is data loss"
+    )
+    assert "not ours to stop" in verdict.phase(q.PHASE_STOP_ENGINE).detail
+
+
+def test_a_process_that_could_not_be_identified_at_all_is_not_reported_as_absence():
+    """"Nothing is running" and "nothing could be identified" are opposite facts.
+
+    Under the 32-bit PowerShell that Inno's 32-bit Setup launches,
+    `Process.Path` is `$null` and `Process.Modules` is empty for every 64-bit
+    process — silently. `verify_clear` said "no owned process is running" while
+    the managed engine held four files `[InstallDelete]` was about to remove,
+    and nothing anywhere recorded that it had been unable to look.
+    """
+    opaque = q.ProcessInfo(pid=214, name="qdrant.exe", executable=None,
+                           command_line="", modules_readable=False)
+    config, ports = build([opaque])
+    verdict = q.run(config, ports)
+
+    detail = verdict.phase(q.PHASE_VERIFY_CLEAR).detail
+    assert "could not be identified" in detail and "214" in detail, (
+        f"verify_clear reported a clean sweep over a process it could not "
+        f"inspect: {detail!r}"
+    )
+    assert "absence of evidence" in detail
+    assert verdict.exit_code == q.EXIT_QUIESCENT, (
+        "a process nobody could identify must not, by itself, refuse every "
+        "upgrade — the replaceability probe is what decides"
     )
 
 

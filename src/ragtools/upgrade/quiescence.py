@@ -423,6 +423,20 @@ class QuiescenceConfig:
     #: distinguishable — they have different remedies and the user is told which
     #: one happened.
     settle_rounds: int = 3
+    #: How long the engine is given to close after being ASKED, before it is
+    #: terminated. The engine has no CLI stop of its own and "stopping the
+    #: service stops it" is an assumption this product has been bitten by — an
+    #: engine orphaned from a service that died has no parent left to ask.
+    engine_grace_seconds: float = 2.0
+    #: How long :data:`PHASE_STOP_ENGINE` waits to SEE the engine gone after
+    #: terminating it. `stop()` returns when the request was issued; the kernel
+    #: releases the image's file handle afterwards, and the delete that follows
+    #: fails in exactly that gap.
+    engine_exit_seconds: float = 10.0
+    #: Interval between looks while awaiting an exit. Deliberately not a value
+    #: from :attr:`retry_backoff` — the two are bounded separately and must stay
+    #: separately auditable.
+    poll_seconds: float = 0.25
 
 
 # --------------------------------------------------------------------------
@@ -555,6 +569,26 @@ def owns(proc: ProcessInfo, app_dir: str, data_dir: str) -> bool:
     return bool(ownership_evidence(proc, app_dir, data_dir))
 
 
+def is_unresolved(proc: ProcessInfo) -> bool:
+    """The enumerator could say NOTHING about this process.
+
+    Not a blocker on its own — every machine has processes it may not inspect,
+    and refusing on ``System`` would refuse every upgrade. But it is not
+    evidence of quiescence either, and the 3.5.1 engine verdict is what leaving
+    it unsaid costs.
+
+    Under the 32-bit PowerShell that Inno's 32-bit Setup actually launches,
+    ``Process.Path`` returns ``$null`` and ``Process.Modules`` returns an empty
+    collection for every 64-bit process — *silently*, with nothing raised. So
+    the managed engine, which earns no image-name evidence by design, produced
+    no evidence at all: it was never stopped, never named as a blocker, and
+    ``verify_clear`` reported "no owned process is running" while it held four
+    files ``[InstallDelete]`` was about to remove. "Nothing is running" and
+    "nothing could be identified" are opposite facts and must not read alike.
+    """
+    return not proc.executable and not proc.modules_readable
+
+
 _TRAY = re.compile(r"(?<![a-z])tray(?![a-z])")
 _SUPERVISOR = re.compile(r"supervis")
 
@@ -656,35 +690,88 @@ class _Run:
                 found.append((proc, evidence))
         return found
 
-    def _issue_stops(self, role: str) -> tuple[bool, list[int], int]:
+    def _gone(self, pid: int) -> bool:
+        return not any(proc.pid == pid for proc in self.ports.processes.list_processes())
+
+    def _await_gone(self, pid: int, budget: float) -> bool:
+        """Await ACTUAL EXIT, by looking — never by believing the request.
+
+        Bounded twice, by its own budget and by the protocol deadline, so a
+        process that will never die cannot consume the whole upgrade window.
+        """
+        spent = 0.0
+        while True:
+            if self._gone(pid):
+                return True
+            if spent >= budget or self._expired():
+                return False
+            step = min(self.config.poll_seconds, budget - spent)
+            if step <= 0.0:
+                return False
+            self.ports.clock.sleep(step)
+            spent += step
+
+    def _stop_engine(self, pid: int) -> bool:
+        """Ask, then insist, then WAIT — for one managed engine.
+
+        The caller has ALREADY proven this pid's executable lies under the
+        installation or its data directory. Nothing here re-decides ownership.
+
+        Returns whether the process is GONE, which is not what ``stop()``
+        returns: that is the fate of the request, and believing it is how a kill
+        that silently did nothing looks exactly like one that worked.
+        """
+        self.ports.processes.stop(pid, force=False)
+        if self._await_gone(pid, self.config.engine_grace_seconds):
+            return True
+        self.ports.processes.stop(pid, force=True)
+        return self._await_gone(pid, self.config.engine_exit_seconds)
+
+    def _issue_stops(self, role: str) -> tuple[bool, list[int], int, int]:
         """Ask, then insist. Never conclude — that is :meth:`_owned`'s job.
 
-        Returns ``(graceful request accepted, pids stopped, pids spared)``. The
-        engine is the only role with anything to spare, and sparing it is the
-        rule that keeps this installer out of someone else's database.
+        Returns ``(graceful request accepted, pids stopped, pids spared, pids
+        confirmed gone)``. The engine is the only role with anything to spare,
+        and sparing it is the rule that keeps this installer out of someone
+        else's database — and the only role that is WAITED for here, because it
+        is the only one with neither a CLI stop nor an image-name kill behind
+        it. If this phase does not confirm its exit, nothing before
+        :data:`PHASE_PROBE_REPLACEABLE` does, and by then all that phase can do
+        is refuse.
         """
         asked = self.ports.installation.request_stop(role)
         stopped: list[int] = []
         spared = 0
+        exited = 0
         for proc in self.ports.processes.list_processes():
             if classify_role(proc) != role:
                 continue
             if role == ROLE_ENGINE:
                 if not (is_under(proc.executable, self.config.app_dir)
                         or is_under(proc.executable, self.config.data_dir)):
+                    # Includes an engine whose executable could not be resolved
+                    # at all: unattributable is not ours.
                     spared += 1
                     continue
-            elif not owns(proc, self.config.app_dir, self.config.data_dir):
+                stopped.append(proc.pid)
+                if self._stop_engine(proc.pid):
+                    exited += 1
+                continue
+            if not owns(proc, self.config.app_dir, self.config.data_dir):
                 continue
             if self.ports.processes.stop(proc.pid, force=True):
                 stopped.append(proc.pid)
-        return asked, stopped, spared
+        return asked, stopped, spared, exited
 
     def _stop_role(self, phase: str, role: str) -> PhaseRecord:
         started = self.ports.clock.now()
-        asked, stopped, spared = self._issue_stops(role)
+        asked, stopped, spared, exited = self._issue_stops(role)
         detail = (f"graceful request {'accepted' if asked else 'unavailable'}; "
                   f"stop issued to {len(stopped)} process(es)")
+        if role == ROLE_ENGINE:
+            # Named separately from the count of stops ISSUED, because they are
+            # different facts and conflating them is what the 3.5.1 verdict did.
+            detail += f"; {exited} of {len(stopped)} confirmed gone"
         if spared:
             detail += (f"; left {spared} Qdrant process(es) alone — outside this "
                        "installation, so not ours to stop")
@@ -842,11 +929,23 @@ class _Run:
     def verify_clear(self) -> list[Blocker]:
         started = self.ports.clock.now()
         blockers = [describe_process(proc, evidence) for proc, evidence in self._owned()]
+        if blockers:
+            detail = f"{len(blockers)} owned process(es) survived every stop"
+        else:
+            detail = "no owned process is running"
+            # "Nothing is running" and "nothing could be identified" used to read
+            # identically here, and for the engine — whose ownership is nothing
+            # but its path — the second is the whole 3.5.1 failure.
+            unresolved = [p.pid for p in self.ports.processes.list_processes()
+                          if is_unresolved(p)]
+            if unresolved:
+                detail += (f"; {len(unresolved)} process(es) could not be identified "
+                           f"at all (pids {', '.join(str(p) for p in unresolved)}) — "
+                           "this is the absence of evidence and not evidence of "
+                           "absence; the replaceability probe is what decides")
         self._record(PHASE_VERIFY_CLEAR,
                      OUTCOME_BLOCKED if blockers else OUTCOME_OK,
-                     ("no owned process is running" if not blockers
-                      else f"{len(blockers)} owned process(es) survived every stop"),
-                     started, blockers)
+                     detail, started, blockers)
         return blockers
 
     def probe_replaceable(self) -> list[Blocker]:
@@ -1247,7 +1346,7 @@ __all__ = [
     "Installation", "ProcessInfo", "Blocker", "TaskRecord", "PhaseRecord",
     "Verdict", "QuiescenceConfig", "Ports",
     "InstallationPort", "ProcessPort", "TaskPort", "LockPort", "ClockPort",
-    "is_under", "ownership_evidence", "owns", "classify_role",
+    "is_under", "ownership_evidence", "owns", "is_unresolved", "classify_role",
     "run", "decide", "restore_tasks",
     "POST_INSTALL_CHECKS", "INTEGRITY_CHECKS", "RUNTIME_CHECKS",
     "PostInstallCheck", "PostInstallVerdict", "decide_post_install",
