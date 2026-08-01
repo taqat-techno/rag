@@ -26,10 +26,19 @@ playwright_sync = pytest.importorskip(
     "playwright.sync_api", reason="playwright not installed"
 ) if PANEL_URL else None
 
-pytestmark = pytest.mark.skipif(
-    not PANEL_URL,
-    reason="panel e2e is resource-gated; set RAG_E2E_PANEL_URL to a running panel",
-)
+pytestmark = [
+    # Registered in pyproject.toml. `release_blocking` is not decoration: the
+    # `panel-e2e` job REQUIRES every test in this module to pass, and
+    # `scripts/check_no_silent_skips.py` fails the build if any of them reports
+    # skipped there. The skip below is tolerated only in the ordinary suite,
+    # and only because that same file records which job covers it instead.
+    pytest.mark.e2e_panel,
+    pytest.mark.release_blocking,
+    pytest.mark.skipif(
+        not PANEL_URL,
+        reason="panel e2e is resource-gated; set RAG_E2E_PANEL_URL to a running panel",
+    ),
+]
 
 
 @pytest.fixture

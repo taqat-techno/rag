@@ -55,3 +55,14 @@ final-*.png
 
 # Large raw CI logs stay local; commit the trimmed extract instead.
 .claude/evidence/**/*-full.log
+
+# WP-R10 gate artifacts. The `suite` job now writes a JUnit report and the
+# Windows leg measures coverage; both are inputs to a check, never outputs
+# worth committing. The engine directory is where scripts/fetch_qdrant.py
+# drops the pinned qdrant binary for the e2e and stress gates.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit-*.xml
+/engine/

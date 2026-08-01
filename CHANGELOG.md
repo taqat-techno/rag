@@ -9,7 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### The gates that would have caught the last two releases now execute
+
+The evidence was a summary line nobody read as a defect:
+
+```
+2581 passed, 19 skipped
+```
+
+Ten of those nineteen were the two suites that mattered. `test_panel_e2e.py` —
+the entire admin panel in a browser — is gated on `RAG_E2E_PANEL_URL`, and
+Playwright was not a dependency of any extra, so even setting the variable by
+hand produced an import-skip. `test_storage_managed_e2e.py` — the managed
+engine against a real `qdrant` binary — is gated on `RAG_E2E_QDRANT`. There
+were **zero** occurrences of `RAG_E2E` anywhere under `.github/workflows`. The
+two code paths behind the v3.4 and v3.5.0 field incidents were validated by
+nothing, and the workflow reported success while proving it.
+
+A skip is not a failure, which is exactly the problem: a green run and a green
+run with the interesting half missing look identical from outside.
+
+* **`managed-qdrant-e2e`** fetches the pinned engine with the existing
+  `scripts/fetch_qdrant.py` — checksum-verified against a digest committed
+  here — and runs the managed lifecycle on Windows, Linux and macOS arm64.
+* **`panel-e2e`** boots a real service on an isolated port and data directory,
+  indexes two fixture projects into the per-project layout, and drives the
+  panel with Chromium. Booting it *populated* is deliberate: the isolation test
+  skips itself against an empty panel, and a job that green-lights while its
+  isolation test excused itself is the defect, not the fix.
+* **`transport-stress`** drives 20,000 requests against a real engine, past the
+  16,384-wide ephemeral range that produced `[WinError 10048]`, and asserts on
+  a **measurement** — distinct client-side ports, socket growth — not on the
+  absence of a crash. It runs a negative control first: a client with
+  keep-alive disabled (the v3.4 configuration) must trip the same threshold the
+  real run has to clear, or the measurement has no discriminating power.
+  Observed on Windows: control 1,743 distinct ports for 3,000 requests; the
+  shipped pool 8 for 20,000. On all three platforms, because the failure was
+  Windows-specific and the fix is shared code.
+* **`winget-manifest`** runs `scripts/check_winget_hash.py` on tag pushes only,
+  waiting for the installer `release.yml` is building from the same tag. It
+  cannot run on a pre-release pull request, where the manifest cannot
+  legitimately be correct yet.
+
+### A skip in a release-blocking suite is now a build failure
+
+`scripts/check_no_silent_skips.py` parses the JUnit report structurally — never
+console output — and fails on four independent conditions, so no single edit
+satisfies it by accident: every skip must be declared by node id **and** by the
+reason it recorded; every required test must be present **and** passed; a suite
+has a collected-case floor; and a skip excused as "it runs in the dedicated
+job" is only valid if that job actually requires it. `tests/test_ci_gates.py`
+proves every node id it names resolves to a real test, and drives each failure
+mode against synthetic reports — a structural check that has never been shown
+to fail is not evidence of anything.
+
+Also: pytest markers are registered for the first time (`--strict-markers` is
+now on, so an undeclared one is a collection error rather than a warning), a
+coverage floor of 75% guards the Windows leg against a measured 76.73%, and
+every job producing a JUnit report is required to check it.
 
 ---
 

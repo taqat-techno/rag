@@ -59,6 +59,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0", "pytest-cov>=5.0.0", "pytest-asyncio>=0.23.0"]
+# The browser gate's dependency, declared instead of assumed. `test_panel_e2e.py`
+# has shipped since S15 and had never run once: it is gated on
+# RAG_E2E_PANEL_URL, no workflow set it, and Playwright was not a dependency of
+# ANY extra — so even a developer who set the variable got an import-skip.
+#
+# Separate from `dev` on purpose. Playwright pulls a driver bundle and its
+# browsers are a further ~150 MB install step; every ordinary `pip install -e
+# ".[dev]"` should not pay for a gate that needs a booted panel to be useful.
+# The `panel-e2e` job installs `.[dev,e2e]` and runs `playwright install`.
+e2e = ["playwright>=1.44.0"]
 build = ["pyinstaller>=6.0.0"]
 notifications = ["winotify>=1.1.0; sys_platform == 'win32'"]
 tray = [
@@ -84,3 +94,19 @@ ragtools = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# `--strict-markers` turns a typo'd or undeclared marker into a collection
+# ERROR instead of a warning nobody reads. That matters here more than usual:
+# the release-blocking suites below are SELECTED by marker, and a marker that
+# silently means nothing selects nothing — which is a suite that reports zero
+# tests and, without `scripts/check_no_silent_skips.py`, a green job.
+# `--strict-config` does the same for this table.
+addopts = ["--strict-markers", "--strict-config"]
+
+markers = [
+    # Registered, not merely used. There was no `markers` entry at all before
+    # WP-R10, so every marker in this project was an unregistered string.
+    "e2e_managed_qdrant: the managed engine against the real pinned qdrant binary. Requires RAG_E2E_QDRANT=1 and RAG_E2E_QDRANT_BIN. Release-blocking via the `managed-qdrant-e2e` job.",
+    "e2e_panel: the admin panel in a real browser (Playwright). Requires RAG_E2E_PANEL_URL. Release-blocking via the `panel-e2e` job.",
+    "release_blocking: this test is required to PASS in a named CI suite; a skip is a failure. The suites and their required node ids are declared in scripts/check_no_silent_skips.py.",
+]

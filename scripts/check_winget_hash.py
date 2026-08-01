@@ -31,6 +31,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -101,6 +102,48 @@ def api_digest(tag: str, asset_name: str) -> tuple[str | None, int | None, str]:
     return None, None, f"{asset_name} is not attached to {tag}"
 
 
+def resolve_published_digest(
+    url: str, tag: str, asset_name: str, *, download: bool, wait_seconds: float,
+) -> tuple[str | None, int | None, str]:
+    """The digest of the artifact the manifest points at, waiting if asked.
+
+    ``--wait-for-asset`` exists because of WHEN this check can run. Wired into
+    release-validation, it fires on the tag push — the same event that starts
+    ``release.yml`` building the installer. So at the moment this job starts,
+    the release it is asked to validate does not exist yet: it is being built
+    on another runner, and will be for the best part of an hour.
+
+    The alternatives were both worse. Failing immediately makes the check
+    useless on the only event it needs to work on. Passing when the asset is
+    absent is a check that reports success for something it never looked at,
+    which is the failure mode this entire work package is about. So it waits,
+    with a stated budget, and fails when the budget runs out — a tag that
+    produced no installer inside the budget is a failed release either way.
+    """
+    deadline = time.time() + max(0.0, wait_seconds)
+    while True:
+        if download:
+            actual, size, note = downloaded_digest(url)
+        else:
+            actual, size, note = api_digest(tag, asset_name)
+            # Fall back to hashing the bytes ONLY when the asset demonstrably
+            # exists and merely has no recorded digest (`size` is not None).
+            # If the release or the asset is absent, a 626 MB download cannot
+            # succeed either — it would just take much longer to say so.
+            if actual is None and size is not None:
+                print(f"    (API digest unavailable: {note}; falling back to "
+                      f"download)", flush=True)
+                actual, size, note = downloaded_digest(url)
+
+        if actual is not None or time.time() >= deadline:
+            return actual, size, note
+
+        remaining = int(deadline - time.time())
+        print(f"    (not published yet: {note}; retrying in 60s, ~{remaining}s "
+              f"of budget left)", flush=True)
+        time.sleep(min(60.0, max(1.0, deadline - time.time())))
+
+
 def downloaded_digest(url: str) -> tuple[str | None, int | None, str]:
     h = hashlib.sha256()
     total = 0
@@ -121,6 +164,9 @@ def main() -> int:
                     help="fail unless the manifest declares this version")
     ap.add_argument("--download", action="store_true",
                     help="hash the served bytes instead of trusting the API digest")
+    ap.add_argument("--wait-for-asset", type=float, default=0.0, metavar="SECONDS",
+                    help="poll for up to SECONDS while the release asset is "
+                         "still being built and uploaded (0 = do not wait)")
     args = ap.parse_args()
 
     print(f"Winget manifest: {args.manifest}", flush=True)
@@ -156,14 +202,18 @@ def main() -> int:
     ok &= check("the asset name matches the declared version",
                 version in asset_name, f"asset {asset_name}, version {version}")
 
-    if args.download:
-        actual, size, note = downloaded_digest(url)
-    else:
-        actual, size, note = api_digest(tag, asset_name)
-        if actual is None:
-            print(f"    (API digest unavailable: {note}; falling back to download)",
-                  flush=True)
-            actual, size, note = downloaded_digest(url)
+    # Waiting is only ever worth it when everything above agreed. If the
+    # manifest already declares the wrong version, or points at a tag that is
+    # not the one under test, an hour of polling ends in the same answer — so
+    # say it now, in seconds, rather than at the end of the budget.
+    wait = args.wait_for_asset
+    if wait and not ok:
+        print("    (not waiting for the asset: a check above already failed, "
+              "and the answer will not change)", flush=True)
+        wait = 0.0
+
+    actual, size, note = resolve_published_digest(
+        url, tag, asset_name, download=args.download, wait_seconds=wait)
 
     if actual is None:
         check("the published artifact's digest could be determined", False, note)
