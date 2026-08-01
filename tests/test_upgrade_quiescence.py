@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -465,6 +465,138 @@ def test_restore_re_enables_only_what_the_upgrade_disabled():
 
 
 # --------------------------------------------------------------------------
+# 8b. a preparatory phase that fails must not skip the phases that do the work
+#
+# THE 3.5.1 DEFECT. `Get-TaskState` ran `schtasks /query ... 2>$null` while
+# `$ErrorActionPreference = 'Stop'` was in force, and in Windows PowerShell a
+# native command's stderr becomes a TERMINATING error the moment stream 2 is
+# redirected. A task that is simply not registered — the normal case for at
+# least one of `OWNED_TASKS` on every release the matrix upgrades from — threw,
+# the dispatcher rethrew, and the protocol aborted at `disable_tasks`: no tray
+# stop, no supervisor stop, no `taskkill`, no engine stop. Every upgrade leg
+# refused with the previous version still serving and all its processes alive,
+# and the refusal named an exception where a blocker belonged.
+#
+# The PowerShell half of the fix is asserted, executably, in
+# tests/test_installer_quiescence_contract.py. This is the policy half.
+# --------------------------------------------------------------------------
+
+
+class ExplodingTasks(FakeTasks):
+    """A Task Scheduler port that cannot answer.
+
+    Models the real failure exactly: the QUERY is what raised, so nothing was
+    ever disabled and nothing was ever recorded to restore.
+    """
+
+    def states(self):
+        raise OSError("ERROR: The system cannot find the file specified.")
+
+
+def test_a_task_query_that_fails_does_not_skip_every_stop():
+    """The stops still run, and the upgrade still proceeds.
+
+    Failing to disable a scheduled task is not evidence that anything is holding
+    a file. It is one attempt to help that did not work — and the two phases
+    that actually decide still have to pass, so carrying on cannot produce a
+    false "quiescent".
+    """
+    tasks = ExplodingTasks()
+    config, ports = build([tray(), supervisor(), service(), engine()], tasks=tasks)
+    verdict = q.run(config, ports)
+
+    assert ports.processes.stop_calls, (
+        "the task query raised and NOT ONE process was stopped — the protocol "
+        "abandoned every kill because a preparatory step failed"
+    )
+    assert {101, 102, 103, 104} <= set(ports.processes.stop_calls), (
+        f"only {sorted(set(ports.processes.stop_calls))} were stopped; the tray, "
+        "the supervisor, the service and the engine must all still be asked"
+    )
+    assert verdict.exit_code == q.EXIT_QUIESCENT
+    assert verdict.reason == q.REASON_QUIESCENT
+    assert verdict.blockers == []
+
+
+def test_an_advisory_failure_is_recorded_rather_than_hidden():
+    """Continuing is not the same as pretending it worked."""
+    config, ports = build([tray()], tasks=ExplodingTasks())
+    verdict = q.run(config, ports)
+
+    assert [p.phase for p in verdict.phases] == list(q.PHASES), (
+        "a phase that failed was dropped from the record instead of being "
+        "reported as failed"
+    )
+    failed = verdict.phase(q.PHASE_DISABLE_TASKS)
+    assert failed.outcome == q.OUTCOME_ERROR
+    assert "OSError" in failed.detail and "cannot find the file" in failed.detail, (
+        f"the failure is recorded without saying what it was: {failed.detail!r}"
+    )
+
+
+def test_an_advisory_failure_still_refuses_when_something_really_is_holding_on():
+    """The invariant half. Carrying on past a failed preparatory phase must not
+    cost the refusal — it must only change WHY the refusal happens, from an
+    exception nobody can act on to a named process."""
+    config, ports = build([tray(), supervisor()], refuse=[101],
+                          tasks=ExplodingTasks())
+    verdict = q.run(config, ports)
+
+    assert verdict.exit_code == q.EXIT_NOT_QUIESCENT
+    assert verdict.reason == q.REASON_PROCESSES_SURVIVED, (
+        "the refusal still reports an internal error rather than the process "
+        "that is actually holding the installation"
+    )
+    assert 101 in blocker_pids(verdict)
+
+
+@pytest.mark.parametrize("phase", sorted(q.DECISIVE_PHASES))
+def test_a_decisive_phase_that_cannot_answer_refuses(phase):
+    """Unknown refuses. These are the three whose failure could make the
+    protocol wrongly conclude quiescence — above all ``detect_installation``,
+    where "I could not tell" read as "nothing is installed" returns exit 0 and
+    invites Setup to delete a live installation."""
+    config, ports = build([tray()])
+
+    if phase == q.PHASE_DETECT:
+        def explode():
+            raise OSError("the registry could not be read")
+        ports.installation.detect = explode
+    elif phase == q.PHASE_VERIFY_CLEAR:
+        # The last look at the process table, after the retries have finished.
+        original = ports.processes.list_processes
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] > 6:
+                raise OSError("the process table could not be read")
+            return original()
+        ports.processes.list_processes = flaky
+    else:
+        def refuse(_path):
+            raise OSError("the file could not be opened")
+        ports.locks.can_replace = refuse
+
+    verdict = q.run(config, ports)
+
+    assert verdict.exit_code == q.EXIT_INTERNAL_ERROR, (
+        f"{phase} failed and the protocol returned {verdict.exit_code} "
+        f"({verdict.reason}) instead of refusing"
+    )
+    assert verdict.quiescent is False
+
+
+def test_every_phase_is_either_decisive_or_advisory_and_never_both():
+    assert set(q.DECISIVE_PHASES) | set(q.ADVISORY_PHASES) == set(q.PHASES)
+    assert not set(q.DECISIVE_PHASES) & set(q.ADVISORY_PHASES)
+    assert q.PHASE_DISABLE_TASKS in q.ADVISORY_PHASES, (
+        "disable_tasks aborts the protocol when it fails, which is how one "
+        "unregistered scheduled task stopped 3.5.1 from ever running its kill"
+    )
+
+
+# --------------------------------------------------------------------------
 # 9. the timeout, and what it must NOT have done by then
 # --------------------------------------------------------------------------
 
@@ -721,12 +853,34 @@ def test_a_check_that_did_not_run_is_not_a_check_that_passed():
 def test_the_rollback_copy_lands_outside_the_directory_it_protects():
     """`[InstallDelete]` removes `{app}\\_internal` wholesale and
     `[UninstallDelete]` removes `{app}` entirely, so a copy kept underneath is
-    deleted by the operations it exists to survive."""
+    deleted by the operations it exists to survive.
+
+    `APP` is a WINDOWS path and this module is pure Python that has to be right
+    on every platform, so the parent is taken with ``PureWindowsPath`` and the
+    boundary is tested with the module's own :func:`is_under`.
+    ``pathlib.Path(APP)`` on POSIX parses ``C:\\Users\\r\\...`` as ONE relative
+    segment whose parent is ``.``, so ``startswith(str(Path(APP).parent))`` was
+    a comparison against ``"."`` — false for every input, and the assertion
+    failed on Linux and macOS while passing on Windows for a reason that had
+    nothing to do with the code under test.
+    """
     plan = q.plan_backup(APP, "20260801-101010")
+
+    # The control that makes the assertion below mean something. Had it been
+    # here, the POSIX failure would have named its own cause instead of
+    # presenting as a rollback-placement bug.
+    parent = str(PureWindowsPath(APP).parent)
+    assert parent not in (".", "", "\\", "C:\\"), (
+        f"{parent!r} is not the installation's parent directory, so the "
+        "placement assertion below would hold or fail for the wrong reason"
+    )
 
     assert q.backup_is_outside_installation(plan) is True
     assert not q.is_under(plan.backup_dir, APP)
-    assert plan.backup_dir.startswith(str(Path(APP).parent))
+    assert q.is_under(plan.backup_dir, parent), (
+        f"the rollback copy at {plan.backup_dir} is not a sibling of the "
+        f"installation — it does not lie under {parent}"
+    )
     assert "\\" in plan.backup_dir and "/" not in plan.backup_dir, (
         f"the plan mixes path separators: {plan.backup_dir}"
     )
