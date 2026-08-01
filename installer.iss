@@ -17,7 +17,7 @@
 ; nothing, and the release published WITHOUT its installer while every step
 ; reported success.
 #ifndef MyAppVersion
-  #define MyAppVersion "3.5.1"
+  #define MyAppVersion "3.5.1-rc.1"
 #endif
 #define MyAppPublisher "TaqaTechno"
 #define MyAppURL "https://github.com/taqat-techno/rag"
