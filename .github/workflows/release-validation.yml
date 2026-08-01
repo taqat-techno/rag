@@ -748,34 +748,39 @@ jobs:
           --root "$RUNNER_TEMP/stress"
 
   winget-manifest:
-    name: winget manifest matches the published installer
-    # TAG PUSHES ONLY — and this condition is the job's design, not a detail.
+    name: winget manifest matches the installer it names
+    # NOT on tag pushes. That was the design, and v3.5.1 proved it impossible.
     #
-    # `scripts/check_winget_hash.py` compares the manifest's InstallerSha256
-    # with the digest of the asset actually attached to the release its own URL
-    # names. On a pre-release pull request that comparison CANNOT legitimately
-    # pass: the installer for the version under review has not been built, so
-    # the manifest necessarily still describes the previous release. Running it
-    # there would produce a red check that is correct about the world and wrong
-    # about the change, and a check that is always red is a check people learn
-    # to ignore.
+    # The old condition ran this on every stable tag and asserted, via
+    # `--expect-version <tag>`, that the committed manifest described THAT
+    # release. It cannot. The manifest carries the installer's SHA-256, and the
+    # installer does not exist until the tag builds it — the same tag push that
+    # starts this job. `--wait-for-asset` was added to wait out the build, but
+    # waiting does not help: the manifest is committed source, fixed at the
+    # commit the tag points at, and no wait changes what that file says.
     #
-    # On a STABLE tag push it is exactly right, and that is the only moment it
-    # is. That is also why the step below passes `--wait-for-asset`: this
-    # workflow and `release.yml` are triggered by the SAME tag push, so when
-    # this job starts the installer it must hash is still being built on
-    # another runner.
+    # So on the v3.5.1 tag it failed, correctly and unavoidably, and took the
+    # release gate red with it — for a release whose manifest was fine within
+    # the hour. A gate that cannot be green at the moment it runs teaches people
+    # to merge past it, which is exactly what this release spent its time
+    # removing elsewhere.
     #
-    # PRE-RELEASE TAGS ARE EXCLUDED, and not for convenience. Winget serves
-    # stable releases; there is no `winget install` of `v3.5.1-rc.1`, and no
-    # manifest that could describe one. `release.yml` already draws exactly
-    # this line — `prerelease: ${{ contains(github.ref_name, '-') }}` — so a
-    # release candidate publishes as a pre-release while the manifest still
-    # points, correctly, at the last stable version. Demanding a match there
-    # would fail every release candidate for being a release candidate, and the
-    # first thing anyone does with a gate that is wrong about the world is stop
-    # believing it.
-    if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+    # The invariant that IS always true, and is the one worth defending:
+    #
+    #     the committed manifest's hash matches the artifact at its own URL.
+    #
+    # That holds on every ordinary commit. It is briefly untrue only between
+    # publishing a release and updating the manifest — a window that exists on
+    # the release tag and nowhere else. So the job runs on pull requests and
+    # dispatches, where it is both meaningful and satisfiable, and the version
+    # comes from the manifest itself rather than from a tag: the question is
+    # "does this file describe the thing it points at", not "is this file about
+    # the release I happen to be cutting".
+    #
+    # The release-time check — that the manifest was updated to the NEW version
+    # — is `RELEASING.md`'s step, run against the published artifact, and it is
+    # the same script with `--expect-version`.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90          # 70 min of asset wait, 20 min of margin
     steps:
@@ -783,28 +788,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: The version under release, from the tag itself
-        id: version
-        run: |
-          set -euo pipefail
-          v="${GITHUB_REF_NAME#v}"
-          test -n "$v"
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-      - name: The manifest must describe THIS release's installer
-        # `--expect-version` is what makes the common failure fast: a manifest
-        # still declaring the previous version fails in seconds, without
-        # spending the wait budget to reach the same answer.
+      - name: The manifest must describe the installer it points at
+        # No `--expect-version`, deliberately. That flag asks "is this manifest
+        # about the release being cut", which is a question only the release
+        # process can answer and only after the artifact exists. Here the
+        # question is the one that must hold on every commit: the hash in the
+        # file matches the asset at the URL in the same file.
         #
-        # This check currently exits 1 against the committed manifest, and that
-        # is correct — it carries the v3.4.0 digest under a v3.5.0 version, so
-        # every `winget install` fails a hash comparison before it runs
-        # anything. The manifest is what has to change, not this gate.
+        # No `--wait-for-asset` either. Nothing is being built by this run, so
+        # an absent asset is not a race to wait out — it means the manifest
+        # points at a release that does not exist, and that is the answer, not
+        # a reason to spend seventy minutes reaching it.
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          python scripts/check_winget_hash.py
-          --expect-version "${{ steps.version.outputs.version }}"
-          --wait-for-asset 4200
+        run: python scripts/check_winget_hash.py
 
   gate:
     name: release gate
@@ -863,26 +860,27 @@ jobs:
             managed-qdrant-e2e ${{ needs.managed-qdrant-e2e.result }}
             panel-e2e ${{ needs.panel-e2e.result }}
             transport-stress ${{ needs.transport-stress.result }}
-          # RELEASE-BLOCKING ON A TAG PUSH, AND ONLY THEN. Kept in its own list
-          # rather than folded into BLOCKING because the two want opposite
-          # verdicts on the same result: `skipped` is the CORRECT outcome for
-          # this leg on a pull request, and a failure on a tag.
+          # RELEASE-BLOCKING EXCEPT ON A TAG PUSH. Kept in its own list rather
+          # than folded into BLOCKING because the two want opposite verdicts on
+          # the same result: `skipped` is the CORRECT outcome for this leg on a
+          # tag, and a failure everywhere else.
+          #
+          # This list used to be the other way round, and v3.5.1 is why it is
+          # not. The manifest carries the installer's SHA-256; the installer is
+          # built BY the tag. Demanding on the tag that the committed manifest
+          # already describe that build asks a file to contain a hash of
+          # something that did not exist when the file was committed. It failed,
+          # correctly, and took the release gate red for a release whose
+          # manifest was right within the hour.
           #
           # The alternative — leaving the job out of `needs` — is what the
           # macOS-Intel incident warns against in reverse: a leg nobody waits
           # on is a leg nobody reads. The queue-time hazard that rule protects
           # against does not apply here, because a job skipped by an `if:`
           # resolves immediately and never queues at all.
-          TAG_ONLY: |
+          NON_TAG_ONLY: |
             winget-manifest ${{ needs.winget-manifest.result }}
-          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          # A pre-release tag is a tag, but it is not a tag the TAG-ONLY legs
-          # can pass. `winget-manifest` compares the committed manifest against
-          # the published stable installer, and an RC deliberately does not
-          # produce one — `release.yml` publishes it as a pre-release and the
-          # manifest keeps pointing at the last stable version. So on `-rc.N`
-          # the honest expectation is `skipped`, exactly as on a non-tag run.
-          IS_STABLE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
           # BEST-EFFORT. Named out loud, never waited on, never decisive.
           # Deliberately NOT read from `needs.suite-macos-intel.outputs` — that
           # expression is what put the job in `needs` and let it hold the gate
@@ -903,30 +901,29 @@ jobs:
           done <<< "$BLOCKING"
 
           echo ""
-          echo "TAG-ONLY legs - blocking on a STABLE tag push" \
-               "(is_tag=$IS_TAG, is_stable_tag=$IS_STABLE_TAG)"
+          echo "NON-TAG legs - blocking everywhere EXCEPT a tag push" \
+               "(is_tag=$IS_TAG)"
           while read -r job result; do
             [ -n "${job:-}" ] || continue
-            if [ "$IS_STABLE_TAG" = "true" ]; then
+            if [ "$IS_TAG" != "true" ]; then
               if [ "$result" = "success" ]; then
-                printf '  PASS         %-22s (%s, tag push)\n' "$job" "$result"
+                printf '  PASS         %-22s (%s)\n' "$job" "$result"
               else
-                printf '  NOT PASSED   %-22s (%s, tag push)\n' "$job" "$result"
+                printf '  NOT PASSED   %-22s (%s)\n' "$job" "$result"
                 blocked=$((blocked + 1))
               fi
             elif [ "$result" = "skipped" ]; then
-              printf '  N/A          %-22s (%s - no stable release for it to\n' \
+              printf '  N/A          %-22s (%s - the manifest cannot yet\n' \
                 "$job" "$result"
-              printf '               validate on this run)\n'
+              printf '               describe an installer this tag is still building)\n'
             else
-              # Not tolerated. `skipped` is the only defensible result when
-              # there is no stable tag; anything else means the `if:` condition
-              # and this list have drifted apart, and a gate that shrugs at
-              # that is guessing.
-              printf '  UNEXPECTED   %-22s (%s without a stable tag)\n' "$job" "$result"
+              # Not tolerated. `skipped` is the only defensible result on a tag;
+              # anything else means the `if:` condition and this list have
+              # drifted apart, and a gate that shrugs at that is guessing.
+              printf '  UNEXPECTED   %-22s (%s on a tag push)\n' "$job" "$result"
               blocked=$((blocked + 1))
             fi
-          done <<< "$TAG_ONLY"
+          done <<< "$NON_TAG_ONLY"
 
           echo ""
           echo "BEST-EFFORT legs - informational, cannot block OR delay a release"
