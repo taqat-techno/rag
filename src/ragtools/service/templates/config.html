@@ -167,8 +167,10 @@
             <div class="note">
                 <span aria-hidden="true">⚠</span>
                 <span>
-                    <strong>Restart Claude Code to apply.</strong>
-                    The MCP server reads this once at startup, so changes take effect on the next connection.
+                    <strong>Saved right away — applied the next time Claude Code starts.</strong>
+                    The ragtools MCP server builds its tool list once, as it launches, and it runs as a
+                    local stdio process that Claude Code does not respawn on its own. Your toggles are
+                    already written to disk; restart Claude Code to hand the agent the new list.
                 </span>
             </div>
         </div>
