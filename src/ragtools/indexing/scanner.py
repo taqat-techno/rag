@@ -114,6 +114,33 @@ def _inspect(path: Path, ledger: SkipLedger):
         return True, None
 
 
+def _walk_files(directory: Path, ignore_rules: IgnoreRules, ledger: SkipLedger):
+    """Every non-directory entry under ``directory``, never entering an ignored directory.
+
+    Replaces ``directory.rglob("*")``, which descended into every directory and
+    left the ignore rules to discard the files afterwards. Measured in the field:
+    a project with ``.claude/`` and ``node_modules/`` both ignored still walked
+    70,359 entries of a git worktree's ``node_modules`` on every incremental
+    scan, logging each as a link loop — and through the unreadable reparse points
+    inside an ignored ``.venv``. Pruning happens before descent, so an ignored
+    directory, and any junction or symlink inside it, is never opened at all.
+
+    Link handling matches ``rglob`` on Python 3.12: junctions are followed,
+    directory symlinks are not (``followlinks=False``). A directory the OS
+    refuses to list is recorded in the ledger instead of vanishing silently.
+    """
+
+    def _unlistable(exc: OSError) -> None:
+        ledger.record(exc.filename or directory, f"{type(exc).__name__}: {exc}")
+
+    for dirpath, dirnames, filenames in os.walk(directory, onerror=_unlistable):
+        base = Path(dirpath)
+        dirnames[:] = sorted(d for d in dirnames
+                             if not ignore_rules.prunes_dir(base / d, directory))
+        for name in filenames:
+            yield base / name
+
+
 # --- Legacy (v1) functions — kept for backward compatibility ---
 
 
@@ -201,7 +228,7 @@ def discover_indexable_files(
     #: rather than fixing it. Every copy would be chunked, embedded and stored
     #: separately.
     seen: set = set()
-    for path in directory.rglob("*"):
+    for path in _walk_files(directory, ignore_rules, ledger):
         is_file, key = _inspect(path, ledger)
         if not is_file:
             continue

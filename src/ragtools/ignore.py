@@ -155,6 +155,11 @@ def is_secret(file_path: Path | str, allowlist: "list[str] | tuple[str, ...]" = 
     return False
 
 
+def _has_negation(spec: pathspec.PathSpec) -> bool:
+    """True if a spec contains a ``!`` pattern that can re-include a path."""
+    return any(getattr(p, "include", None) is False for p in spec.patterns)
+
+
 class IgnoreRules:
     """Three-layer ignore rule engine.
 
@@ -208,6 +213,60 @@ class IgnoreRules:
         Honors this instance's secret allowlist (from config).
         """
         return is_secret(file_path, self._secret_allowlist)
+
+    def prunes_dir(self, dir_path: Path | str, content_root: Path | str | None = None) -> bool:
+        """True if NOTHING under this directory can be indexed, so a walk may skip it.
+
+        Filtering files one by one after walking into an ignored directory is
+        correct but unbounded: a project whose ``.claude/worktrees/`` held a
+        full checkout with its own ``node_modules`` walked ~70,000 ignored
+        entries on every incremental scan — and through any junction loop or
+        unreadable reparse point inside them — only to discard every one.
+
+        A directory is pruned only when a matching layer guarantees every path
+        beneath it is ignored too. Gitignore directory patterns (``node_modules/``,
+        ``**/worktrees/**``) match only the directory form ``rel/``, and a
+        match there implies a match for everything below it — UNLESS the same
+        spec carries a ``!`` negation that could re-include a file inside. A
+        spec with any negation is therefore never used to prune; its files are
+        still filtered individually, exactly as before.
+        """
+        root = Path(content_root).resolve() if content_root else self.content_root
+        path = Path(dir_path)
+        if path.is_absolute():
+            try:
+                rel = path.relative_to(root)
+            except ValueError:
+                return False
+        else:
+            rel = path
+        rel_posix = rel.as_posix()
+        if rel_posix in ("", "."):
+            return False
+        rel_dir = rel_posix + "/"
+
+        if self._builtin_spec.match_file(rel_dir):
+            return True
+        if (self._global_spec and not _has_negation(self._global_spec)
+                and self._global_spec.match_file(rel_dir)):
+            return True
+        if self.use_ragignore:
+            check_dir = (path if path.is_absolute() else root / path).parent.resolve()
+            root_resolved = root.resolve()
+            target = (path if path.is_absolute() else root / path).resolve()
+            while True:
+                spec = self._load_ragignore(check_dir)
+                if spec is not None and not _has_negation(spec):
+                    try:
+                        local_rel = target.relative_to(check_dir).as_posix()
+                        if spec.match_file(local_rel + "/"):
+                            return True
+                    except ValueError:
+                        pass
+                if check_dir == root_resolved or check_dir.parent == check_dir:
+                    break
+                check_dir = check_dir.parent
+        return False
 
     def get_reason(self, file_path: Path | str, content_root: Path | str | None = None) -> str | None:
         """Return why a file is ignored, or None if it's not ignored.
