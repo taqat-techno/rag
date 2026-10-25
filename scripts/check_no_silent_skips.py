@@ -253,6 +253,15 @@ _FULL_SUITE = Suite(
             justification="NTFS junctions do not exist off Windows",
         ),
         ApprovedSkip(
+            nodeid="tests/test_scanner_prune.py::test_a_link_loop_inside_an_ignored_directory_is_never_entered",
+            reasons=("junctions are Windows-only",
+                     "could not create a junction on this runner"),
+            justification=(
+                "NTFS junctions do not exist off Windows, and creating one can "
+                "be refused even there; directory symlinks are not followed by "
+                "the walk on any platform, so they cannot form the loop"),
+        ),
+        ApprovedSkip(
             nodeid="tests/test_selfcheck.py::test_windows_declares_that_it_records_installed_versions",
             reasons=("registry is Windows-only",),
             justification="there is no Windows registry to read on Linux or macOS",
