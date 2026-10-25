@@ -562,3 +562,46 @@ def test_the_watcher_queues_changes_it_could_not_index(tmp_path, monkeypatch):
     assert [p for _kind, p in queued] == [str(changed)], (
         "the queued change lost its file identity"
     )
+
+
+# ---------------------------------------------------------------------------
+# W-9 — the run that held the mutex was an INCREMENTAL, not a rebuild
+# ---------------------------------------------------------------------------
+
+
+def test_an_edit_queued_behind_an_incremental_is_current_afterwards(owner, monkeypatch):
+    """W-9. Field-observed 2026-10-24: three ``run_index`` jobs for one project
+    held the mutex back to back; a watcher tick for another project lost the
+    race and queued its edit. Only rebuilds and service start drained the
+    ledger, so the edit stayed unindexed until the next edit to that project
+    or the next boot. The incremental that held the mutex must drain it."""
+    owner.run_full_index()
+    edited = Path(owner._settings.projects[1].path) / "a.md"
+
+    def _edit():
+        edited.write_text(_body("beta", "a.md", "v2-edited-mid-incremental"),
+                          encoding="utf-8")
+        result = _watcher_tick(owner, "beta", [("upsert", str(edited))])
+        assert result.get("status") != "unavailable"
+
+    # The incremental path streams rather than calling `index_file`, so hook
+    # its streaming step: the first call is alpha's run, mutex held.
+    real_stream = owner._stream_index
+    fired: list = []
+
+    def _stream(*args, **kwargs):
+        if not fired:
+            fired.append(True)
+            _edit()
+        return real_stream(*args, **kwargs)
+
+    monkeypatch.setattr(owner, "_stream_index", _stream)
+
+    stats = owner.run_incremental_index(project_id="alpha")
+
+    assert "v2-edited-mid-incremental" in _stored(owner, "beta").get("beta/a.md", ""), (
+        "the edit queued while alpha's incremental held the mutex is still not "
+        "indexed — nothing drains the ledger until a rebuild or a restart"
+    )
+    assert [r["project"] for r in stats.get("replayed", [])] == ["beta"]
+    assert owner._projects_awaiting_replay() == []

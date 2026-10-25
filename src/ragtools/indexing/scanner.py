@@ -277,6 +277,7 @@ def scan_configured_projects(
     secret_allowlist: list[str] | None = None,
     dependencies: list | None = None,
     ledger: "SkipLedger | None" = None,
+    only: str | None = None,
 ) -> list[tuple[str, Path]]:
     """Scan explicitly configured projects for markdown files (v2).
 
@@ -293,6 +294,10 @@ def scan_configured_projects(
             declaring raw paths — without it their dependency roots are NOT
             excluded here, and the same files end up both in the project's own
             collection and in the shared corpus.
+        only: Walk just this project. Every project still takes part in the
+            nested-path exclusion, so the result is exactly the unscoped
+            scan's rows for ``only`` — without walking the other trees, which
+            on the installed machine took ~5 minutes per watcher tick.
 
     Returns: list of (project_id, absolute_file_path) tuples.
     """
@@ -305,6 +310,8 @@ def scan_configured_projects(
     results = []
     for project in projects:
         if not project.enabled:
+            continue
+        if only is not None and project.id != only:
             continue
 
         project_path = Path(project.path).resolve()
