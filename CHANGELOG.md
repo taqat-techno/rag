@@ -9,7 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **Ignored directories are no longer walked.** The scanner descended into every
+  directory and applied ignore rules to files afterwards, so a project with an
+  ignored `.claude/worktrees/` checkout walked ~70,000 `node_modules` entries on
+  every incremental scan and logged them as "already-visited (link loop)", and
+  unreadable links inside an ignored `.venv` were logged as unreadable. Ignore
+  rules now prune directories before descent. A spec containing a `!` negation
+  is never used to prune, so re-included files still index. Measured on the
+  reporting machine: 60,016 → 335 directories listed, 58 s → 1 s, identical file set.
 
 ---
 
