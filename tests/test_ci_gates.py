@@ -438,7 +438,7 @@ def test_the_stress_gate_runs_on_all_three_first_class_platforms():
     about a regression elsewhere."""
     job = _load(RELEASE_VALIDATION)["jobs"]["transport-stress"]
     labels = set((job.get("strategy") or {}).get("matrix", {}).get("os") or [])
-    assert {"ubuntu-latest", "macos-14", "windows-latest"} <= labels, labels
+    assert {"ubuntu-latest", "macos-15", "windows-latest"} <= labels, labels
 
 
 # --- the stress gate's negative control has to work on every platform --------
@@ -463,7 +463,7 @@ def test_the_stress_gate_runs_on_all_three_first_class_platforms():
 #: The runner label -> ``platform.system()`` the script sees there.
 _MATRIX_SYSTEMS = {
     "ubuntu-latest": "Linux",
-    "macos-14": "Darwin",
+    "macos-15": "Darwin",
     "windows-latest": "Windows",
 }
 
@@ -706,7 +706,7 @@ def test_a_connection_counter_that_can_measure_nothing_refuses_to_report_zero():
 def test_the_managed_engine_gate_runs_on_all_three_first_class_platforms():
     job = _load(RELEASE_VALIDATION)["jobs"]["managed-qdrant-e2e"]
     labels = set((job.get("strategy") or {}).get("matrix", {}).get("os") or [])
-    assert {"ubuntu-latest", "macos-14", "windows-latest"} <= labels, labels
+    assert {"ubuntu-latest", "macos-15", "windows-latest"} <= labels, labels
 
 
 def test_playwright_is_a_declared_dependency():

@@ -50,10 +50,10 @@ platform claim let a leg with no artifact behind it block a release.
 | Linux x86_64 | first-class, release-blocking | `RAGTools-X.Y.Z-linux-x86_64.tar.gz` |
 | macOS **Intel x86_64** | **best-effort** | **none — no Intel artifact is built or published** |
 
-`release.yml` has exactly one macOS job (`build-macos`, on `macos-14`) and it
+`release.yml` has exactly one macOS job (`build-macos`, on `macos-15`) and it
 uploads exactly one macOS asset, the arm64 zip. Intel macOS is therefore
 validated but never release-blocking: `release-validation.yml` runs the suite on
-`macos-13` in a `continue-on-error` job that reports pass / fail / unsupported
+`macos-15-intel` in a `continue-on-error` job that reports pass / fail / unsupported
 and cannot fail the workflow. Promote Intel to first-class only when a real
 Intel artifact is built and published here — not before.
 

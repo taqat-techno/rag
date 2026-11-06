@@ -43,11 +43,11 @@ WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 SUPPORTED_RUNNER_LABELS = {
     "ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04",
     "windows-latest", "windows-2025", "windows-2022",
-    "macos-latest", "macos-14", "macos-15", "macos-26",
+    "macos-latest", "macos-15", "macos-26",
     "macos-15-intel", "macos-26-intel",
 }
 
-RETIRED_RUNNER_LABELS = {"macos-13", "macos-12", "macos-11", "ubuntu-20.04", "windows-2019"}
+RETIRED_RUNNER_LABELS = {"macos-14", "macos-13", "macos-12", "macos-11", "ubuntu-20.04", "windows-2019"}
 
 
 def _load(path: Path) -> dict:
