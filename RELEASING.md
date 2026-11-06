@@ -53,7 +53,7 @@ platform claim let a leg with no artifact behind it block a release.
 `release.yml` has exactly one macOS job (`build-macos`, on `macos-14`) and it
 uploads exactly one macOS asset, the arm64 zip. Intel macOS is therefore
 validated but never release-blocking: `release-validation.yml` runs the suite on
-`macos-13` in a `continue-on-error` job that reports pass / fail / unsupported
+`macos-15-intel` in a `continue-on-error` job that reports pass / fail / unsupported
 and cannot fail the workflow. Promote Intel to first-class only when a real
 Intel artifact is built and published here — not before.
 

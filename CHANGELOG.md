@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [3.5.2] — 2026-11-06
+
+A patch release: indexing stops walking what it was told to ignore, and stops
+walking projects it was not asked about. No config, state-database or Qdrant
+format change; upgrading from 3.5.1 (or 3.4.0) needs no migration.
+
 ### Fixed
 
 - **Ignored directories are no longer walked.** The scanner descended into every
@@ -19,6 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rules now prune directories before descent. A spec containing a `!` negation
   is never used to prune, so re-included files still index. Measured on the
   reporting machine: 60,016 → 335 directories listed, 58 s → 1 s, identical file set.
+- **A project-scoped index walks only that project.** A watcher tick for one
+  project scanned every configured project and filtered afterwards — minutes on
+  a large configuration, holding the index mutex so later ticks and queued jobs
+  waited. Nested-project exclusion is unchanged.
+- **Edits queued during an incremental run are no longer stranded.** A watcher
+  tick that lost the mutex queued its changes, but only rebuilds and service
+  start drained that queue, so the edit sat unindexed until the next edit or
+  boot. Incremental runs now drain it before releasing the mutex.
+
+### Changed
+
+- **Intel macOS (best-effort, no artifact) pins a dependency line that runs on
+  torch 2.2.2.** sentence-transformers < 6, transformers < 5 and numpy < 2 on
+  `darwin`/`x86_64` only; every other platform is unaffected.
 
 ---
 
