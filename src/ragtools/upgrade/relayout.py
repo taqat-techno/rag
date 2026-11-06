@@ -836,10 +836,9 @@ def indexable_file_count(owner, unit_id: str) -> int:
 def indexable_file_counts(owner, unit_ids) -> dict[str, int]:
     """:func:`indexable_file_count` for several units, in ONE scan.
 
-    ``_scan_files(pid)`` scans every configured project and then filters, so
-    asking it once per project costs N walks of the whole corpus — on the
-    installed machine that is 145,906 files per poll, per project. The dashboard
-    asks about every configured project at once, so it asks here.
+    The dashboard asks about every configured project at once; one unscoped
+    walk answers all of them, where N scoped calls would repeat the per-project
+    setup (ignore rules, dependency roots) N times.
     """
     counts = {str(u): 0 for u in unit_ids}
     for pid, _path in owner._scan_files():

@@ -1623,7 +1623,22 @@ class QdrantOwner:
                 # A watcher tick that lands during a long re-index has nothing
                 # to add — the next tick picks up whatever changed.
                 return self._skipped_incremental()
-            return self._run_incremental_index_locked(project_id, progress)
+            stats = self._run_incremental_index_locked(project_id, progress)
+            # A watcher tick that lost the mutex to THIS run queued its changes
+            # in the pending ledger — and the watcher will not wake again until
+            # the filesystem moves. Only rebuilds and service start drained that
+            # ledger, so an edit made during a routine incremental sat unindexed
+            # until the next edit to the same project or the next boot. Drain it
+            # before releasing the mutex: one pass over a snapshot, as rebuild
+            # does, so work arriving during the sweep waits for the next run.
+            replayed = []
+            for pid in self._projects_awaiting_replay():
+                outcome = self._replay_pending(pid, stamp_identity=False)
+                if outcome is not None:
+                    replayed.append(outcome)
+            if replayed:
+                stats["replayed"] = replayed
+            return stats
 
     def _run_incremental_index_locked(self, project_id: str | None = None,
                                       progress=None) -> dict:
@@ -3111,8 +3126,11 @@ class QdrantOwner:
         """Scan files from configured projects.
 
         Always passes ALL projects to the scanner so nested path scoping
-        works correctly (parent excludes child project files). Filters
-        results by project_id afterward if requested.
+        works correctly (parent excludes child project files), but walks only
+        ``project_id``'s tree when one is given. Walking every project and
+        filtering afterwards made each watcher tick for a 200-file project
+        scan all of them — minutes, holding the index mutex, so later ticks
+        and queued jobs waited behind it.
         """
         if project_id and not any(p.id == project_id for p in self._settings.enabled_projects):
             raise ValueError(f"Project '{project_id}' not found in configuration")
@@ -3127,10 +3145,8 @@ class QdrantOwner:
             # than typing its path) has that tree scanned into its own
             # collection as well as the shared corpus — every hit twice.
             dependencies=self._settings.dependencies,
+            only=project_id or None,
         )
-
-        if project_id:
-            return [(pid, fp) for pid, fp in all_files if pid == project_id]
         return all_files
 
     def _resolve_relative_path(self, project_id: str, file_path: Path) -> str:
