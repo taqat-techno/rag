@@ -14,6 +14,7 @@ service is started.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -91,9 +92,15 @@ def main() -> int:
         noise = ("does not exist", "not found", "No such file or directory",
                  "is not executable", "Failed to prepare", "cannot be resolved",
                  "Unit not found")
+        # `verify` also loads the HOST's units and reports their deprecations
+        # (ubuntu-latest, 2026-11: "/usr/lib/systemd/system/xfs_scrub_all.service:26:
+        # Support for option CPUAccounting= has been removed"). A diagnostic that
+        # names some other unit file is about the runner image, not ours.
+        foreign = re.compile(r"^/\S+?:\d+: ")
         fatal = [
             line for line in (proc.stderr or "").splitlines()
             if line.strip() and not any(n in line for n in noise)
+            and not (foreign.match(line) and not line.startswith(str(unit_path)))
         ]
         check("systemd parses the generated unit", PASS if not fatal else FAIL,
               "; ".join(fatal[:2]) if fatal else "systemd-analyze verify clean")
