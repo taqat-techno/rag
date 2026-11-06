@@ -37,9 +37,16 @@ format change; upgrading from 3.5.1 (or 3.4.0) needs no migration.
   tick that lost the mutex queued its changes, but only rebuilds and service
   start drained that queue, so the edit sat unindexed until the next edit or
   boot. Incremental runs now drain it before releasing the mutex.
+- **The MCP tool-access note on `/config` says what to do, in order.** It named
+  two different remedies and never said the toggles need *Save changes*. It now
+  says: save, then restart Claude Code — the MCP server builds its tool list once,
+  at launch, and Claude Code does not restart it on its own.
 
 ### Changed
 
+- **The macOS arm64 build moved from GitHub's `macos-14` runner to `macos-15`**,
+  because GitHub retired `macos-14` on 2026-11-02. Same architecture and
+  Python toolchain; report it if the macOS zip fails to start on macOS 14.
 - **Intel macOS (best-effort, no artifact) pins a dependency line that runs on
   torch 2.2.2.** sentence-transformers < 6, transformers < 5 and numpy < 2 on
   `darwin`/`x86_64` only; every other platform is unaffected.
