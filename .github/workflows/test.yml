@@ -19,13 +19,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-14, ubuntu-22.04]
+        os: [windows-latest, macos-15, ubuntu-22.04]
         python-version: ["3.12"]
         include:
           - os: windows-latest
             pip-cache: ~\AppData\Local\pip\Cache
             hf-cache: ~\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2
-          - os: macos-14
+          - os: macos-15
             pip-cache: ~/Library/Caches/pip
             hf-cache: ~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2
           - os: ubuntu-22.04
